@@ -1,0 +1,55 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Go
+*.test
+*.prof
+coverage.out
+go.work
+go.work.sum
+
+# Dependency directories
+vendor/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment
+.env
+.env.local
+.env.*
+
+# Logs
+*.log
+
+# Node_modules
+node_modules/
+dist/
+.DS_Store
+
+# Build
+*.tar.gz
+*.zip
+
+# Electron
+electron/out/
+release/
+
+# Capacitor
+android/
+ios/
+
+# Local configs
+config/local.yaml

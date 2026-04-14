@@ -1,0 +1,121 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: conference-postgres
+    environment:
+      POSTGRES_DB: conference
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ../backend/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - conference-net
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: conference-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - conference-net
+    restart: unless-stopped
+
+  coturn:
+    image: instrumentisto/coturn:latest
+    container_name: conference-coturn
+    ports:
+      - "3478:3478"
+      - "3478:3478/udp"
+      - "49152-65535:49152-65535/udp"
+    environment:
+      - TURN_STATIC_AUTH_SECRET=your-turn-secret-change-in-production
+      - TURN_USER=username
+      - TURN_PWD=password
+    network_mode: host
+    restart: unless-stopped
+
+  api-server:
+    build:
+      context: ..
+      dockerfile: deployment/docker/Dockerfile.server
+    container_name: conference-api
+    environment:
+      SERVER_PORT: 8080
+      SFU_PORT: 8081
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: conference
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ""
+      JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
+      COTURN_URL: turn:localhost:3478
+      COTURN_USER: username
+      COTURN_PASSWORD: password
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+      - redis
+    networks:
+      - conference-net
+    restart: unless-stopped
+
+  sfu-server:
+    build:
+      context: ..
+      dockerfile: deployment/docker/Dockerfile.sfu
+    container_name: conference-sfu
+    environment:
+      SFU_PORT: 8081
+    ports:
+      - "8081:8081"
+    depends_on:
+      - api-server
+    networks:
+      - conference-net
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ../frontend
+      dockerfile: ../deployment/docker/Dockerfile.frontend
+    container_name: conference-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - api-server
+      - sfu-server
+    restart: unless-stopped
+
+  nginx:
+    image: nginx:alpine
+    container_name: conference-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./certbot/conf:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    depends_on:
+      - frontend
+      - api-server
+      - sfu-server
+    networks:
+      - conference-net
+    restart: unless-stopped
+
+networks:
+  conference-net:
+    driver: bridge
+
+volumes:
+  postgres_data:
