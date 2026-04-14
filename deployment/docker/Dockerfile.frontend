@@ -1,9 +1,15 @@
 FROM node:18-alpine AS builder
 
+# 换npm为淘宝镜像（大陆网络加速）
+RUN npm config set registry https://registry.npmmirror.com
+
 WORKDIR /app
 
+# copy package*.json (context已经是frontend目录了)
 COPY package*.json ./
-RUN npm ci
+
+# 使用npm install代替npm ci，因为package-lock不存在
+RUN npm install
 
 COPY . .
 RUN npm run build

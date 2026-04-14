@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/zap"
 )
@@ -25,10 +26,11 @@ type Peer struct {
 }
 
 type SFUServer struct {
-	rooms  map[uint]*Room
-	api    *webrtc.API
-	logger *zap.Logger
-	mu     sync.Mutex
+	rooms         map[uint]*Room
+	api           *webrtc.API
+	configuration webrtc.Configuration
+	logger        *zap.Logger
+	mu            sync.Mutex
 }
 
 type OfferRequest struct {
@@ -42,7 +44,7 @@ type AnswerResponse struct {
 }
 
 func NewSFUServer(logger *zap.Logger) *SFUServer {
-	config := webrtc.Configuration{
+	configuration := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
 			{
 				URLs: []string{"stun:stun.l.google.com:19302"},
@@ -57,9 +59,10 @@ func NewSFUServer(logger *zap.Logger) *SFUServer {
 	)
 
 	return &SFUServer{
-		rooms:  make(map[uint]*Room),
-		api:    api,
-		logger: logger,
+		rooms:         make(map[uint]*Room),
+		api:           api,
+		configuration: configuration,
+		logger:        logger,
 	}
 }
 
@@ -83,7 +86,7 @@ func (s *SFUServer) HandleOffer(w http.ResponseWriter, r *http.Request) {
 	room.mu.Lock()
 	defer room.mu.Unlock()
 
-	peerConnection, err := s.api.NewPeerConnection(webrtc.Configuration{})
+	peerConnection, err := s.api.NewPeerConnection(s.configuration)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -150,11 +153,11 @@ func (s *SFUServer) HandleOffer(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder().Encode(w, response)
+	json.NewEncoder(w).Encode(response)
 }
 
 func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-	localTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec(), track.ID(), track.StreamID())
+	localTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), track.StreamID())
 	if err != nil {
 		s.logger.Error("Failed to create local track", zap.Error(err))
 		return

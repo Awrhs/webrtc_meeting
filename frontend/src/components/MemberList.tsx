@@ -1,6 +1,5 @@
-import { useState } from 'react'
 import { Avatar, Dropdown, MenuProps, message, Modal } from 'antd'
-import { UserOutlined, MoreOutlined } from '@ant-design/icons'
+import { UserOutlined, MoreOutlined, AudioMutedOutlined } from '@ant-design/icons'
 import { RoomMember } from '@/types'
 import { api } from '@/utils/api'
 import { useNavigate } from 'react-router-dom'
@@ -19,7 +18,7 @@ export default function MemberList({ roomId, members, isAdmin, isOwner }: Member
     Modal.confirm({
       title: '确认踢人',
       content: `确定要踢出 ${member.nickname} 吗？被踢用户10分钟内无法重新加入。`,
-      danger: true,
+      okButtonProps: { danger: true },
       onOk: async () => {
         try {
           await api.post(`/api/v1/rooms/${roomId}/members/${member.user_id}/kick`)
@@ -108,7 +107,7 @@ export default function MemberList({ roomId, members, isAdmin, isOwner }: Member
       })
     }
 
-    if (isOwner && member.role !== 'owner') {
+    if (isOwner) {
       if (member.role !== 'admin') {
         items.push({
           key: 'set-admin',

@@ -2,6 +2,7 @@ package repository
 
 import (
 	"conference-sfu/backend/internal/models"
+	"time"
 
 	"gorm.io/gorm"
 )
@@ -101,7 +102,7 @@ func (r *roomRepository) GetMember(roomID uint, userID uint) (*models.RoomMember
 }
 
 func (r *roomRepository) RemoveMember(roomID uint, userID uint) error {
-	now := gorm.NowFunc()
+	now := time.Now()
 	return r.db.Model(&models.RoomMember{}).
 		Where("room_id = ? AND user_id = ? AND left_at IS NULL", roomID, userID).
 		Update("left_at", &now).Error

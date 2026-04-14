@@ -1,11 +1,6 @@
-import { Room } from '@/types'
-
-const API_HOST = import.meta.env.VITE_API_HOST || 'http://localhost:8080'
-const SFU_HOST = import.meta.env.VITE_SFU_HOST || 'http://localhost:8081'
+const SFU_HOST = (import.meta as any).env.VITE_SFU_HOST || 'http://localhost:8081'
 
 export const createPeerConnection = async (
-  roomId: number,
-  userId: number,
   onTrack: (track: MediaStreamTrack, stream: MediaStream) => void
 ): Promise<RTCPeerConnection> => {
   const configuration: RTCConfiguration = {
@@ -37,7 +32,7 @@ export const connectToSFU = async (
   userId: number,
   localStream: MediaStream
 ): Promise<RTCPeerConnection> => {
-  const pc = await createPeerConnection(roomId, userId, () => {})
+  const pc = await createPeerConnection(() => { })
 
   localStream.getTracks().forEach((track) => {
     pc.addTrack(track, localStream)

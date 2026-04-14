@@ -1,20 +1,15 @@
 import { useState, useEffect, useRef } from 'react'
 import { useParams, useNavigate, useSearchParams } from 'react-router-dom'
 import { useDispatch, useSelector } from 'react-redux'
-import { Layout, Button, Card, List, Space, Tag, message, Modal, Dropdown, MenuProps, Tabs, Input } from 'antd'
+import { Layout, Button, Space, Tag, message, Modal, Dropdown, MenuProps, Tabs } from 'antd'
 import {
   VideoCameraOutlined,
   VideoCameraFilled,
   AudioOutlined,
   AudioMutedOutlined,
-  ScreenShareOutlined,
   StopOutlined,
   LockOutlined,
   UnlockOutlined,
-  CloseOutlined,
-  UserOutlined,
-  MessageOutlined,
-  StarOutlined,
   DeleteOutlined,
   LogoutOutlined,
 } from '@ant-design/icons'
@@ -23,7 +18,6 @@ import { joinRoom, getRoomMessages, addMessage, setConnected, clearCurrentRoom, 
 import { api } from '@/utils/api'
 import { SignalingClient } from '@/utils/signaling'
 import { getMediaStream, connectToSFU } from '@/utils/webrtc'
-import { Message, RoomMember } from '@/types'
 import VideoGrid from '@/components/VideoGrid'
 import Chat from '@/components/Chat'
 import MemberList from '@/components/MemberList'
@@ -35,13 +29,12 @@ export default function MeetingRoom() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const dispatch = useDispatch<AppDispatch>()
-  const { currentRoom, members, messages, connected } = useSelector((state: RootState) => state.room)
+  const { currentRoom, members, messages } = useSelector((state: RootState) => state.room)
   const { user } = useSelector((state: RootState) => state.auth)
 
   const [videoOn, setVideoOn] = useState(false)
   const [audioOn, setAudioOn] = useState(true)
   const [screenShare, setScreenShare] = useState(false)
-  const [isJoined, setIsJoined] = useState(false)
   const [loading, setLoading] = useState(false)
 
   const signalingRef = useRef<SignalingClient | null>(null)
@@ -64,7 +57,6 @@ export default function MeetingRoom() {
       .then(async () => {
         dispatch(getRoomMessages(roomId))
         await joinMeeting()
-        setIsJoined(true)
       })
       .catch((error) => {
         message.error(error)
@@ -294,7 +286,7 @@ export default function MeetingRoom() {
     Modal.confirm({
       title: '确认解散房间',
       content: '解散后所有成员将被移出，且无法恢复，确定解散吗？',
-      danger: true,
+      okButtonProps: { danger: true },
       onOk: async () => {
         try {
           await api.delete(`/api/v1/rooms/${currentRoom.id}`)
@@ -425,7 +417,7 @@ export default function MeetingRoom() {
                 danger={screenShare}
                 shape="circle"
                 size="large"
-                icon={screenShare ? <StopOutlined /> : <ScreenShareOutlined />}
+                icon={<StopOutlined />}
                 onClick={toggleScreenShare}
               />
             </Space>

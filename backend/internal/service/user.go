@@ -4,7 +4,6 @@ import (
 	"conference-sfu/backend/internal/models"
 	"conference-sfu/backend/internal/repository"
 	"errors"
-	"fmt"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"

@@ -49,6 +49,6 @@ export interface SignalingMessage {
   type: string
   room_id: number
   user_id: number
-  target_id: number
+  target_id?: number
   data: any
 }

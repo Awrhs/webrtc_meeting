@@ -9,7 +9,6 @@ import (
 )
 
 func (h *Handler) GetMessages(c *gin.Context) {
-	userID := GetUserID(c)
 	idStr := c.Param("id")
 	roomID, _ := strconv.Atoi(idStr)
 

@@ -1,8 +1,16 @@
 FROM golang:1.21-alpine AS builder
 
+RUN sed -i 's/dl-cdn.alpinelinux.org/mirrors.aliyun.com/g' /etc/apk/repositories
+
+RUN apk --no-cache add ca-certificates git
+
+# 设置Go模块代理为国内镜像（大陆网络加速）
+ENV GO111MODULE=on \
+    GOPROXY=https://goproxy.cn,direct
+
 WORKDIR /app
 
-COPY go.mod go.sum ./
+COPY go.mod ./
 RUN go mod download
 
 COPY . .
@@ -10,8 +18,6 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o server ./backend/cmd/server
 
 FROM alpine:latest
-
-RUN apk --no-cache add ca-certificates
 
 WORKDIR /root/
 

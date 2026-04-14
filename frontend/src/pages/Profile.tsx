@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useDispatch, useSelector } from 'react-redux'
-import { Layout, Card, Form, Input, Button, Avatar, message, Typography, Space, Divider } from 'antd'
-import { UserOutlined, UploadOutlined, LockOutlined } from '@ant-design/icons'
+import { Layout, Card, Form, Input, Button, Avatar, message, Typography, Divider } from 'antd'
+import { UserOutlined } from '@ant-design/icons'
 import { updateProfile, getMe } from '@/store/slices/authSlice'
 import { RootState, AppDispatch } from '@/store'
 
@@ -14,7 +14,6 @@ export default function Profile() {
   const navigate = useNavigate()
   const { user } = useSelector((state: RootState) => state.auth)
   const [formProfile] = Form.useForm()
-  const [formPassword] = Form.useForm()
   const [loading, setLoading] = useState(false)
 
   useEffect(() => {

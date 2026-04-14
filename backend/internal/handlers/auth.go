@@ -3,6 +3,7 @@ package handlers
 import (
 	"conference-sfu/backend/internal/models"
 	"conference-sfu/backend/internal/service"
+	"conference-sfu/backend/internal/signaling"
 	"net/http"
 	"strings"
 

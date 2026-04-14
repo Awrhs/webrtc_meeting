@@ -5,6 +5,8 @@ import (
 	"conference-sfu/backend/internal/sfu"
 	"conference-sfu/backend/pkg/logger"
 	"net/http"
+
+	"go.uber.org/zap"
 )
 
 func main() {
@@ -18,6 +20,6 @@ func main() {
 
 	log.Info("SFU server starting on port " + cfg.SFUPort)
 	if err := http.ListenAndServe(":"+cfg.SFUPort, nil); err != nil {
-		log.Fatal("Failed to start SFU server", err)
+		log.Fatal("Failed to start SFU server", zap.Error(err))
 	}
 }

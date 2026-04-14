@@ -1,6 +1,4 @@
 import { Routes, Route } from 'react-router-dom'
-import { useSelector } from 'react-redux'
-import { RootState } from './store'
 import Login from './pages/Login'
 import Register from './pages/Register'
 import RoomList from './pages/RoomList'
@@ -9,8 +7,6 @@ import Profile from './pages/Profile'
 import ProtectedRoute from './components/ProtectedRoute'
 
 function App() {
-  const { isAuthenticated } = useSelector((state: RootState) => state.auth)
-
   return (
     <Routes>
       <Route path="/login" element={<Login />} />

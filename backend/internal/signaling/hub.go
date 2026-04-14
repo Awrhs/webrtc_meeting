@@ -178,14 +178,15 @@ func (h *Hub) BroadcastKick(roomID uint, targetID uint) {
 }
 
 func (h *Hub) BroadcastMute(roomID uint, targetID uint, isMuted bool) {
+	data, _ := json.Marshal(map[string]bool{"is_muted": isMuted})
 	msg := Message{
 		Type:   MessageTypeMuted,
 		RoomID: roomID,
 		UserID: targetID,
-		Data:   json.RawMessage(`{"is_muted": ` + string(rune(isMuted)) + `}`),
+		Data:   json.RawMessage(data),
 	}
-	data, _ := json.Marshal(msg)
-	h.BroadcastToRoom(roomID, data, 0)
+	raw, _ := json.Marshal(msg)
+	h.BroadcastToRoom(roomID, raw, 0)
 }
 
 func (h *Hub) BroadcastRoleChanged(roomID uint, userID uint, role models.Role) {
@@ -202,15 +203,16 @@ func (h *Hub) BroadcastRoleChanged(roomID uint, userID uint, role models.Role) {
 
 func (h *Hub) BroadcastMessage(roomID uint, message *models.Message, receiverID *uint) {
 	if receiverID != nil {
+		data, _ := json.Marshal(message)
 		msg := Message{
 			Type:    MessageTypeChatMessage,
 			RoomID:  roomID,
 			UserID:  message.SenderID,
-			Data, _ := json.Marshal(message)
-			msg.Data = data
-			raw, _ := json.Marshal(msg)
-			h.SendToUser(message.SenderID, raw)
-			h.SendToUser(*receiverID, raw)
+			Data:    data,
+		}
+		raw, _ := json.Marshal(msg)
+		h.SendToUser(message.SenderID, raw)
+		h.SendToUser(*receiverID, raw)
 	} else {
 		msg := Message{
 			Type:    MessageTypeChatMessage,
@@ -224,28 +226,28 @@ func (h *Hub) BroadcastMessage(roomID uint, message *models.Message, receiverID 
 }
 
 func (c *Client) ReadPump() {
-	defer func() {
-		c.hub.Unregister(c)
-		c.conn.Close()
-	}()
+		defer func() {
+			c.hub.Unregister(c)
+			c.conn.Close()
+		}()
 
-	for {
-		_, message, err := c.conn.ReadMessage()
-		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("error: %v", err)
+		for {
+			_, message, err := c.conn.ReadMessage()
+			if err != nil {
+				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+					log.Printf("error: %v", err)
+				}
+				break
 			}
-			break
-		}
 
-		var msg Message
-		if err := json.Unmarshal(message, &msg); err != nil {
-			continue
-		}
+			var msg Message
+			if err = json.Unmarshal(message, &msg); err != nil {
+				continue
+			}
 
-		c.handleMessage(&msg)
+			c.handleMessage(&msg)
+		}
 	}
-}
 
 func (c *Client) handleMessage(msg *Message) {
 	switch msg.Type {

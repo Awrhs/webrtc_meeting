@@ -1,6 +1,6 @@
 import CryptoJS from 'crypto-js'
 
-const ENCRYPTION_KEY = import.meta.env.VITE_ENCRYPTION_KEY || 'default-encryption-key-change-in-production'
+const ENCRYPTION_KEY = (import.meta as any).env.VITE_ENCRYPTION_KEY || 'default-encryption-key-change-in-production'
 
 export const encrypt = (plaintext: string, key?: string): string => {
   const useKey = key || ENCRYPTION_KEY

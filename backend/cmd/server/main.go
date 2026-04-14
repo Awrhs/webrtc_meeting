@@ -7,10 +7,10 @@ import (
 	"conference-sfu/backend/internal/service"
 	"conference-sfu/backend/internal/signaling"
 	"conference-sfu/backend/pkg/logger"
-	"log"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
 )
@@ -21,7 +21,7 @@ func main() {
 
 	db, err := gorm.Open(postgres.Open(cfg.DatabaseDSN), &gorm.Config{})
 	if err != nil {
-		log.Fatal("Failed to connect to database", err)
+		log.Fatal("Failed to connect to database", zap.Error(err))
 	}
 
 	redisClient := repository.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword)
@@ -97,7 +97,7 @@ func main() {
 	})
 
 	log.Info("Server starting on port " + cfg.ServerPort)
-	if err := r.Run(":" + cfg.ServerPort); err != nil {
-		log.Fatal("Failed to start server", err)
+	if err = r.Run(":" + cfg.ServerPort); err != nil {
+		log.Fatal("Failed to start server", zap.Error(err))
 	}
 }

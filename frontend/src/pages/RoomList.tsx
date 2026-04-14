@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useDispatch, useSelector } from 'react-redux'
-import { Layout, Menu, Button, Card, List, Input, Space, Tag, Modal, Form, message, Typography, Avatar, Dropdown } from 'antd'
-import { PlusOutlined, SearchOutlined, LockOutlined, UnlockOutlined, UserOutlined, SettingOutlined, LogoutOutlined } from '@ant-design/icons'
+import { Layout, Button, Card, List, Input, Space, Tag, Modal, Form, message, Typography, Avatar, Dropdown } from 'antd'
+import { PlusOutlined, LockOutlined, UnlockOutlined, UserOutlined, SettingOutlined, LogoutOutlined } from '@ant-design/icons'
 import { getMyRooms, createRoom } from '@/store/slices/roomSlice'
 import { logout } from '@/store/slices/authSlice'
 import { RootState, AppDispatch } from '@/store'
@@ -18,7 +18,10 @@ export default function RoomList() {
   const { rooms } = useSelector((state: RootState) => state.room)
   const [searchText, setSearchText] = useState('')
   const [createModalVisible, setCreateModalVisible] = useState(false)
+  const [joinModalVisible, setJoinModalVisible] = useState(false)
+  const [joinVerifyCode, setJoinVerifyCode] = useState('')
   const [loading, setLoading] = useState(false)
+  const [selectedRoom, setSelectedRoom] = useState<Room | null>(null)
   const [form] = Form.useForm()
 
   useEffect(() => {
@@ -47,16 +50,17 @@ export default function RoomList() {
 
   const handleJoinRoom = (room: Room) => {
     if (room.auth_type !== 'none') {
-      Modal.prompt({
-        title: '请输入验证信息',
-        okText: '加入',
-        cancelText: '取消',
-        onOk: (verifyCode) => {
-          navigate(`/room/${room.id}?verify=${verifyCode}`)
-        },
-      })
+      setSelectedRoom(room)
+      setJoinVerifyCode('')
+      setJoinModalVisible(true)
     } else {
       navigate(`/room/${room.id}`)
+    }
+  }
+
+  const handleConfirmJoin = () => {
+    if (selectedRoom) {
+      navigate(`/room/${selectedRoom.id}?verify=${joinVerifyCode}`)
     }
   }
 
@@ -276,6 +280,21 @@ export default function RoomList() {
             </Space>
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        title="请输入验证信息"
+        open={joinModalVisible}
+        okText="加入"
+        cancelText="取消"
+        onOk={handleConfirmJoin}
+        onCancel={() => setJoinModalVisible(false)}
+      >
+        <Input
+          placeholder="请输入验证信息"
+          value={joinVerifyCode}
+          onChange={(e) => setJoinVerifyCode(e.target.value)}
+        />
       </Modal>
     </Layout>
   )
