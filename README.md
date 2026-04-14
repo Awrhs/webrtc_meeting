@@ -38,7 +38,15 @@
 ### 使用 Docker Compose 启动
 
 ```bash
-docker-compose up -d
+cp .env.example .env
+docker-compose -f deployment/docker-compose.yml up -d --build
+```
+
+或者使用 Makefile：
+
+```bash
+cp .env.example .env
+make docker-up
 ```
 
 ### 本地开发
