@@ -1,8 +1,10 @@
 package config
 
 import (
+	"bufio"
 	"os"
 	"strconv"
+	"strings"
 )
 
 type Config struct {
@@ -18,7 +20,35 @@ type Config struct {
 	CoturnPassword string
 }
 
+func loadEnvFromFile(filename string) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		parts := strings.SplitN(line, "=", 2)
+		if len(parts) == 2 {
+			key := strings.TrimSpace(parts[0])
+			value := strings.TrimSpace(parts[1])
+			os.Setenv(key, value)
+		}
+	}
+}
+
 func Load() *Config {
+	// 只有在开发环境（GO_ENV 不是 production）且 .env 文件存在时，才自动加载
+	goEnv := getEnv("GO_ENV", "development")
+	if goEnv != "production" {
+		loadEnvFromFile(".env")
+	}
+
 	port := getEnv("SERVER_PORT", "8080")
 	sfuPort := getEnv("SFU_PORT", "8081")
 

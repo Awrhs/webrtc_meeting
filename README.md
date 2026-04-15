@@ -156,6 +156,7 @@ go run backend/cmd/sfu/main.go
 
 ```bash
 cd frontend
+cp .env.example .env  # 复制前端环境变量配置
 npm install
 npm run dev
 ```

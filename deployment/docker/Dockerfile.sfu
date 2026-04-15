@@ -25,4 +25,6 @@ COPY --from=builder /app/sfu .
 
 EXPOSE 8081
 
+ENV GO_ENV=production
+
 CMD ["./sfu"]

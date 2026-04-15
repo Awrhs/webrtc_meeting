@@ -27,6 +27,7 @@ const (
 	MessageTypeMuted       MessageType = "muted"
 	MessageTypeRoleChanged MessageType = "role_changed"
 	MessageTypeMediaState  MessageType = "media_state"
+	MessageTypeConnectionFailed MessageType = "connection_failed"
 )
 
 type Message struct {
@@ -199,6 +200,16 @@ func (h *Hub) BroadcastRoleChanged(roomID uint, userID uint, role models.Role) {
 	}
 	raw, _ := json.Marshal(msg)
 	h.BroadcastToRoom(roomID, raw, 0)
+}
+
+func (h *Hub) SendConnectionFailed(roomID uint, userID uint) {
+	msg := Message{
+		Type:    MessageTypeConnectionFailed,
+		RoomID:  roomID,
+		UserID:  userID,
+	}
+	data, _ := json.Marshal(msg)
+	h.SendToUser(userID, data)
 }
 
 func (h *Hub) BroadcastMessage(roomID uint, message *models.Message, receiverID *uint) {

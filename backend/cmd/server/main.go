@@ -78,6 +78,8 @@ func main() {
 			auth.GET("/rooms/:id/messages", handler.GetMessages)
 			auth.POST("/rooms/:id/messages", handler.SendMessage)
 		}
+		// Callback for SFU to notify peer connection failed
+		api.POST("/sfu/callback/:roomId/:userId/connection-failed", handler.NotifyConnectionFailed)
 	}
 
 	r.GET("/ws", func(c *gin.Context) {

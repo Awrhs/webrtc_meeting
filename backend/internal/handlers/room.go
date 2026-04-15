@@ -221,3 +221,13 @@ func (h *Handler) TransferOwner(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"message": "ownership transferred"})
 }
+
+func (h *Handler) NotifyConnectionFailed(c *gin.Context) {
+	idStr := c.Param("roomId")
+	roomID, _ := strconv.Atoi(idStr)
+	userIdStr := c.Param("userId")
+	userID, _ := strconv.Atoi(userIdStr)
+
+	h.hub.SendConnectionFailed(uint(roomID), uint(userID))
+	c.JSON(http.StatusOK, gin.H{"message": "notification sent"})
+}

@@ -1,9 +1,13 @@
 package sfu
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/gorilla/websocket"
@@ -206,7 +210,42 @@ func (s *SFUServer) onConnectionStateChange(room *Room, peer *Peer, state webrtc
 			delete(s.rooms, room.ID)
 			s.mu.Unlock()
 		}
+
+		if state == webrtc.PeerConnectionStateFailed {
+			s.logger.Warn("Peer connection failed (ICE negotiation failed)", 
+				zap.Uint("roomID", room.ID), 
+				zap.Uint("userID", peer.UserID))
+			s.notifyConnectionFailed(room.ID, peer.UserID)
+		}
 	}
+}
+
+func (s *SFUServer) notifyConnectionFailed(roomID uint, userID uint) {
+	apiHost := getAPIHost()
+	url := apiHost + "/api/v1/sfu/callback/" + strconv.Itoa(int(roomID)) + "/" + strconv.Itoa(int(userID)) + "/connection-failed"
+	
+	client := &http.Client{}
+	req, _ := http.NewRequest("POST", url, nil)
+	req.Header.Set("Content-Type", "application/json")
+	
+	_, err := client.Do(req)
+	if err != nil {
+		s.logger.Error("Failed to notify connection failed to API server", 
+			zap.Error(err),
+			zap.Uint("roomID", roomID), 
+			zap.Uint("userID", userID))
+	}
+}
+
+func getAPIHost() string {
+	apiHost := os.Getenv("API_SERVER_HOST")
+	if apiHost == "" {
+		return "http://api-server:8080"
+	}
+	if !strings.HasPrefix(apiHost, "http") {
+		return "http://" + apiHost
+	}
+	return apiHost
 }
 
 func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
