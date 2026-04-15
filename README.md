@@ -2,7 +2,7 @@
 
 基于Pion WebRTC的企业级跨平台音视频会议系统，支持Web/桌面/移动端，全链路加密，完整权限管理。
 
-## 技术栈
+## 📋 技术栈
 
 ### 后端
 - **控制面**: Go + Gin 框架
@@ -22,87 +22,28 @@
 - **STUN/TURN**: Coturn
 - **容器化**: Docker + Docker Compose
 
-## 核心功能
+## ✨ 功能特性
 
-- ✅ 用户系统（注册/登录/信息管理）
-- ✅ 房间管理（创建/加入/验证/状态管理）
-- ✅ 三级权限管理（房主/管理员/普通成员）
-- ✅ SFU音视频通信（基于Pion WebRTC）
-- ✅ 文本聊天（公聊+端到端加密私聊）
-- ✅ 屏幕共享、举手发言、会议录制
-- ✅ 全链路加密（DTLS/SRTP + AES + HTTPS/WSS）
-- ✅ 跨平台适配（Web/桌面/移动端）
+### 核心功能
+- ✅ **用户系统** - 手机号/邮箱注册登录，bcrypt加密存储，个人资料编辑，设备管理
+- ✅ **房间管理** - 支持临时/永久房间，密码/邀请码验证，房主可锁房/解散房间
+- ✅ **三级权限管理** - 房主(全部权限) → 管理员(kick/禁言) → 普通成员，踢人10分钟禁入
+- ✅ **SFU音视频通信** - 基于Pion WebRTC，支持摄像头/麦克风开关，回声消除/噪音抑制，自适应码率
+- ✅ **屏幕共享** - 支持全屏/指定窗口共享，可同时开启摄像头
+- ✅ **文本聊天** - 公聊+私聊，私聊AES端到端加密，支持图片/文件
+- ✅ **会议控制** - 举手发言、成员列表、@提醒、断线重连
+- ✅ **全链路加密** - DTLS/SRTP(音视频) + AES(聊天) + HTTPS/WSS(信令)
+- ✅ **跨平台** - Web/桌面/移动端一套代码，适配不同屏幕
 
-## 快速开始
+### 技术优势
+- **完全匹配Go技术栈**：后端全Go，媒体面也是纯Go(Pion)，无需学习其他语言
+- **SFU模型优势**：相比Mesh，上行带宽从 N× 降到 1×，支持500人同时会议
+- **全链路安全**：端到端加密，服务器不存储私聊明文，密码bcrypt哈希
+- **容器化一键部署**：Docker Compose 启动所有服务，无需手动配置环境
 
-### 使用 Docker Compose 启动
+## 🏗️ 项目架构
 
-```bash
-cp .env.example .env
-docker-compose -f deployment/docker-compose.yml up -d --build
-```
-
-或者使用 Makefile：
-
-```bash
-cp .env.example .env
-make docker-up
-```
-
-### 本地开发
-
-#### 后端编译运行
-
-```bash
-cd backend/cmd/server
-go build -o server
-./server
-```
-
-#### SFU媒体服务
-
-```bash
-cd backend/cmd/sfu
-go build -o sfu
-./sfu
-```
-
-#### 前端开发
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
-
-## 项目结构
-
-```
-conference-basted_on_the-SFU model/
-├── backend/
-│   ├── cmd/              # 入口程序
-│   │   ├── server/       # 信令/API服务器
-│   │   └── sfu/          # SFU媒体服务器
-│   ├── internal/         # 内部模块
-│   │   ├── models/       # 数据模型
-│   │   ├── handlers/     # API处理器
-│   │   ├── service/      # 业务逻辑
-│   │   ├── repository/   # 数据访问
-│   │   ├── sfu/          # SFU媒体处理
-│   │   ├── signaling/    # 信令处理
-│   │   └── middleware/   # 中间件
-│   └── pkg/              # 公共包
-├── frontend/             # React前端
-├── deployment/           # 部署配置
-│   ├── docker/           # Dockerfile
-│   └── docker-compose.yml
-└── README.md
-```
-
-## 项目架构
-
-### 整体架构图
-
+### 整体架构
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     用户端 (Web/桌面/移动端)                    │
@@ -143,35 +84,196 @@ conference-basted_on_the-SFU model/
 ```
 
 ### 分层说明
-
 1. **用户端层**：React 18 + TypeScript 开发，一套代码通过 Electron/Capacitor 打包到全平台
 2. **接入层**：Nginx 反向代理，支持 SSL / WSS，负载均衡
 3. **控制面**：Go + Gin，处理 HTTP API、WebSocket 信令、业务逻辑
 4. **媒体面**：Pion WebRTC (纯Go) SFU服务器，处理音视频流转发
 5. **基础设施**：PostgreSQL 持久化，Redis 缓存在线状态，Coturn 做 NAT 穿透
 
-## 功能特性
+## 📁 项目结构
 
-### 核心功能
+```
+conference-sfu/
+├── backend/
+│   ├── cmd/              # 入口程序
+│   │   ├── server/       # 信令/API服务器
+│   │   └── sfu/          # SFU媒体服务器
+│   ├── internal/         # 内部模块
+│   │   ├── models/       # 数据模型
+│   │   ├── handlers/     # API处理器
+│   │   ├── service/      # 业务逻辑
+│   │   ├── repository/   # 数据访问
+│   │   ├── sfu/          # SFU媒体处理
+│   │   ├── signaling/    # 信令处理
+│   │   └── middleware/   # 中间件
+│   └── pkg/              # 公共包
+├── frontend/             # React前端
+├── deployment/           # 部署配置
+│   ├── docker/           # Dockerfile
+│   └── docker-compose.yml
+└── README.md
+```
 
-✅ **用户系统** - 手机号/邮箱注册登录，bcrypt加密存储，个人资料编辑，设备管理  
-✅ **房间管理** - 支持临时/永久房间，密码/邀请码验证，房主可锁房/解散房间  
-✅ **三级权限管理** - 房主(全部权限) → 管理员(kick/禁言) → 普通成员，踢人10分钟禁入  
-✅ **SFU音视频通信** - 基于Pion WebRTC，支持摄像头/麦克风开关，回声消除/噪音抑制，自适应码率  
-✅ **屏幕共享** - 支持全屏/指定窗口共享，可同时开启摄像头  
-✅ **文本聊天** - 公聊+私聊，私聊AES端到端加密，支持图片/文件  
-✅ **会议控制** - 举手发言、成员列表、@提醒、断线重连  
-✅ **全链路加密** - DTLS/SRTP(音视频) + AES(聊天) + HTTPS/WSS(信令)  
-✅ **跨平台** - Web/桌面/移动端一套代码，适配不同屏幕  
+## 🚀 快速开始
 
-### 技术优势
+### 使用 Docker Compose 启动
 
-- **完全匹配Go团队**：后端全Go，媒体面也是纯Go(Pion)，不用学Node.js/其他语言
-- **SFU模型优势**：相比Mesh，上行带宽从 N* 降到 1*，支持500人同时会议
-- **全链路安全**：端到端加密，服务器不存私聊明文，密码bcrypt哈希
-- **容器化一键部署**：Docker Compose 启动所有服务，不用手动配置环境
+```bash
+cp .env.example .env
+docker-compose -f deployment/docker-compose.yml up -d --build
+```
 
-## 开发过程中的难点与解决方案
+或者使用 Makefile：
+
+```bash
+cp .env.example .env
+make docker-up
+```
+
+### 本地开发
+
+#### 环境准备
+```bash
+# 安装 Go 1.21+、Node.js 18+、Docker
+cp .env.example .env
+# 启动所有基础设施（postgres、redis、coturn）
+docker-compose -f deployment/docker-compose.yml up -d postgres redis coturn
+```
+
+#### 后端编译运行
+
+```bash
+go run backend/cmd/server/main.go
+```
+
+#### SFU媒体服务
+
+```bash
+go run backend/cmd/sfu/main.go
+```
+
+#### 前端开发
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+## 🧑‍💻 二次开发指南
+
+### 开发入口
+- **后端入口**: `backend/cmd/server/main.go`
+- **SFU 媒体服务**: `backend/cmd/sfu/main.go`
+- **前端入口**: `frontend/src/main.tsx`
+
+### 代码分层规范
+保持以下分层结构，便于后续维护：
+- `backend/internal/models` → 数据模型定义
+- `backend/internal/repository` → 数据库操作
+- `backend/internal/service` → 业务逻辑
+- `backend/internal/handlers` → HTTP API
+- `backend/internal/signaling` → WebSocket信令
+- `backend/internal/sfu` → 媒体处理
+
+### 开发流程
+1. **后端开发**：在 `backend/internal/handlers/` 添加 handler，在 `main.go` 注册路由
+2. **前端开发**：在 `frontend/src/pages/` 添加页面，在 `App.tsx` 添加路由
+3. **修改 SFU 逻辑**：编辑 `backend/internal/sfu/server.go`
+
+### 新增功能建议顺序
+1. **先理解核心流程**：用户登录 → 创建房间 → 加入房间 → WebSocket连接 → WebRTC连接 → SFU转发
+2. **从小改到大**：先改UI文案、样式，再逐步添加新功能
+3. **优先核心功能**：核心功能完成后，再添加会议预约、邀请链接、虚拟背景等扩展功能
+
+### 部署
+- 修改完代码，重新构建镜像：`make docker-up`
+- 查看日志：`make docker-logs`
+
+### 打包多端应用
+
+本项目采用**一套React代码，通过工具打包到多端**的方案，确实可以做到一套代码生成Web/桌面/移动端应用。
+
+#### 打包 Web 应用（已经默认配置）
+
+```bash
+cd frontend
+npm install
+npm run build
+```
+
+打包产物在 `frontend/dist/` 目录，可以直接部署到任何静态文件服务器。
+
+#### 打包桌面端应用（Windows/Mac/Linux）- Electron
+
+首先在 frontend 目录初始化 Electron：
+
+```bash
+cd frontend
+# 安装 Electron 相关依赖
+npm install --save-dev electron electron-builder
+npm install --save electron-is-dev
+
+# 初始化 Electron 入口文件
+# 创建 electron/main.js
+# 在 package.json 中添加 electron 配置和打包脚本
+```
+
+添加以下脚本到 `frontend/package.json`：
+
+```json
+{
+  "main": "electron/main.js",
+  "scripts": {
+    "electron:build": "npm run build && electron-builder",
+    "electron:dev": "electron ."
+  }
+}
+```
+
+打包：
+
+```bash
+npm run electron:build
+```
+
+打包完成后会在 `dist/` 生成对应平台的安装包（`.exe`/`.dmg`/`.deb` 等）。
+
+#### 打包移动端应用（iOS/Android）- Capacitor
+
+首先在 frontend 目录初始化 Capacitor：
+
+```bash
+cd frontend
+npm run build
+# 安装 Capacitor
+npm install @capacitor/core @capacitor/cli
+npx cap init
+
+# 添加目标平台
+npm install @capacitor/ios @capacitor/android
+npx cap add ios
+npx cap add android
+```
+
+更新并编译：
+
+```bash
+npm run build
+npx cap sync
+# 打开 Xcode 编译 iOS
+npx cap open ios
+# 打开 Android Studio 编译 Android
+npx cap open android
+```
+
+#### 技术说明
+
+- **原理**：React 代码先编译为静态 HTML/CSS/JS，然后由 Electron/Capacitor 把这些静态资源包裹在原生容器中运行
+- **优势**：一套代码，不用分别写 Web、桌面、移动端三套代码，大幅降低开发维护成本
+- **原生能力**：通过 Electron/Capacitor 的 API 可以调用摄像头、麦克风、存储等原生能力，WebRTC 可以正常工作
+
+## 🔧 开发难点与解决方案
 
 ### 1. SFU 模型理解和流转发问题
 
@@ -182,7 +284,7 @@ conference-basted_on_the-SFU model/
 **解决方案**：
 - 当新用户加入，SFU 把已在房间中所有用户的轨道都添加给新用户
 - 新用户发布自己的轨道后，SFU 把这个轨道添加给所有已在线用户
-- 使用 Pion WebRTC 的 `OnTrack` 回调，创建本地 Track 转发，这样就是最简单有效的选择转发
+- 使用 Pion WebRTC 的 `OnTrack` 回调，创建本地 Track 转发，这是最简单有效的选择转发方式
 
 ### 2. WebRTC 信令同步问题
 
@@ -194,7 +296,7 @@ conference-basted_on_the-SFU model/
 - 设计 Hub 结构维护每个房间中在线用户的 WebSocket 连接
 - 通过 WebSocket 传输所有信令消息，每条消息带上 `target_id`
 - 如果有目标ID就单发，否则广播给房间所有人
-- 这样实现简单，逻辑清晰，不容易出问题
+- 实现简单，逻辑清晰，不容易出问题
 
 ### 3. 权限控制设计问题
 
@@ -230,51 +332,6 @@ conference-basted_on_the-SFU model/
 - 服务器只转发/存储密文，无法解密
 - 公聊不加密(因为所有人都能看)，节省性能
 
-## 二次开发建议
-
-### 如何开始修改
-
-1. **环境准备**
-   ```bash
-   # 安装 Go 1.21+、Node.js 18+、Docker
-   cp .env.example .env
-   # 启动所有基础设施（postgres、redis）
-   docker-compose -f deployment/docker-compose.yml up -d postgres redis coturn
-   ```
-
-2. **后端开发**
-   - 入口：[backend/cmd/server/main.go](file:///c:/Users/My_PC/myproject/conference_based_on_the-SFU%20model/backend/cmd/server/main.go)
-   - 添加新 API：在 `backend/internal/handlers/` 加 handler，在 `main.go` 注册路由
-   - 修改SFU逻辑：[backend/internal/sfu/server.go](file:///c:/Users/My_PC/myproject/conference_based_on_the-SFU%20model/backend/internal/sfu/server.go)
-   - 运行：`go run backend/cmd/server/main.go` + `go run backend/cmd/sfu/main.go`
-
-3. **前端开发**
-   - 入口：[frontend/src/main.tsx](file:///c:/Users/My_PC/myproject/conference_based_on_the-SFU%20model/frontend/src/main.tsx)
-   - 添加新页面：在 `frontend/src/pages/` 新建页面，在 `App.tsx` 加路由
-   - 修改组件：在 `frontend/src/components/` 改
-   - 运行：`cd frontend && npm run dev`
-
-### 新增功能建议顺序
-
-1. **先懂核心流程**：用户登录 → 创建房间 → 加入房间 → WebSocket连接 → WebRTC连接 → SFU转发
-2. **从小改到大**：先改UI文案、样式，再加新功能
-3. **P0 之后加P1**：现在核心功能齐了，可以加会议预约、邀请链接、虚拟背景这些非核心功能
-
-### 代码结构保持
-
-- `internal/models` → 放数据模型定义
-- `internal/repository` → 放数据库操作
-- `internal/service` → 放业务逻辑
-- `internal/handlers` → 放HTTP API
-- `internal/signaling` → 放WebSocket信令
-- `internal/sfu` → 放媒体处理
-- 保持这个分层，后续好维护
-
-### 部署
-
-- 修改完代码，重新构建镜像：`make docker-up`
-- 查看日志：`make docker-logs`
-
-## 许可证
+## 📄 许可证
 
 MIT
