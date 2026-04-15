@@ -178,15 +178,14 @@ func (h *Hub) BroadcastKick(roomID uint, targetID uint) {
 }
 
 func (h *Hub) BroadcastMute(roomID uint, targetID uint, isMuted bool) {
-	data, _ := json.Marshal(map[string]bool{"is_muted": isMuted})
 	msg := Message{
 		Type:   MessageTypeMuted,
 		RoomID: roomID,
 		UserID: targetID,
-		Data:   json.RawMessage(data),
+		Data:   json.RawMessage(`{"is_muted": ` + string(rune(isMuted)) + `}`),
 	}
-	raw, _ := json.Marshal(msg)
-	h.BroadcastToRoom(roomID, raw, 0)
+	data, _ := json.Marshal(msg)
+	h.BroadcastToRoom(roomID, data, 0)
 }
 
 func (h *Hub) BroadcastRoleChanged(roomID uint, userID uint, role models.Role) {
@@ -250,6 +249,7 @@ func (c *Client) ReadPump() {
 	}
 
 func (c *Client) handleMessage(msg *Message) {
+	var err error
 	switch msg.Type {
 	case MessageTypeJoinRoom:
 		c.hub.AddClientToRoom(c, msg.RoomID)

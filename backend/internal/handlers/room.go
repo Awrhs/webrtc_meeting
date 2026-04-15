@@ -64,6 +64,12 @@ func (h *Handler) GetRoom(c *gin.Context) {
 
 func (h *Handler) JoinRoom(c *gin.Context) {
 	userID := GetUserID(c)
+	idStr := c.Param("id")
+	roomID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
 
 	var req models.JoinRoomRequest
 	if err := c.ShouldBindJSON(&req); err != nil {

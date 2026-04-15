@@ -27,9 +27,9 @@ vendor/
 Thumbs.db
 
 # Environment
-.env
-.env.local
-.env.*
+# .env
+# .env.local
+# .env.*
 
 # Logs
 *.log
