@@ -159,7 +159,7 @@ func (s *SFUServer) HandleOffer(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(response)
 }
 
-func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 	localTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), track.StreamID())
 	if err != nil {
 		s.logger.Error("Failed to create local track", zap.Error(err))
