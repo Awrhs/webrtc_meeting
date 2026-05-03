@@ -100,7 +100,20 @@ func (s *userService) Login(account, password string) (string, *models.User, err
 }
 
 func (s *userService) GetUserByID(id uint) (*models.User, error) {
-	return s.repo.FindByID(id)
+	// Try cache first
+	if cached, err := s.redis.GetUser(id); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	// Cache miss, fetch from DB
+	user, err := s.repo.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache the result
+	s.redis.SetUser(user)
+	return user, nil
 }
 
 func (s *userService) UpdateProfile(userID uint, nickname, avatar string) error {
@@ -114,7 +127,13 @@ func (s *userService) UpdateProfile(userID uint, nickname, avatar string) error 
 		user.Avatar = avatar
 	}
 
-	return s.repo.Update(user)
+	if err := s.repo.Update(user); err != nil {
+		return err
+	}
+
+	// Invalidate cache after update
+	s.redis.DeleteUser(userID)
+	return nil
 }
 
 func (s *userService) UpdatePassword(userID uint, oldPassword, newPassword string) error {

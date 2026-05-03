@@ -82,11 +82,27 @@ func (s *roomService) CreateRoom(ownerID uint, req *models.CreateRoomRequest) (*
 
 	s.redis.AddToRoom(room.ID, ownerID)
 
+	// Invalidate user's rooms cache after creating a new room
+	s.redis.DeleteUserRooms(ownerID)
+
 	return room, nil
 }
 
 func (s *roomService) GetRoomByID(id uint) (*models.Room, error) {
-	return s.roomRepo.FindByID(id)
+	// Try cache first
+	if cached, err := s.redis.GetRoom(id); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	// Cache miss, fetch from DB
+	room, err := s.roomRepo.FindByID(id)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache the result
+	s.redis.SetRoom(room)
+	return room, nil
 }
 
 func (s *roomService) GetRoomByRoomID(roomID string) (*models.Room, error) {
@@ -94,7 +110,20 @@ func (s *roomService) GetRoomByRoomID(roomID string) (*models.Room, error) {
 }
 
 func (s *roomService) GetMyRooms(userID uint) ([]*models.Room, error) {
-	return s.roomRepo.FindRoomsByUserID(userID)
+	// Try cache first
+	if cached, err := s.redis.GetUserRooms(userID); err == nil && cached != nil {
+		return cached, nil
+	}
+
+	// Cache miss, fetch from DB
+	rooms, err := s.roomRepo.FindRoomsByUserID(userID)
+	if err != nil {
+		return nil, err
+	}
+
+	// Cache the result
+	s.redis.SetUserRooms(userID, rooms)
+	return rooms, nil
 }
 
 func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string) (*models.Room, []*models.RoomMemberInfo, error) {
@@ -163,6 +192,10 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 
 	s.redis.AddToRoom(room.ID, userID)
 
+	// Invalidate room and user rooms cache
+	s.redis.DeleteRoom(room.ID)
+	s.redis.DeleteUserRooms(userID)
+
 	membersInfo, err := s.GetRoomMembersInfo(room.ID)
 	return room, membersInfo, err
 }
@@ -188,6 +221,10 @@ func (s *roomService) LeaveRoom(roomID uint, userID uint) error {
 	room.CurrentSize = int(count)
 	s.roomRepo.Update(room)
 
+	// Invalidate caches
+	s.redis.DeleteRoom(roomID)
+	s.redis.DeleteUserRooms(userID)
+
 	if count == 0 && !room.IsPermanent {
 		return s.roomRepo.Delete(roomID)
 	}
@@ -210,7 +247,13 @@ func (s *roomService) LockRoom(roomID uint, userID uint, locked bool) error {
 	}
 
 	room.IsLocked = locked
-	return s.roomRepo.Update(room)
+	if err := s.roomRepo.Update(room); err != nil {
+		return err
+	}
+
+	// Invalidate room cache
+	s.redis.DeleteRoom(roomID)
+	return nil
 }
 
 func (s *roomService) DeleteRoom(roomID uint, userID uint) error {
@@ -219,7 +262,14 @@ func (s *roomService) DeleteRoom(roomID uint, userID uint) error {
 		return errors.New("permission denied")
 	}
 
-	return s.roomRepo.Delete(roomID)
+	if err := s.roomRepo.Delete(roomID); err != nil {
+		return err
+	}
+
+	// Invalidate room cache
+	s.redis.DeleteRoom(roomID)
+	s.redis.DeleteUserRooms(userID)
+	return nil
 }
 
 func (s *roomService) KickMember(roomID uint, requesterID uint, targetID uint) error {
@@ -260,6 +310,10 @@ func (s *roomService) KickMember(roomID uint, requesterID uint, targetID uint) e
 	room, _ := s.roomRepo.FindByID(roomID)
 	room.CurrentSize = int(count)
 	s.roomRepo.Update(room)
+
+	// Invalidate caches after kicking a member
+	s.redis.DeleteRoom(roomID)
+	s.redis.DeleteUserRooms(targetID)
 
 	return nil
 }

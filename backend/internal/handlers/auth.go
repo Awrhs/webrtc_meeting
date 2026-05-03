@@ -4,11 +4,13 @@ import (
 	"conference-sfu/backend/internal/models"
 	"conference-sfu/backend/internal/service"
 	"conference-sfu/backend/internal/signaling"
+	"conference-sfu/backend/internal/sfu"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 	"github.com/golang-jwt/jwt/v5"
+	"go.uber.org/zap"
 )
 
 type Handler struct {
@@ -16,14 +18,18 @@ type Handler struct {
 	roomService  service.RoomService
 	chatService  service.ChatService
 	hub          *signaling.Hub
+	sfuClient    *sfu.ControlClient
+	logger       *zap.Logger
 }
 
-func NewHandler(userService service.UserService, roomService service.RoomService, chatService service.ChatService, hub *signaling.Hub) *Handler {
+func NewHandler(userService service.UserService, roomService service.RoomService, chatService service.ChatService, hub *signaling.Hub, sfuClient *sfu.ControlClient, logger *zap.Logger) *Handler {
 	return &Handler{
 		userService: userService,
 		roomService: roomService,
 		chatService: chatService,
 		hub:         hub,
+		sfuClient:   sfuClient,
+		logger:      logger,
 	}
 }
 

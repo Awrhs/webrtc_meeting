@@ -3,6 +3,8 @@ package repository
 import (
 	"conference-sfu/backend/internal/models"
 	"context"
+	"encoding/json"
+	"fmt"
 	"strconv"
 	"time"
 
@@ -137,4 +139,112 @@ func (r *RedisClient) GetRoomMembers(roomID uint) ([]uint, error) {
 
 func (r *RedisClient) Close() error {
 	return r.client.Close()
+}
+
+// ==================== User Cache Methods ====================
+
+const (
+	userCacheKeyPrefix    = "user:"
+	userCacheTTL          = 15 * time.Minute
+	roomCacheKeyPrefix    = "room:info:"
+	roomCacheTTL          = 10 * time.Minute
+	userRoomsCachePrefix  = "user:rooms:"
+	userRoomsCacheTTL     = 5 * time.Minute
+)
+
+func (r *RedisClient) SetUser(user *models.User) error {
+	ctx := context.Background()
+	data, err := json.Marshal(user)
+	if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("%s%d", userCacheKeyPrefix, user.ID)
+	return r.client.Set(ctx, key, data, userCacheTTL).Err()
+}
+
+func (r *RedisClient) GetUser(userID uint) (*models.User, error) {
+	ctx := context.Background()
+	key := fmt.Sprintf("%s%d", userCacheKeyPrefix, userID)
+	data, err := r.client.Get(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var user models.User
+	if err := json.Unmarshal([]byte(data), &user); err != nil {
+		return nil, err
+	}
+	return &user, nil
+}
+
+func (r *RedisClient) DeleteUser(userID uint) error {
+	ctx := context.Background()
+	key := fmt.Sprintf("%s%d", userCacheKeyPrefix, userID)
+	return r.client.Del(ctx, key).Err()
+}
+
+// ==================== Room Cache Methods ====================
+
+func (r *RedisClient) SetRoom(room *models.Room) error {
+	ctx := context.Background()
+	data, err := json.Marshal(room)
+	if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("%s%d", roomCacheKeyPrefix, room.ID)
+	return r.client.Set(ctx, key, data, roomCacheTTL).Err()
+}
+
+func (r *RedisClient) GetRoom(roomID uint) (*models.Room, error) {
+	ctx := context.Background()
+	key := fmt.Sprintf("%s%d", roomCacheKeyPrefix, roomID)
+	data, err := r.client.Get(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var room models.Room
+	if err := json.Unmarshal([]byte(data), &room); err != nil {
+		return nil, err
+	}
+	return &room, nil
+}
+
+func (r *RedisClient) DeleteRoom(roomID uint) error {
+	ctx := context.Background()
+	key := fmt.Sprintf("%s%d", roomCacheKeyPrefix, roomID)
+	return r.client.Del(ctx, key).Err()
+}
+
+// ==================== User Rooms Cache Methods ====================
+
+func (r *RedisClient) SetUserRooms(userID uint, rooms []*models.Room) error {
+	ctx := context.Background()
+	data, err := json.Marshal(rooms)
+	if err != nil {
+		return err
+	}
+	key := fmt.Sprintf("%s%d", userRoomsCachePrefix, userID)
+	return r.client.Set(ctx, key, data, userRoomsCacheTTL).Err()
+}
+
+func (r *RedisClient) GetUserRooms(userID uint) ([]*models.Room, error) {
+	ctx := context.Background()
+	key := fmt.Sprintf("%s%d", userRoomsCachePrefix, userID)
+	data, err := r.client.Get(ctx, key).Result()
+	if err != nil {
+		return nil, err
+	}
+
+	var rooms []*models.Room
+	if err := json.Unmarshal([]byte(data), &rooms); err != nil {
+		return nil, err
+	}
+	return rooms, nil
+}
+
+func (r *RedisClient) DeleteUserRooms(userID uint) error {
+	ctx := context.Background()
+	key := fmt.Sprintf("%s%d", userRoomsCachePrefix, userID)
+	return r.client.Del(ctx, key).Err()
 }

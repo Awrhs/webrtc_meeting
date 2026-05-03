@@ -6,6 +6,7 @@ import (
 	"strconv"
 
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
 func (h *Handler) CreateRoom(c *gin.Context) {
@@ -124,6 +125,13 @@ func (h *Handler) KickMember(c *gin.Context) {
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Call SFU to force disconnect the user's media connection
+	if h.sfuClient != nil {
+		if err := h.sfuClient.KickUser(uint(roomID), uint(targetID), "kicked by admin"); err != nil {
+			h.logger.Warn("Failed to kick user from SFU, continuing with signaling", zap.Error(err))
+		}
 	}
 
 	h.hub.BroadcastKick(uint(roomID), uint(targetID))

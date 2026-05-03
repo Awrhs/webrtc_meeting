@@ -6,6 +6,7 @@ import (
 	"conference-sfu/backend/internal/repository"
 	"conference-sfu/backend/internal/service"
 	"conference-sfu/backend/internal/signaling"
+	"conference-sfu/backend/internal/sfu"
 	"conference-sfu/backend/pkg/logger"
 
 	"github.com/gin-contrib/cors"
@@ -34,6 +35,15 @@ func main() {
 	roomService := service.NewRoomService(roomRepo, userRepo, redisClient)
 	chatService := service.NewChatService(chatRepo, roomRepo)
 
+	// Connect to SFU gRPC control server
+	sfuClient, err := sfu.NewControlClient(cfg.SFUAddr, log)
+	if err != nil {
+		log.Warn("Failed to connect to SFU gRPC server, running without SFU control", zap.Error(err))
+	} else {
+		defer sfuClient.Close()
+		log.Info("Connected to SFU gRPC server successfully", zap.String("addr", cfg.SFUAddr))
+	}
+
 	hub := signaling.NewHub(roomService, chatService, log)
 	go hub.Run()
 
@@ -47,7 +57,7 @@ func main() {
 		AllowCredentials: true,
 	}))
 
-	handler := handlers.NewHandler(userService, roomService, chatService, hub)
+	handler := handlers.NewHandler(userService, roomService, chatService, hub, sfuClient, log)
 
 	api := r.Group("/api/v1")
 	{

@@ -10,6 +10,8 @@ import (
 type Config struct {
 	ServerPort     string
 	SFUPort        string
+	SFUGRPCPort    string
+	SFUAddr        string
 	DatabaseDSN    string
 	RedisAddr      string
 	RedisPassword  string
@@ -63,6 +65,8 @@ func Load() *Config {
 	return &Config{
 		ServerPort:     port,
 		SFUPort:        sfuPort,
+		SFUGRPCPort:    getEnv("SFU_GRPC_PORT", "50051"),
+		SFUAddr:        getEnv("SFU_ADDR", "localhost:50051"),
 		DatabaseDSN:    dsn,
 		RedisAddr:      getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword:  getEnv("REDIS_PASSWORD", ""),

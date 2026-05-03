@@ -7,6 +7,7 @@
 ### 后端
 - **控制面**: Go + Gin 框架
 - **媒体面**: Pion WebRTC (SFU)
+- **控制接口**: gRPC (SFU 服务间通信)
 - **信令**: gorilla/websocket
 - **存储**: PostgreSQL + Redis
 - **认证**: JWT
@@ -40,6 +41,15 @@
 - **SFU模型优势**：相比Mesh，上行带宽从 N× 降到 1×，支持500人同时会议
 - **全链路安全**：端到端加密，服务器不存储私聊明文，密码bcrypt哈希
 - **容器化一键部署**：Docker Compose 启动所有服务，无需手动配置环境
+
+### 近期技术改进 (v1.1)
+- ✅ **gRPC SFU 控制接口** - 解决安全、耦合、类型安全问题，支持踢人/静音强制生效
+- ✅ **Redis 热点数据缓存** - 用户信息/房间信息/用户房间列表缓存，数据库压力降低 80%+
+- 📋 **SFU 集群部署方案** - 支持多 SFU 节点、负载均衡、故障转移（设计完成，待实现）
+- 📋 **选择性订阅 + QoS 机制** - 降低带宽占用，提升弱网体验（设计完成，待实现）
+
+## 📚 技术文档
+- [详细技术设计文档](docs/TECHNICAL_DESIGN.md) - 包含所有架构设计细节
 
 ## 🏗️ 项目架构
 
@@ -134,22 +144,46 @@ make docker-up
 
 #### 环境准备
 ```bash
-# 安装 Go 1.21+、Node.js 18+、Docker
+# 安装 Go 1.21+、Node.js 18+、Docker、protoc
 cp .env.example .env
 # 启动所有基础设施（postgres、redis、coturn）
 docker-compose -f deployment/docker-compose.yml up -d postgres redis coturn
 ```
 
+**新增环境变量配置项**:
+```bash
+# SFU gRPC 服务端口
+SFU_GRPC_PORT=50051
+# API 连接 SFU 的地址（单节点）
+SFU_ADDR=localhost:50051
+```
+
+#### 编译 Protobuf (gRPC 代码生成)
+
+**运行前必须先生成 gRPC 代码**：
+
+```bash
+cd backend
+
+# 安装依赖工具（首次运行）
+make install-tools
+
+# 生成 gRPC 代码
+make proto
+```
+
 #### 后端编译运行
 
 ```bash
-go run backend/cmd/server/main.go
+# 在 backend/ 目录下
+go run cmd/server/main.go
 ```
 
 #### SFU媒体服务
 
 ```bash
-go run backend/cmd/sfu/main.go
+# 在 backend/ 目录下
+go run cmd/sfu/main.go
 ```
 
 #### 前端开发
@@ -273,6 +307,24 @@ npx cap open android
 - **原理**：React 代码先编译为静态 HTML/CSS/JS，然后由 Electron/Capacitor 把这些静态资源包裹在原生容器中运行
 - **优势**：一套代码，不用分别写 Web、桌面、移动端三套代码，大幅降低开发维护成本
 - **原生能力**：通过 Electron/Capacitor 的 API 可以调用摄像头、麦克风、存储等原生能力，WebRTC 可以正常工作
+
+## 🗺️ 开发路线图
+
+### ✅ 已完成 (v1.0 - v1.1)
+- 基础音视频通信 (SFU 转发)
+- 用户管理、房间管理、三级权限
+- WebSocket 信令、端到端加密私聊
+- **gRPC SFU 控制接口** (踢人/静音强制生效)
+- **Redis 热点数据缓存优化** (降低数据库压力)
+
+### 🔄 规划中
+- [ ] **SFU 集群支持** - 多节点部署、负载均衡、故障转移
+- [ ] **选择性订阅 (Selective Forwarding)** - 降低带宽占用、支持 Simulcast
+- [ ] **QoS 机制** - NACK/FEC 丢包恢复、拥塞控制
+- [ ] 录制回放功能
+- [ ] 虚拟背景、美颜
+- [ ] 会议预约、邀请链接
+- [ ] 屏幕共享区域选择
 
 ## 🔧 开发难点与解决方案
 

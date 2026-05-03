@@ -15,6 +15,12 @@ func main() {
 
 	sfuServer := sfu.NewSFUServer(log)
 
+	// Start gRPC control server
+	_, err := sfu.StartGRPCServer(sfuServer, cfg.SFUGRPCPort, log)
+	if err != nil {
+		log.Fatal("Failed to start gRPC server", zap.Error(err))
+	}
+
 	http.HandleFunc("/offer", sfuServer.HandleOffer)
 	http.HandleFunc("/ws", sfuServer.HandleWebSocket)
 

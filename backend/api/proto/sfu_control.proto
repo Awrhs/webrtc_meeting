@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package sfu_control;
+
+option go_package = "./sfu_control;sfu_control";
+
+// SFU Control Service
+service SFUControl {
+  // Kick a user from the room
+  rpc KickUser(KickUserRequest) returns (KickUserResponse);
+
+  // Mute/Unmute a user's audio
+  rpc MuteUser(MuteUserRequest) returns (MuteUserResponse);
+
+  // Enable/Disable a user's video
+  rpc SetVideoEnabled(SetVideoEnabledRequest) returns (SetVideoEnabledResponse);
+
+  // Get room statistics
+  rpc GetRoomStats(GetRoomStatsRequest) returns (GetRoomStatsResponse);
+
+  // Get all rooms on this SFU node
+  rpc ListRooms(ListRoomsRequest) returns (ListRoomsResponse);
+
+  // Force close a specific peer connection
+  rpc ClosePeerConnection(ClosePeerConnectionRequest) returns (ClosePeerConnectionResponse);
+}
+
+message KickUserRequest {
+  uint32 room_id = 1;
+  uint32 user_id = 2;
+  string reason = 3;
+}
+
+message KickUserResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message MuteUserRequest {
+  uint32 room_id = 1;
+  uint32 user_id = 2;
+  bool is_muted = 3;
+}
+
+message MuteUserResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message SetVideoEnabledRequest {
+  uint32 room_id = 1;
+  uint32 user_id = 2;
+  bool enabled = 3;
+}
+
+message SetVideoEnabledResponse {
+  bool success = 1;
+  string message = 2;
+}
+
+message PeerStats {
+  uint32 user_id = 1;
+  bool audio_enabled = 2;
+  bool video_enabled = 3;
+  int64 bytes_received = 4;
+  int64 bytes_sent = 5;
+  double jitter = 6;
+  uint32 packets_lost = 7;
+  string connection_state = 8;
+}
+
+message GetRoomStatsRequest {
+  uint32 room_id = 1;
+}
+
+message GetRoomStatsResponse {
+  uint32 room_id = 1;
+  uint32 peer_count = 2;
+  repeated PeerStats peers = 3;
+}
+
+message ListRoomsRequest {}
+
+message RoomInfo {
+  uint32 room_id = 1;
+  uint32 peer_count = 2;
+}
+
+message ListRoomsResponse {
+  repeated RoomInfo rooms = 1;
+}
+
+message ClosePeerConnectionRequest {
+  uint32 room_id = 1;
+  uint32 user_id = 2;
+}
+
+message ClosePeerConnectionResponse {
+  bool success = 1;
+  string message = 2;
+}

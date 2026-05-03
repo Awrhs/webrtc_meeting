@@ -27,9 +27,10 @@ vendor/
 Thumbs.db
 
 # Environment
-# .env
-# .env.local
-# .env.*
+.env
+.env.local
+# 注意：.env.example 必须提交到 git，作为配置模板！
+# 不要忽略 .env.example
 
 # Logs
 *.log
