@@ -32,12 +32,15 @@ services:
     ports:
       - "3478:3478"
       - "3478:3478/udp"
-      - "49152-65535:49152-65535/udp"
+      # 注意：在桥接模式下，过大的端口范围会导致Docker启动缓慢
+      # 开发环境只映射必要端口即可，如需完整端口范围请使用host网络模式（仅Linux原生环境）
+      - "49152-49200:49152-49200/udp"
     environment:
       - TURN_STATIC_AUTH_SECRET=your-turn-secret-change-in-production
       - TURN_USER=username
       - TURN_PWD=password
-    network_mode: host
+    networks:
+      - conference-net
     restart: unless-stopped
 
   api-server:
