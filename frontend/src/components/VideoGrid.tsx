@@ -5,7 +5,7 @@ interface VideoGridProps {
   members: RoomMember[]
   currentUserId: number
   localStream: MediaStream | null
-  remoteStreams: Map<number, MediaStream>
+  remoteStreams: Map<number, MediaStream[]>
 }
 
 export default function VideoGrid({
@@ -14,7 +14,9 @@ export default function VideoGrid({
   localStream,
   remoteStreams,
 }: VideoGridProps) {
-  const videoCount = members.filter(m => m.is_video_on).length + (localStream?.getVideoTracks().some(t => t.enabled) ? 1 : 0)
+  const localHasVideo = localStream?.getVideoTracks().some(t => t.enabled) || false
+  const remoteVideoCount = members.filter(m => m.is_video_on && m.user_id !== currentUserId).length
+  const videoCount = (localHasVideo ? 1 : 0) + remoteVideoCount
 
   let columns = 1
   if (videoCount >= 2 && videoCount < 4) columns = 2
@@ -25,11 +27,11 @@ export default function VideoGrid({
     gridTemplateColumns: `repeat(${columns}, 1fr)`,
   }
 
-  const activeMembers = members.filter(m => m.is_video_on)
+  const remoteMembers = members.filter(m => m.is_video_on && m.user_id !== currentUserId)
 
   return (
     <div className="video-grid" style={gridStyle}>
-      {localStream && localStream.getVideoTracks().some(t => t.enabled) && (
+      {localHasVideo && (
         <VideoCard
           stream={localStream}
           nickname="你"
@@ -37,15 +39,20 @@ export default function VideoGrid({
           muted={false}
         />
       )}
-      {activeMembers.map(member => (
-        <VideoCard
-          key={member.user_id}
-          stream={remoteStreams.get(member.user_id) || null}
-          nickname={member.nickname}
-          isSelf={member.user_id === currentUserId}
-          muted={member.is_muted}
-        />
-      ))}
+      {remoteMembers.map((member, index) => {
+        // SFU 场景：所有远程流暂存于 key=0，按索引分配（单用户演示用）
+        const streams = remoteStreams.get(member.user_id) || remoteStreams.get(0) || []
+        const stream = streams.length > index ? streams[index] : (streams[0] || null)
+        return (
+          <VideoCard
+            key={member.user_id}
+            stream={stream}
+            nickname={member.nickname}
+            isSelf={false}
+            muted={member.is_muted}
+          />
+        )
+      })}
     </div>
   )
 }

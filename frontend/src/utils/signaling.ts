@@ -1,23 +1,47 @@
 import { SignalingMessage } from '@/types'
 
-const token = localStorage.getItem('token')
-const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-const host = window.location.host
-const wsUrl = `${protocol}//${host}/ws?token=${token}`
-
 export class SignalingClient {
   private ws: WebSocket | null = null
   private handlers: Map<string, ((data: any) => void)[]> = new Map()
+  private reconnectAttempts = 0
+  private maxReconnectAttempts = 5
+  private reconnectDelay = 3000
+
+  // 动态构建 WebSocket URL
+  private getWsUrl(): string {
+    const token = localStorage.getItem('token')
+    const apiHost = import.meta.env.VITE_API_HOST || 'http://localhost:8080'
+    const wsProtocol = apiHost.startsWith('https') ? 'wss:' : 'ws:'
+    const wsHost = apiHost.replace(/^https?:\/\//, '')
+    return `${wsProtocol}//${wsHost}/ws?token=${token}`
+  }
 
   connect(): Promise<void> {
     return new Promise((resolve, reject) => {
+      const token = localStorage.getItem('token')
+      if (!token || token === 'null') {
+        reject(new Error('No authentication token found'))
+        return
+      }
+
+      // 超过最大重连次数，不再重试
+      if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+        reject(new Error('Max reconnect attempts reached'))
+        return
+      }
+
+      const wsUrl = this.getWsUrl()
+      console.log('[Signaling] Connecting to:', wsUrl.replace(/token=([^&]+)/, 'token=***'))
       this.ws = new WebSocket(wsUrl)
 
       this.ws.onopen = () => {
+        console.log('[Signaling] WebSocket connected')
+        this.reconnectAttempts = 0
         resolve()
       }
 
       this.ws.onerror = (error) => {
+        console.error('[Signaling] WebSocket error:', error)
         reject(error)
       }
 
@@ -25,17 +49,23 @@ export class SignalingClient {
         this.handleMessage(event)
       }
 
-      this.ws.onclose = () => {
-        setTimeout(() => {
-          this.connect()
-        }, 3000)
+      this.ws.onclose = (event) => {
+        console.log('[Signaling] WebSocket closed, code:', event.code)
+        // 只有正常断开过的连接才尝试重连
+        if (event.code !== 1000 && this.reconnectAttempts < this.maxReconnectAttempts) {
+          this.reconnectAttempts++
+          console.log(`[Signaling] Reconnecting... (${this.reconnectAttempts}/${this.maxReconnectAttempts})`)
+          setTimeout(() => {
+            this.connect().catch(() => {})
+          }, this.reconnectDelay)
+        }
       }
     })
   }
 
   disconnect() {
     if (this.ws) {
-      this.ws.close()
+      this.ws.close(1000, 'User disconnected')
       this.ws = null
     }
   }
@@ -43,6 +73,8 @@ export class SignalingClient {
   send(message: SignalingMessage) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message))
+    } else {
+      console.warn('[Signaling] WebSocket not connected, message not sent')
     }
   }
 
@@ -71,7 +103,7 @@ export class SignalingClient {
         handlers.forEach(handler => handler(message))
       }
     } catch (error) {
-      console.error('Failed to parse signaling message', error)
+      console.error('[Signaling] Failed to parse message:', error)
     }
   }
 }

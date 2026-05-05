@@ -1,4 +1,5 @@
-const SFU_HOST = (import.meta as any).env.VITE_SFU_HOST || 'http://localhost:8081'
+const SFU_HOST = import.meta.env.VITE_SFU_HOST || 'http://localhost:8081'
+console.log('[WebRTC] SFU host:', SFU_HOST)
 
 export const createPeerConnection = async (
   onTrack: (track: MediaStreamTrack, stream: MediaStream) => void
