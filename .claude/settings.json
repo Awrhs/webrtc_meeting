@@ -6,7 +6,11 @@
       "Bash(nc -zv localhost 5432)",
       "Bash(PGPASSWORD=postgres psql -h localhost -U postgres -d conference -c \"SELECT 1\")",
       "Bash(sudo service *)",
-      "Bash(sudo systemctl *)"
+      "Bash(sudo systemctl *)",
+      "Bash(go mod *)",
+      "Bash(npm install *)",
+      "Bash(git commit -m 'fix: 补充数据库初始化脚本v1.2新增表，完善环境变量配置 *)",
+      "Bash(git commit *)"
     ]
   }
 }
