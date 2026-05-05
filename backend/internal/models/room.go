@@ -52,6 +52,66 @@ const (
 	RoleMember  Role = "member"
 )
 
+// Permission 细粒度权限枚举
+type Permission string
+
+const (
+	PermKickMember        Permission = "kick_member"
+	PermMuteMember        Permission = "mute_member"
+	PermSetAdmin          Permission = "set_admin"
+	PermLockRoom          Permission = "lock_room"
+	PermDeleteRoom        Permission = "delete_room"
+	PermTransferOwner     Permission = "transfer_owner"
+	PermSendMessage       Permission = "send_message"
+	PermUpdateMediaState  Permission = "update_media_state"
+	PermViewRoomInfo      Permission = "view_room_info"
+	PermViewMemberList    Permission = "view_member_list"
+)
+
+// 角色权限矩阵 - 定义每个角色拥有的权限
+var RolePermissions = map[Role][]Permission{
+	RoleMember: {
+		PermSendMessage,
+		PermUpdateMediaState,
+		PermViewRoomInfo,
+		PermViewMemberList,
+	},
+	RoleAdmin: {
+		PermKickMember,
+		PermMuteMember,
+		PermSendMessage,
+		PermUpdateMediaState,
+		PermViewRoomInfo,
+		PermViewMemberList,
+	},
+	RoleOwner: {
+		PermKickMember,
+		PermMuteMember,
+		PermSetAdmin,
+		PermLockRoom,
+		PermDeleteRoom,
+		PermTransferOwner,
+		PermSendMessage,
+		PermUpdateMediaState,
+		PermViewRoomInfo,
+		PermViewMemberList,
+	},
+}
+
+// HasPermission 检查角色是否拥有指定权限
+func (r Role) HasPermission(perm Permission) bool {
+	perms, ok := RolePermissions[r]
+	if !ok {
+		return false
+	}
+	for _, p := range perms {
+		if p == perm {
+			return true
+		}
+	}
+	return false
+}
+
 type CreateRoomRequest struct {
 	Name        string  `json:"name" binding:"required,min=2,max=20"`
 	Topic       string  `json:"topic" binding:"max=50"`
@@ -71,14 +131,14 @@ type RoomResponse struct {
 }
 
 type RoomMemberInfo struct {
-	ID        uint   `json:"id"`
-	UserID    uint   `json:"user_id"`
-	Nickname  string `json:"nickname"`
-	Avatar    string `json:"avatar"`
-	Role      Role   `json:"role"`
-	IsMuted   bool   `json:"is_muted"`
-	IsVideoOn bool   `json:"is_video_on"`
-	IsAudioOn bool   `json:"is_audio_on"`
+	ID        uint       `json:"id"`
+	UserID    uint       `json:"user_id"`
+	Nickname  string     `json:"nickname"`
+	Avatar    string     `json:"avatar"`
+	Role      Role       `json:"role"`
+	IsMuted   bool       `json:"is_muted"`
+	IsVideoOn bool       `json:"is_video_on"`
+	IsAudioOn bool       `json:"is_audio_on"`
 }
 
 type KickBan struct {
@@ -88,4 +148,24 @@ type KickBan struct {
 	KickedAt   time.Time   `json:"kicked_at"`
 	ExpiresAt  time.Time   `json:"expires_at"`
 	Reason     string     `json:"reason" gorm:"size:200"`
+}
+
+// JoinRoomResponse 加入房间响应
+type JoinRoomResponse struct {
+	Room        *Room            `json:"room"`
+	Members     []*RoomMemberInfo `json:"members"`
+	Permissions []Permission     `json:"my_permissions"`
+}
+
+// AuditLog 房间操作审计日志
+type AuditLog struct {
+	ID         uint      `json:"id" gorm:"primaryKey"`
+	RoomID     uint      `json:"room_id" gorm:"index"`
+	UserID     uint      `json:"user_id"`
+	TargetID   *uint     `json:"target_id"`
+	Action     string    `json:"action" gorm:"size:50"`
+	Details    string    `json:"details" gorm:"size:500"`
+	IPAddress  string    `json:"ip_address" gorm:"size:50"`
+	UserAgent  string    `json:"user_agent" gorm:"size:255"`
+	CreatedAt  time.Time `json:"created_at"`
 }

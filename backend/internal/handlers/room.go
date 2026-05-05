@@ -84,17 +84,18 @@ func (h *Handler) JoinRoom(c *gin.Context) {
 	var req models.JoinRoomRequest
 	_ = c.ShouldBindJSON(&req) // verify_code 可选，绑定失败也没关系
 
-	room, members, err := h.roomService.JoinRoom(userID, roomIDStr, req.VerifyCode)
+	result, err := h.roomService.JoinRoom(userID, roomIDStr, req.VerifyCode)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	h.hub.BroadcastUserJoined(room.ID, userID)
+	h.hub.BroadcastUserJoined(result.Room.ID, userID)
 
 	c.JSON(http.StatusOK, gin.H{
-		"room":    room,
-		"members": members,
+		"room":           result.Room,
+		"members":        result.Members,
+		"my_permissions": result.Permissions,
 	})
 }
 

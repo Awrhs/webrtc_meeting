@@ -1,37 +1,13 @@
 import { createSlice, createAsyncThunk, PayloadAction } from '@reduxjs/toolkit'
 import { api } from '@/utils/api'
-import { Message } from '@/types'
-
-interface RoomMember {
-  id: number
-  user_id: number
-  nickname: string
-  avatar: string
-  role: 'owner' | 'admin' | 'member'
-  is_muted: boolean
-  is_video_on: boolean
-  is_audio_on: boolean
-}
-
-interface Room {
-  id: number
-  room_id: string
-  name: string
-  topic: string
-  owner_id: number
-  max_members: number
-  is_permanent: boolean
-  is_locked: boolean
-  auth_type: 'none' | 'password' | 'invite_code'
-  current_size: number
-  invite_code?: string
-}
+import { Message, Permission, JoinRoomResponse, RoomMember, Room } from '@/types'
 
 interface RoomState {
   rooms: Room[]
   currentRoom: Room | null
   members: RoomMember[]
   messages: Message[]
+  myPermissions: Permission[]
   loading: boolean
   connected: boolean
 }
@@ -41,6 +17,7 @@ const initialState: RoomState = {
   currentRoom: null,
   members: [],
   messages: [],
+  myPermissions: [],
   loading: false,
   connected: false,
 }
@@ -105,6 +82,90 @@ export const getRoomMessages = createAsyncThunk(
   }
 )
 
+// 踢出成员
+export const kickMember = createAsyncThunk(
+  'room/kickMember',
+  async ({ roomId, userId }: { roomId: number; userId: number }, { rejectWithValue }) => {
+    try {
+      await api.post(`/api/v1/rooms/${roomId}/members/${userId}/kick`)
+      return userId
+    } catch (error: any) {
+      return rejectWithValue(error.response.data.error)
+    }
+  }
+)
+
+// 禁言/取消禁言成员
+export const muteMember = createAsyncThunk(
+  'room/muteMember',
+  async ({ roomId, userId, muted }: { roomId: number; userId: number; muted: boolean }, { rejectWithValue }) => {
+    try {
+      const endpoint = muted ? 'mute' : 'unmute'
+      await api.post(`/api/v1/rooms/${roomId}/members/${userId}/${endpoint}`)
+      return { userId, muted }
+    } catch (error: any) {
+      return rejectWithValue(error.response.data.error)
+    }
+  }
+)
+
+// 设置/取消管理员
+export const setAdmin = createAsyncThunk(
+  'room/setAdmin',
+  async ({ roomId, userId, isAdmin }: { roomId: number; userId: number; isAdmin: boolean }, { rejectWithValue }) => {
+    try {
+      if (isAdmin) {
+        await api.post(`/api/v1/rooms/${roomId}/members/${userId}/admin`)
+      } else {
+        await api.delete(`/api/v1/rooms/${roomId}/members/${userId}/admin`)
+      }
+      return { userId, role: isAdmin ? 'admin' : 'member' }
+    } catch (error: any) {
+      return rejectWithValue(error.response.data.error)
+    }
+  }
+)
+
+// 转让房主
+export const transferOwner = createAsyncThunk(
+  'room/transferOwner',
+  async ({ roomId, userId }: { roomId: number; userId: number }, { rejectWithValue }) => {
+    try {
+      await api.post(`/api/v1/rooms/${roomId}/members/${userId}/transfer`)
+      return userId
+    } catch (error: any) {
+      return rejectWithValue(error.response.data.error)
+    }
+  }
+)
+
+// 锁定/解锁房间
+export const lockRoom = createAsyncThunk(
+  'room/lockRoom',
+  async ({ roomId, locked }: { roomId: number; locked: boolean }, { rejectWithValue }) => {
+    try {
+      const endpoint = locked ? 'lock' : 'unlock'
+      await api.post(`/api/v1/rooms/${roomId}/${endpoint}`)
+      return locked
+    } catch (error: any) {
+      return rejectWithValue(error.response.data.error)
+    }
+  }
+)
+
+// 删除房间
+export const deleteRoom = createAsyncThunk(
+  'room/deleteRoom',
+  async (roomId: number, { rejectWithValue }) => {
+    try {
+      await api.delete(`/api/v1/rooms/${roomId}`)
+      return roomId
+    } catch (error: any) {
+      return rejectWithValue(error.response.data.error)
+    }
+  }
+)
+
 const roomSlice = createSlice({
   name: 'room',
   initialState,
@@ -147,12 +208,40 @@ const roomSlice = createSlice({
       .addCase(createRoom.fulfilled, (state, action: PayloadAction<Room>) => {
         state.rooms.unshift(action.payload)
       })
-      .addCase(joinRoom.fulfilled, (state, action: PayloadAction<any>) => {
+      .addCase(joinRoom.fulfilled, (state, action: PayloadAction<JoinRoomResponse>) => {
         state.currentRoom = action.payload.room
         state.members = action.payload.members
+        state.myPermissions = action.payload.my_permissions
       })
       .addCase(getRoomMessages.fulfilled, (state, action: PayloadAction<Message[]>) => {
         state.messages = action.payload
+      })
+      .addCase(kickMember.fulfilled, (state, action: PayloadAction<number>) => {
+        state.members = state.members.filter(m => m.user_id !== action.payload)
+      })
+      .addCase(muteMember.fulfilled, (state, action: PayloadAction<{ userId: number; muted: boolean }>) => {
+        const member = state.members.find(m => m.user_id === action.payload.userId)
+        if (member) {
+          member.is_muted = action.payload.muted
+        }
+      })
+      .addCase(setAdmin.fulfilled, (state, action: PayloadAction<{ userId: number; role: string }>) => {
+        const member = state.members.find(m => m.user_id === action.payload.userId)
+        if (member) {
+          member.role = action.payload.role as any
+        }
+      })
+      .addCase(lockRoom.fulfilled, (state, action: PayloadAction<boolean>) => {
+        if (state.currentRoom) {
+          state.currentRoom.is_locked = action.payload
+        }
+      })
+      .addCase(deleteRoom.fulfilled, (state, action: PayloadAction<number>) => {
+        state.rooms = state.rooms.filter(r => r.id !== action.payload)
+        state.currentRoom = null
+        state.members = []
+        state.messages = []
+        state.myPermissions = []
       })
   },
 })

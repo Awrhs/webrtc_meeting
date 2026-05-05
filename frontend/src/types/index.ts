@@ -53,3 +53,31 @@ export interface SignalingMessage {
   target_id?: number
   data: any
 }
+
+// 权限枚举
+export type Permission =
+  | 'kick_member'
+  | 'mute_member'
+  | 'set_admin'
+  | 'lock_room'
+  | 'delete_room'
+  | 'transfer_owner'
+  | 'send_message'
+  | 'update_media_state'
+  | 'view_room_info'
+  | 'view_member_list'
+
+// E2EE 端到端加密相关类型
+export interface E2EEPublicKey {
+  user_id: number
+  public_key: string
+  key_type: string
+  exists: boolean
+}
+
+// 加入房间响应类型
+export interface JoinRoomResponse {
+  room: Room
+  members: RoomMember[]
+  my_permissions: Permission[]
+}

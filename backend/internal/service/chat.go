@@ -9,6 +9,9 @@ type ChatService interface {
 	SendMessage(senderID uint, roomID uint, receiverID *uint, msgType models.MessageType, content string) (*models.Message, error)
 	GetMessages(roomID uint, limit, offset int) ([]*models.MessageResponse, error)
 	GetPrivateMessages(roomID uint, userID, otherID uint, limit, offset int) ([]*models.MessageResponse, error)
+	SavePublicKey(userID uint, publicKey, keyType string) error
+	GetPublicKey(userID uint) (*models.E2EEGetPublicKeyResponse, error)
+	DeletePublicKey(userID uint) error
 }
 
 type chatService struct {
@@ -67,4 +70,36 @@ func (s *chatService) convertToResponse(messages []*models.Message) []*models.Me
 		}
 	}
 	return result
+}
+
+func (s *chatService) SavePublicKey(userID uint, publicKey, keyType string) error {
+	if keyType == "" {
+		keyType = "ecdh_p256"
+	}
+	pubKey := &models.E2EEPublicKey{
+		UserID:    userID,
+		PublicKey: publicKey,
+		KeyType:   keyType,
+	}
+	return s.repo.SavePublicKey(pubKey)
+}
+
+func (s *chatService) GetPublicKey(userID uint) (*models.E2EEGetPublicKeyResponse, error) {
+	pubKey, err := s.repo.GetPublicKey(userID)
+	if err != nil {
+		return &models.E2EEGetPublicKeyResponse{
+			UserID: userID,
+			Exists: false,
+		}, nil
+	}
+	return &models.E2EEGetPublicKeyResponse{
+		UserID:    pubKey.UserID,
+		PublicKey: pubKey.PublicKey,
+		KeyType:   pubKey.KeyType,
+		Exists:    true,
+	}, nil
+}
+
+func (s *chatService) DeletePublicKey(userID uint) error {
+	return s.repo.DeletePublicKey(userID)
 }

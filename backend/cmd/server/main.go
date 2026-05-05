@@ -91,6 +91,11 @@ func main() {
 			auth.POST("/rooms/:id/messages", handler.SendMessage)
 
 			auth.PUT("/rooms/:id/media-state", handler.UpdateMediaState)
+
+			// E2EE 端到端加密密钥交换
+			auth.POST("/e2ee/public-key", handler.UploadPublicKey)
+			auth.GET("/e2ee/public-key/:user_id", handler.GetPublicKey)
+			auth.DELETE("/e2ee/public-key", handler.DeletePublicKey)
 		}
 		// Callback for SFU to notify peer connection failed
 		api.POST("/sfu/callback/:roomId/:userId/connection-failed", handler.NotifyConnectionFailed)

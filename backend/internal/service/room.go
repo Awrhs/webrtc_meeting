@@ -17,7 +17,7 @@ type RoomService interface {
 	GetRoomByID(id uint) (*models.Room, error)
 	GetRoomByRoomID(roomID string) (*models.Room, error)
 	GetMyRooms(userID uint) ([]*models.Room, error)
-	JoinRoom(userID uint, roomID string, verifyCode string) (*models.Room, []*models.RoomMemberInfo, error)
+	JoinRoom(userID uint, roomID string, verifyCode string) (*models.JoinRoomResponse, error)
 	LeaveRoom(roomID uint, userID uint) error
 	LockRoom(roomID uint, userID uint, locked bool) error
 	DeleteRoom(roomID uint, userID uint) error
@@ -27,8 +27,11 @@ type RoomService interface {
 	TransferOwner(roomID uint, oldOwnerID uint, newOwnerID uint) error
 	GetRoomMembersInfo(roomID uint) ([]*models.RoomMemberInfo, error)
 	CheckPermission(roomID uint, userID uint, requiredRole models.Role) (bool, error)
+	HasPermission(roomID uint, userID uint, permission models.Permission) (bool, error)
+	GetMemberPermissions(roomID uint, userID uint) ([]models.Permission, error)
 	GetMemberRole(roomID uint, userID uint) (models.Role, error)
 	UpdateMediaState(roomID uint, userID uint, videoOn, audioOn *bool) error
+	LogAudit(roomID, userID uint, targetID *uint, action, details, ipAddress, userAgent string) error
 }
 
 type roomService struct {
@@ -127,7 +130,7 @@ func (s *roomService) GetMyRooms(userID uint) ([]*models.Room, error) {
 	return rooms, nil
 }
 
-func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string) (*models.Room, []*models.RoomMemberInfo, error) {
+func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string) (*models.JoinRoomResponse, error) {
 	// 先尝试按 6 位 room_id 查找，再尝试按数据库主键 id 查找
 	var room *models.Room
 	var err error
@@ -142,38 +145,38 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 		}
 	}
 	if err != nil || room == nil {
-		return nil, nil, errors.New("room not found")
+		return nil, errors.New("room not found")
 	}
 
 	if room.IsLocked {
-		return nil, nil, errors.New("room is locked")
+		return nil, errors.New("room is locked")
 	}
 
 	isKicked, err := s.roomRepo.IsKicked(room.ID, userID)
-	if err != nil && isKicked {
-		return nil, nil, errors.New("you are kicked from this room, please try again later")
+	if err == nil && isKicked {
+		return nil, errors.New("you are kicked from this room, please try again later")
 	}
 
 	count, err := s.roomRepo.CountMembers(room.ID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	if int(count) >= room.MaxMembers {
-		return nil, nil, errors.New("room is full")
+		return nil, errors.New("room is full")
 	}
 
 	switch room.AuthType {
 	case models.AuthTypePassword:
 		if verifyCode == "" {
-			return nil, nil, errors.New("password required")
+			return nil, errors.New("password required")
 		}
 		err := bcrypt.CompareHashAndPassword([]byte(room.Password), []byte(verifyCode))
 		if err != nil {
-			return nil, nil, errors.New("invalid password")
+			return nil, errors.New("invalid password")
 		}
 	case models.AuthTypeInviteCode:
 		if verifyCode != room.InviteCode {
-			return nil, nil, errors.New("invalid invite code")
+			return nil, errors.New("invalid invite code")
 		}
 	}
 
@@ -205,13 +208,13 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 	// 如果用户已经在房间中（activeMember != nil），不做任何操作
 
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
 	// 重新统计当前房间人数，确保计数正确
 	newCount, err := s.roomRepo.CountMembers(room.ID)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	room.CurrentSize = int(newCount)
 	s.roomRepo.Update(room)
@@ -223,7 +226,21 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 	s.redis.DeleteUserRooms(userID)
 
 	membersInfo, err := s.GetRoomMembersInfo(room.ID)
-	return room, membersInfo, err
+	if err != nil {
+		return nil, err
+	}
+
+	// 获取用户权限列表
+	permissions, err := s.GetMemberPermissions(room.ID, userID)
+	if err != nil {
+		return nil, err
+	}
+
+	return &models.JoinRoomResponse{
+		Room:        room,
+		Members:     membersInfo,
+		Permissions: permissions,
+	}, nil
 }
 
 func (s *roomService) LeaveRoom(roomID uint, userID uint) error {
@@ -454,6 +471,28 @@ func (s *roomService) CheckPermission(roomID uint, userID uint, requiredRole mod
 	}
 }
 
+// HasPermission 检查用户是否拥有指定的细粒度权限
+func (s *roomService) HasPermission(roomID uint, userID uint, permission models.Permission) (bool, error) {
+	role, err := s.GetMemberRole(roomID, userID)
+	if err != nil {
+		return false, err
+	}
+	return role.HasPermission(permission), nil
+}
+
+// GetMemberPermissions 获取用户在房间内的所有权限列表
+func (s *roomService) GetMemberPermissions(roomID uint, userID uint) ([]models.Permission, error) {
+	role, err := s.GetMemberRole(roomID, userID)
+	if err != nil {
+		return nil, err
+	}
+	perms, ok := models.RolePermissions[role]
+	if !ok {
+		return []models.Permission{}, nil
+	}
+	return perms, nil
+}
+
 func (s *roomService) GetMemberRole(roomID uint, userID uint) (models.Role, error) {
 	member, err := s.roomRepo.GetMember(roomID, userID)
 	if err != nil {
@@ -474,6 +513,20 @@ func (s *roomService) UpdateMediaState(roomID uint, userID uint, videoOn, audioO
 		member.IsAudioOn = *audioOn
 	}
 	return s.roomRepo.UpdateMember(member)
+}
+
+func (s *roomService) LogAudit(roomID, userID uint, targetID *uint, action, details, ipAddress, userAgent string) error {
+	log := &models.AuditLog{
+		RoomID:    roomID,
+		UserID:    userID,
+		TargetID:  targetID,
+		Action:    action,
+		Details:   details,
+		IPAddress: ipAddress,
+		UserAgent: userAgent,
+		CreatedAt: time.Now(),
+	}
+	return s.roomRepo.CreateAuditLog(log)
 }
 
 func generateRoomID() string {

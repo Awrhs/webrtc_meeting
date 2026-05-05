@@ -74,8 +74,6 @@ func NewHub(roomService service.RoomService, chatService service.ChatService, lo
 }
 
 func (h *Hub) Run() {
-	for {
-	}
 }
 
 func (h *Hub) Register(client *Client) {

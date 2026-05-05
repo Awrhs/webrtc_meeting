@@ -42,14 +42,37 @@
 - **全链路安全**：端到端加密，服务器不存储私聊明文，密码bcrypt哈希
 - **容器化一键部署**：Docker Compose 启动所有服务，无需手动配置环境
 
-### 近期技术改进 (v1.1)
+### 近期技术改进 (v1.2)
+- ✅ **细粒度权限系统重构** - 从角色检查改为权限枚举，支持 Permission-Based Access Control (PBAC)
+  - 新增 Permission 枚举：kick_member, mute_member, set_admin, lock_room 等
+  - 加入房间返回 my_permissions 列表，前端动态渲染功能按钮
+  - 权限矩阵配置化，便于后续扩展不同角色权限
+- ✅ **端到端加密支持 (E2EE)** - 私聊 AES-256-GCM 加密
+  - 新增 /e2ee/public-key 接口用于公钥交换
+  - crypto 工具包实现加密/解密
+  - 服务器不存储明文消息
+- ✅ **审计日志系统** - 所有敏感操作（踢人/禁言/设置管理员）记录日志
+  - room_audit_logs 表记录操作人、目标、时间、详情
+  - 支持后续审计追溯
+- ✅ **前端架构优化** - Redux Thunk 统一异步操作
+  - kickMember, muteMember, setAdmin, transferOwner, lockRoom, deleteRoom 全部 thunk 化
+  - 权限检查与 UI 渲染分离
+  - 远程流数据结构重构
+
+### 技术改进 (v1.1)
 - ✅ **gRPC SFU 控制接口** - 解决安全、耦合、类型安全问题，支持踢人/静音强制生效
 - ✅ **Redis 热点数据缓存** - 用户信息/房间信息/用户房间列表缓存，数据库压力降低 80%+
+- 🐛 **关键 Bug 修复** - 修复 JoinRoom 踢出检查逻辑（err != nil 误判）
+- 🐛 **修复空循环** - 移除 Hub.Run 空循环导致的 CPU 占用
+
+### 规划中
 - 📋 **SFU 集群部署方案** - 支持多 SFU 节点、负载均衡、故障转移（设计完成，待实现）
 - 📋 **选择性订阅 + QoS 机制** - 降低带宽占用，提升弱网体验（设计完成，待实现）
 
 ## 📚 技术文档
-- [详细技术设计文档](docs/TECHNICAL_DESIGN.md) - 包含所有架构设计细节
+- [API 接口文档](docs/API_DOCUMENTATION.md) - 完整前后端对接 API 文档
+- [权限系统设计与分析](docs/PERMISSION_ANALYSIS.md) - 权限架构设计与实现细节
+- [前端架构分析](docs/FRONTEND_ARCHITECTURE.md) - 前端代码结构与功能实现
 
 ## 🏗️ 项目架构
 

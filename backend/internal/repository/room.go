@@ -25,6 +25,8 @@ type RoomRepository interface {
 	CreateKickBan(kb *models.KickBan) error
 	IsKicked(roomID uint, userID uint) (bool, error)
 	RemoveExpiredKicks() error
+	CreateAuditLog(log *models.AuditLog) error
+	GetAuditLogs(roomID uint, limit, offset int) ([]*models.AuditLog, error)
 }
 
 type roomRepository struct {
@@ -136,4 +138,18 @@ func (r *roomRepository) IsKicked(roomID uint, userID uint) (bool, error) {
 
 func (r *roomRepository) RemoveExpiredKicks() error {
 	return r.db.Where("expires_at <= NOW()").Delete(&models.KickBan{}).Error
+}
+
+func (r *roomRepository) CreateAuditLog(log *models.AuditLog) error {
+	return r.db.Create(log).Error
+}
+
+func (r *roomRepository) GetAuditLogs(roomID uint, limit, offset int) ([]*models.AuditLog, error) {
+	var logs []*models.AuditLog
+	err := r.db.Where("room_id = ?", roomID).
+		Order("created_at DESC").
+		Limit(limit).
+		Offset(offset).
+		Find(&logs).Error
+	return logs, err
 }

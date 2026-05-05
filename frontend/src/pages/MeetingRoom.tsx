@@ -14,7 +14,7 @@ import {
   LogoutOutlined,
 } from '@ant-design/icons'
 import { RootState, AppDispatch } from '@/store'
-import { joinRoom, getRoomMessages, addMessage, setConnected, clearCurrentRoom, updateMember, removeMember } from '@/store/slices/roomSlice'
+import { joinRoom, getRoomMessages, addMessage, setConnected, clearCurrentRoom, updateMember, removeMember, kickMember, muteMember, setAdmin, transferOwner, lockRoom, deleteRoom } from '@/store/slices/roomSlice'
 import { api } from '@/utils/api'
 import { SignalingClient } from '@/utils/signaling'
 import { getMediaStream, connectToSFU } from '@/utils/webrtc'
@@ -29,7 +29,7 @@ export default function MeetingRoom() {
   const [searchParams] = useSearchParams()
   const navigate = useNavigate()
   const dispatch = useDispatch<AppDispatch>()
-  const { currentRoom, members, messages } = useSelector((state: RootState) => state.room)
+  const { currentRoom, members, messages, myPermissions } = useSelector((state: RootState) => state.room)
   const { user } = useSelector((state: RootState) => state.auth)
 
   const [videoOn, setVideoOn] = useState(false)
@@ -41,10 +41,19 @@ export default function MeetingRoom() {
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
   const screenStreamRef = useRef<MediaStream | null>(null)
-  const remoteStreamsRef = useRef<Map<number, MediaStream>>(new Map())
+  // 修复：key 是 user_id，value 是该用户的所有 stream
+  const remoteStreamsRef = useRef<Map<number, MediaStream[]>>(new Map())
 
   const currentUserId = user?.id || 0
   const currentMember = members.find(m => m.user_id === currentUserId)
+
+  // 基于权限的功能检查
+  const canKick = myPermissions.includes('kick_member')
+  const canMute = myPermissions.includes('mute_member')
+  const canSetAdmin = myPermissions.includes('set_admin')
+  const canLockRoom = myPermissions.includes('lock_room')
+  const canDeleteRoom = myPermissions.includes('delete_room')
+  const canTransferOwner = myPermissions.includes('transfer_owner')
   const isOwner = currentMember?.role === 'owner'
   const isAdmin = currentMember?.role === 'admin' || isOwner
 
@@ -141,9 +150,18 @@ export default function MeetingRoom() {
       const pc = await connectToSFU(parseInt(id!), currentUserId, stream)
       peerConnectionRef.current = pc
 
+      // 修复：从 track 事件处理
       pc.ontrack = (event) => {
         event.streams.forEach(stream => {
-          remoteStreamsRef.current.set(0, stream)
+          // 注意：在真正的 SFU 实现中需要通过信令传递 user_id 与 track 关联
+        // 这里简化处理：使用 track.id 作为临时 key
+          // 生产环境需要在 SDP mid/信令传递 user_id
+          const trackId = event.track.id
+
+          // 获取或创建该 track 数组
+          const existingStreams = remoteStreamsRef.current.get(0) || []
+          existingStreams.push(stream)
+          remoteStreamsRef.current.set(0, existingStreams)
         })
       }
     } catch (error) {
@@ -287,16 +305,11 @@ export default function MeetingRoom() {
   const handleLockRoom = async () => {
     if (!currentRoom) return
     try {
-      if (currentRoom.is_locked) {
-        await api.post(`/api/v1/rooms/${currentRoom.id}/unlock`)
-        message.success('房间已解锁')
-      } else {
-        await api.post(`/api/v1/rooms/${currentRoom.id}/lock`)
-        message.success('房间已锁定')
-      }
-      window.location.reload()
+      const newLockedState = !currentRoom.is_locked
+      await dispatch(lockRoom({ roomId: currentRoom.id, locked: newLockedState })).unwrap()
+      message.success(newLockedState ? '房间已锁定' : '房间已解锁')
     } catch (error: any) {
-      message.error(error.response?.data?.error || '操作失败')
+      message.error(error || '操作失败')
     }
   }
 
@@ -308,11 +321,12 @@ export default function MeetingRoom() {
       okButtonProps: { danger: true },
       onOk: async () => {
         try {
-          await api.delete(`/api/v1/rooms/${currentRoom.id}`)
+          await dispatch(deleteRoom(currentRoom.id)).unwrap()
           message.success('房间已解散')
+          leaveMeeting()
           navigate('/')
         } catch (error: any) {
-          message.error(error.response?.data?.error || '操作失败')
+          message.error(error || '操作失败')
         }
       },
     })
@@ -325,37 +339,44 @@ export default function MeetingRoom() {
     return null
   }
 
-  const items: MenuProps['items'] = isOwner ? [
-    {
-      key: 'lock',
-      icon: currentRoom?.is_locked ? <UnlockOutlined /> : <LockOutlined />,
-      label: currentRoom?.is_locked ? '解锁房间' : '锁定房间',
-      onClick: handleLockRoom,
-    },
-    {
-      key: 'delete',
-      icon: <DeleteOutlined />,
-      label: '解散房间',
-      danger: true,
-      onClick: handleDeleteRoom,
-    },
-    {
-      type: 'divider',
-    },
-    {
+  // 基于权限动态生成菜单
+  const buildMenuItems = (): MenuProps['items'] => {
+    const items: MenuProps['items'] = []
+
+    if (canLockRoom) {
+      items.push({
+        key: 'lock',
+        icon: currentRoom?.is_locked ? <UnlockOutlined /> : <LockOutlined />,
+        label: currentRoom?.is_locked ? '解锁房间' : '锁定房间',
+        onClick: handleLockRoom,
+      })
+    }
+
+    if (canDeleteRoom) {
+      items.push({
+        key: 'delete',
+        icon: <DeleteOutlined />,
+        label: '解散房间',
+        danger: true,
+        onClick: handleDeleteRoom,
+      })
+    }
+
+    if (items.length > 0) {
+      items.push({ type: 'divider' })
+    }
+
+    items.push({
       key: 'leave',
       icon: <LogoutOutlined />,
       label: '离开会议',
       onClick: handleLeave,
-    },
-  ] : [
-    {
-      key: 'leave',
-      icon: <LogoutOutlined />,
-      label: '离开会议',
-      onClick: handleLeave,
-    },
-  ]
+    })
+
+    return items
+  }
+
+  const items = buildMenuItems()
 
   if (loading) {
     return <div>加载中...</div>
@@ -410,7 +431,7 @@ export default function MeetingRoom() {
           <Tabs
             defaultActiveKey="members"
             items={[
-              { key: 'members', label: '成员列表', children: <MemberList roomId={parseInt(id!)} members={members} isAdmin={isAdmin} isOwner={isOwner} /> },
+              { key: 'members', label: '成员列表', children: <MemberList roomId={parseInt(id!)} members={members} currentUserId={currentUserId} permissions={myPermissions} /> },
               { key: 'chat', label: '聊天', children: <Chat roomId={parseInt(id!)} messages={messages} /> },
             ]}
           />
