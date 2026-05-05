@@ -20,7 +20,7 @@ function App() {
         }
       />
       <Route
-        path="/room/:id"
+        path="/meeting/:id"
         element={
           <ProtectedRoute>
             <MeetingRoom />

@@ -53,17 +53,16 @@ const (
 )
 
 type CreateRoomRequest struct {
-	Name        string  `json:"name" binding:"required,min:2,max:20"`
-	Topic       string  `json:"topic" binding:"max:50"`
-	MaxMembers  int     `json:"max_members" binding:"min:1,max:500"`
+	Name        string  `json:"name" binding:"required,min=2,max=20"`
+	Topic       string  `json:"topic" binding:"max=50"`
+	MaxMembers  int     `json:"max_members" binding:"min=1,max=500"`
 	IsPermanent bool    `json:"is_permanent"`
 	AuthType    AuthType `json:"auth_type"`
-	Password    string  `json:"password" binding:"max:12"`
+	Password    string  `json:"password" binding:"max=12"`
 }
 
 type JoinRoomRequest struct {
-	RoomID      string `json:"room_id" binding:"required"`
-	VerifyCode  string `json:"verify_code"`
+	VerifyCode string `json:"verify_code"`
 }
 
 type RoomResponse struct {

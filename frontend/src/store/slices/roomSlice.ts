@@ -24,6 +24,7 @@ interface Room {
   is_locked: boolean
   auth_type: 'none' | 'password' | 'invite_code'
   current_size: number
+  invite_code?: string
 }
 
 interface RoomState {
@@ -61,6 +62,18 @@ export const createRoom = createAsyncThunk(
   async (data: any, { rejectWithValue }) => {
     try {
       const response = await api.post('/api/v1/rooms', data)
+      return response.data.room
+    } catch (error: any) {
+      return rejectWithValue(error.response.data.error)
+    }
+  }
+)
+
+export const getRoomByNumber = createAsyncThunk(
+  'room/getRoomByNumber',
+  async (roomNumber: string, { rejectWithValue }) => {
+    try {
+      const response = await api.get(`/api/v1/rooms/number/${roomNumber}`)
       return response.data.room
     } catch (error: any) {
       return rejectWithValue(error.response.data.error)

@@ -20,6 +20,14 @@ export default defineConfig({
         target: 'ws://localhost:8080',
         ws: true,
       },
+      '/offer': {
+        target: 'http://localhost:8081',
+        changeOrigin: true,
+      },
+      '/sfu-ws': {
+        target: 'ws://localhost:8081',
+        ws: true,
+      },
     },
   },
 })

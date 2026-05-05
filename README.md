@@ -147,8 +147,16 @@ make docker-up
 # 安装 Go 1.21+、Node.js 18+、Docker、protoc
 cp .env.example .env
 # 启动所有基础设施（postgres、redis、coturn）
-docker-compose -f deployment/docker-compose.yml up -d postgres redis coturn
+docker compose -f deployment/docker-compose.yml up -d postgres redis coturn
 ```
+
+> **⚠️ WSL2 环境重要提示：**
+>
+> 本项目 docker-compose.yml 中 coturn 默认使用 **bridge 桥接网络模式** 而非 host 模式，避免触发 Docker Desktop for Windows 的 WSL2 集成稳定性 Bug。
+>
+> - ✅ WSL2 + Docker Desktop 开发环境：使用当前配置即可，稳定
+> - ✅ 原生 Linux 生产环境：可改为 `network_mode: host` 以获得最佳 WebRTC 穿透性能
+> - 详细问题说明见：[WSL2_COTURN_HOST_NETWORK_ISSUE.md](docs/WSL2_COTURN_HOST_NETWORK_ISSUE.md)
 
 **新增环境变量配置项**:
 ```bash

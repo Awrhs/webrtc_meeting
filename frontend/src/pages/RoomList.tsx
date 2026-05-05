@@ -2,8 +2,8 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useDispatch, useSelector } from 'react-redux'
 import { Layout, Button, Card, List, Input, Space, Tag, Modal, Form, message, Typography, Avatar, Dropdown } from 'antd'
-import { PlusOutlined, LockOutlined, UnlockOutlined, UserOutlined, SettingOutlined, LogoutOutlined } from '@ant-design/icons'
-import { getMyRooms, createRoom } from '@/store/slices/roomSlice'
+import { PlusOutlined, LockOutlined, UnlockOutlined, UserOutlined, SettingOutlined, LogoutOutlined, CopyOutlined, DeleteOutlined, InfoCircleOutlined, EyeOutlined } from '@ant-design/icons'
+import { getMyRooms, createRoom, joinRoom, getRoomByNumber } from '@/store/slices/roomSlice'
 import { logout } from '@/store/slices/authSlice'
 import { RootState, AppDispatch } from '@/store'
 import { Room } from '@/types'
@@ -19,9 +19,15 @@ export default function RoomList() {
   const [searchText, setSearchText] = useState('')
   const [createModalVisible, setCreateModalVisible] = useState(false)
   const [joinModalVisible, setJoinModalVisible] = useState(false)
+  const [joinByIdModalVisible, setJoinByIdModalVisible] = useState(false)
   const [joinVerifyCode, setJoinVerifyCode] = useState('')
+  const [joinRoomId, setJoinRoomId] = useState('')
+  const [newRoomInfo, setNewRoomInfo] = useState<Room | null>(null)
+  const [inviteModalVisible, setInviteModalVisible] = useState(false)
   const [loading, setLoading] = useState(false)
   const [selectedRoom, setSelectedRoom] = useState<Room | null>(null)
+  const [manageRoomModalVisible, setManageRoomModalVisible] = useState(false)
+  const [manageRoom, setManageRoom] = useState<Room | null>(null)
   const [form] = Form.useForm()
 
   useEffect(() => {
@@ -40,9 +46,15 @@ export default function RoomList() {
       message.success('创建成功')
       setCreateModalVisible(false)
       form.resetFields()
-      navigate(`/room/${result.id}`)
+
+      if (result.auth_type === 'invite_code' && result.invite_code) {
+        setNewRoomInfo(result)
+        setInviteModalVisible(true)
+      } else {
+        navigate(`/meeting/${result.id}`)
+      }
     } catch (error: any) {
-      message.error(error)
+      message.error(error.message || error || '创建失败')
     } finally {
       setLoading(false)
     }
@@ -54,14 +66,103 @@ export default function RoomList() {
       setJoinVerifyCode('')
       setJoinModalVisible(true)
     } else {
-      navigate(`/room/${room.id}`)
+      navigate(`/meeting/${room.id}`)
     }
   }
 
-  const handleConfirmJoin = () => {
+  const handleConfirmJoin = async () => {
     if (selectedRoom) {
-      navigate(`/room/${selectedRoom.id}?verify=${joinVerifyCode}`)
+      setLoading(true)
+      try {
+        await dispatch(joinRoom({
+          id: selectedRoom.id.toString(),
+          data: { verify_code: joinVerifyCode }
+        })).unwrap()
+        message.success('加入成功')
+        setJoinModalVisible(false)
+        navigate(`/meeting/${selectedRoom.id}`)
+      } catch (error: any) {
+        message.error(error?.message || error || '验证失败')
+      } finally {
+        setLoading(false)
+      }
     }
+  }
+
+  const handleJoinById = async () => {
+    if (!joinRoomId.trim()) {
+      message.error('请输入房间ID')
+      return
+    }
+
+    setLoading(true)
+    try {
+      // 先获取房间信息
+      const room = await dispatch(getRoomByNumber(joinRoomId)).unwrap()
+
+      if (room.auth_type !== 'none') {
+        // 需要验证
+        setSelectedRoom(room)
+        setJoinVerifyCode('')
+        setJoinByIdModalVisible(false)
+        setJoinModalVisible(true)
+      } else {
+        // 不需要验证，直接加入
+        await dispatch(joinRoom({ id: room.id.toString(), data: {} })).unwrap()
+        message.success('加入成功')
+        setJoinByIdModalVisible(false)
+        navigate(`/meeting/${room.id}`)
+      }
+    } catch (error: any) {
+      message.error(error?.message || error || '房间不存在或加入失败')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  const handleManageRoom = (room: Room, e: React.MouseEvent) => {
+    e.stopPropagation()
+    setManageRoom(room)
+    setManageRoomModalVisible(true)
+  }
+
+  const handleCopyRoomId = () => {
+    if (manageRoom) {
+      navigator.clipboard.writeText(manageRoom.room_id)
+      message.success('房间ID已复制')
+    }
+  }
+
+  const handleCopyInviteCode = () => {
+    if (manageRoom?.invite_code) {
+      navigator.clipboard.writeText(manageRoom.invite_code)
+      message.success('邀请码已复制')
+    }
+  }
+
+  const handleDeleteRoom = () => {
+    if (!manageRoom) return
+    Modal.confirm({
+      title: '确认解散房间',
+      content: '解散后所有成员将被移出，且无法恢复，确定解散吗？',
+      okButtonProps: { danger: true },
+      onOk: async () => {
+        try {
+          const token = localStorage.getItem('token')
+          await fetch(`/api/v1/rooms/${manageRoom.id}`, {
+            method: 'DELETE',
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+          })
+          message.success('房间已解散')
+          setManageRoomModalVisible(false)
+          dispatch(getMyRooms())
+        } catch (error: any) {
+          message.error('操作失败')
+        }
+      },
+    })
   }
 
   const userMenuItems = [
@@ -130,6 +231,9 @@ export default function RoomList() {
             >
               创建房间
             </Button>
+            <Button onClick={() => setJoinByIdModalVisible(true)}>
+              加入房间
+            </Button>
           </Space>
 
           <List
@@ -141,6 +245,12 @@ export default function RoomList() {
                   hoverable
                   onClick={() => handleJoinRoom(room)}
                   style={{ height: '100%' }}
+                  actions={room.owner_id === user?.id ? [
+                    <SettingOutlined
+                      key="manage"
+                      onClick={(e) => handleManageRoom(room, e)}
+                    />,
+                  ] : []}
                 >
                   <div
                     style={{
@@ -283,7 +393,7 @@ export default function RoomList() {
       </Modal>
 
       <Modal
-        title="请输入验证信息"
+        title={`请输入${selectedRoom?.auth_type === 'password' ? '房间密码' : '邀请码'}`}
         open={joinModalVisible}
         okText="加入"
         cancelText="取消"
@@ -291,10 +401,134 @@ export default function RoomList() {
         onCancel={() => setJoinModalVisible(false)}
       >
         <Input
-          placeholder="请输入验证信息"
+          placeholder={`请输入${selectedRoom?.auth_type === 'password' ? '房间密码' : '房间邀请码'}`}
           value={joinVerifyCode}
           onChange={(e) => setJoinVerifyCode(e.target.value)}
         />
+      </Modal>
+
+      <Modal
+        title="房间创建成功"
+        open={inviteModalVisible}
+        onCancel={() => {
+          setInviteModalVisible(false)
+          if (newRoomInfo) {
+            navigate(`/meeting/${newRoomInfo.id}`)
+          }
+        }}
+        onOk={() => {
+          if (newRoomInfo) {
+            navigator.clipboard.writeText(newRoomInfo.invite_code || '')
+            message.success('邀请码已复制到剪贴板')
+            navigate(`/meeting/${newRoomInfo.id}`)
+          }
+        }}
+        okText="复制并进入房间"
+      >
+        <div style={{ textAlign: 'center', padding: '20px 0' }}>
+          <p style={{ marginBottom: 16 }}>您的房间邀请码是：</p>
+          <div style={{
+            fontSize: 32,
+            fontWeight: 'bold',
+            letterSpacing: 4,
+            color: '#1890ff',
+            padding: '20px',
+            background: '#f5f5f5',
+            borderRadius: 8
+          }}>
+            {newRoomInfo?.invite_code}
+          </div>
+          <p style={{ marginTop: 16, color: '#666' }}>
+            请将此邀请码分享给需要加入会议的成员
+          </p>
+        </div>
+      </Modal>
+
+      <Modal
+        title="加入房间"
+        open={joinByIdModalVisible}
+        okText="加入"
+        cancelText="取消"
+        onOk={handleJoinById}
+        onCancel={() => setJoinByIdModalVisible(false)}
+        confirmLoading={loading}
+      >
+        <Input
+          placeholder="请输入房间ID（6位数字）"
+          value={joinRoomId}
+          onChange={(e) => setJoinRoomId(e.target.value)}
+          maxLength={6}
+        />
+      </Modal>
+
+      <Modal
+        title="房间管理"
+        open={manageRoomModalVisible}
+        onCancel={() => setManageRoomModalVisible(false)}
+        footer={[
+          <Button key="close" onClick={() => setManageRoomModalVisible(false)}>
+            关闭
+          </Button>,
+          <Button key="delete" danger onClick={handleDeleteRoom}>
+            解散房间
+          </Button>,
+        ]}
+      >
+        {manageRoom && (
+          <div style={{ padding: '10px 0' }}>
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontWeight: 'bold', marginBottom: 8 }}>房间名称</div>
+              <div style={{ color: '#666' }}>{manageRoom.name}</div>
+            </div>
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontWeight: 'bold', marginBottom: 8 }}>房间ID</div>
+              <Space>
+                <code style={{ background: '#f5f5f5', padding: '4px 8px', borderRadius: 4 }}>
+                  {manageRoom.room_id}
+                </code>
+                <Button
+                  size="small"
+                  icon={<CopyOutlined />}
+                  onClick={handleCopyRoomId}
+                >
+                  复制
+                </Button>
+              </Space>
+            </div>
+            {manageRoom.auth_type === 'invite_code' && manageRoom.invite_code && (
+              <div style={{ marginBottom: 20 }}>
+                <div style={{ fontWeight: 'bold', marginBottom: 8 }}>邀请码</div>
+                <Space>
+                  <code style={{ background: '#f5f5f5', padding: '4px 8px', borderRadius: 4 }}>
+                    {manageRoom.invite_code}
+                  </code>
+                  <Button
+                    size="small"
+                    icon={<CopyOutlined />}
+                    onClick={handleCopyInviteCode}
+                  >
+                    复制
+                  </Button>
+                </Space>
+              </div>
+            )}
+            <div style={{ marginBottom: 20 }}>
+              <div style={{ fontWeight: 'bold', marginBottom: 8 }}>房间状态</div>
+              <Space>
+                <Tag color={manageRoom.is_locked ? 'red' : 'green'}>
+                  {manageRoom.is_locked ? '已锁定' : '开放中'}
+                </Tag>
+                <Tag color="blue">
+                  {manageRoom.current_size}/{manageRoom.max_members} 人
+                </Tag>
+              </Space>
+            </div>
+            <div style={{ color: '#999', fontSize: 12 }}>
+              <InfoCircleOutlined style={{ marginRight: 4 }} />
+              解散房间后，所有成员将被移出，且操作无法撤销。
+            </div>
+          </div>
+        )}
       </Modal>
     </Layout>
   )

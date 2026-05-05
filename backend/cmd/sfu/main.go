@@ -6,6 +6,7 @@ import (
 	"conference-sfu/backend/pkg/logger"
 	"net/http"
 
+	"github.com/rs/cors"
 	"go.uber.org/zap"
 )
 
@@ -24,8 +25,18 @@ func main() {
 	http.HandleFunc("/offer", sfuServer.HandleOffer)
 	http.HandleFunc("/ws", sfuServer.HandleWebSocket)
 
+	// Add CORS middleware
+	c := cors.New(cors.Options{
+		AllowedOrigins:   []string{"http://localhost:3000", "http://127.0.0.1:3000"},
+		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowedHeaders:   []string{"Content-Type", "Authorization"},
+		AllowCredentials: true,
+	})
+
+	handler := c.Handler(http.DefaultServeMux)
+
 	log.Info("SFU server starting on port " + cfg.SFUPort)
-	if err := http.ListenAndServe(":"+cfg.SFUPort, nil); err != nil {
+	if err := http.ListenAndServe(":"+cfg.SFUPort, handler); err != nil {
 		log.Fatal("Failed to start SFU server", zap.Error(err))
 	}
 }

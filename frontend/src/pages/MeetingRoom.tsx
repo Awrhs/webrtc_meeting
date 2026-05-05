@@ -40,6 +40,7 @@ export default function MeetingRoom() {
   const signalingRef = useRef<SignalingClient | null>(null)
   const peerConnectionRef = useRef<RTCPeerConnection | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
+  const screenStreamRef = useRef<MediaStream | null>(null)
   const remoteStreamsRef = useRef<Map<number, MediaStream>>(new Map())
 
   const currentUserId = user?.id || 0
@@ -52,7 +53,7 @@ export default function MeetingRoom() {
     const roomId = parseInt(id!)
 
     setLoading(true)
-    dispatch(joinRoom({ id: id!, data: { room_id: currentRoom?.room_id, verify_code: verifyCode } }))
+    dispatch(joinRoom({ id: id!, data: { verify_code: verifyCode } }))
       .unwrap()
       .then(async () => {
         dispatch(getRoomMessages(roomId))
@@ -152,6 +153,10 @@ export default function MeetingRoom() {
   }
 
   const leaveMeeting = () => {
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach(track => track.stop())
+      screenStreamRef.current = null
+    }
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach(track => track.stop())
       localStreamRef.current = null
@@ -230,14 +235,15 @@ export default function MeetingRoom() {
       try {
         const screenStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
-          audio: true,
+          audio: false,
         })
+        screenStreamRef.current = screenStream
         const videoTrack = screenStream.getVideoTracks()[0]
         videoTrack.onended = () => {
-          setScreenShare(false)
+          stopScreenShare()
         }
 
-        if (peerConnectionRef.current && localStreamRef.current) {
+        if (peerConnectionRef.current) {
           const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video')
           if (sender) {
             sender.replaceTrack(videoTrack)
@@ -248,15 +254,23 @@ export default function MeetingRoom() {
         message.error('无法开启屏幕共享')
       }
     } else {
-      if (localStreamRef.current && peerConnectionRef.current) {
-        const videoTrack = localStreamRef.current.getVideoTracks()[0]
-        const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video')
-        if (sender && videoTrack) {
-          sender.replaceTrack(videoTrack)
-        }
-      }
-      setScreenShare(false)
+      stopScreenShare()
     }
+  }
+
+  const stopScreenShare = () => {
+    if (screenStreamRef.current) {
+      screenStreamRef.current.getTracks().forEach(track => track.stop())
+      screenStreamRef.current = null
+    }
+    if (localStreamRef.current && peerConnectionRef.current) {
+      const videoTrack = localStreamRef.current.getVideoTracks()[0]
+      const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video')
+      if (sender && videoTrack) {
+        sender.replaceTrack(videoTrack)
+      }
+    }
+    setScreenShare(false)
   }
 
   const handleLeave = () => {
@@ -273,8 +287,13 @@ export default function MeetingRoom() {
   const handleLockRoom = async () => {
     if (!currentRoom) return
     try {
-      await api.post(`/api/v1/rooms/${currentRoom.id}/lock`)
-      message.success(currentRoom.is_locked ? '房间已解锁' : '房间已锁定')
+      if (currentRoom.is_locked) {
+        await api.post(`/api/v1/rooms/${currentRoom.id}/unlock`)
+        message.success('房间已解锁')
+      } else {
+        await api.post(`/api/v1/rooms/${currentRoom.id}/lock`)
+        message.success('房间已锁定')
+      }
       window.location.reload()
     } catch (error: any) {
       message.error(error.response?.data?.error || '操作失败')

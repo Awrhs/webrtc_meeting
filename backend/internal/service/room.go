@@ -5,6 +5,7 @@ import (
 	"conference-sfu/backend/internal/repository"
 	"errors"
 	"math/rand"
+	"strconv"
 	"time"
 
 	"github.com/google/uuid"
@@ -127,8 +128,20 @@ func (s *roomService) GetMyRooms(userID uint) ([]*models.Room, error) {
 }
 
 func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string) (*models.Room, []*models.RoomMemberInfo, error) {
-	room, err := s.roomRepo.FindByRoomID(roomIDStr)
+	// 先尝试按 6 位 room_id 查找，再尝试按数据库主键 id 查找
+	var room *models.Room
+	var err error
+
+	// 先按 6 位 room_id 查找
+	room, err = s.roomRepo.FindByRoomID(roomIDStr)
 	if err != nil {
+		// 失败则尝试按数据库主键 id 查找
+		roomID, parseErr := strconv.Atoi(roomIDStr)
+		if parseErr == nil {
+			room, err = s.roomRepo.FindByID(uint(roomID))
+		}
+	}
+	if err != nil || room == nil {
 		return nil, nil, errors.New("room not found")
 	}
 
@@ -164,30 +177,43 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 		}
 	}
 
-	existingMember, _ := s.roomRepo.GetMember(room.ID, userID)
-	if existingMember == nil {
-		member := &models.RoomMember{
-			RoomID:    room.ID,
-			UserID:    userID,
-			Role:      models.RoleMember,
-			IsMuted:   false,
-			IsVideoOn: false,
-			IsAudioOn: true,
-			JoinedAt:  time.Now(),
+	// 先检查用户是否在房间中（未离开）
+	activeMember, _ := s.roomRepo.GetMember(room.ID, userID)
+	if activeMember == nil {
+		// 用户不在房间中，检查是否有历史记录
+		existingMember, _ := s.roomRepo.GetAnyMember(room.ID, userID)
+		if existingMember == nil {
+			// 新成员，创建记录
+			member := &models.RoomMember{
+				RoomID:    room.ID,
+				UserID:    userID,
+				Role:      models.RoleMember,
+				IsMuted:   false,
+				IsVideoOn: false,
+				IsAudioOn: true,
+				JoinedAt:  time.Now(),
+			}
+			err = s.roomRepo.AddMember(member)
+		} else {
+			// 用户曾经加入过，更新记录
+			now := time.Now()
+			existingMember.LeftAt = nil
+			existingMember.JoinedAt = now
+			err = s.roomRepo.UpdateMember(existingMember)
 		}
-		err = s.roomRepo.AddMember(member)
-	} else {
-		now := time.Now()
-		existingMember.LeftAt = nil
-		existingMember.JoinedAt = now
-		err = s.roomRepo.UpdateMember(existingMember)
 	}
+	// 如果用户已经在房间中（activeMember != nil），不做任何操作
 
 	if err != nil {
 		return nil, nil, err
 	}
 
-	room.CurrentSize = int(count + 1)
+	// 重新统计当前房间人数，确保计数正确
+	newCount, err := s.roomRepo.CountMembers(room.ID)
+	if err != nil {
+		return nil, nil, err
+	}
+	room.CurrentSize = int(newCount)
 	s.roomRepo.Update(room)
 
 	s.redis.AddToRoom(room.ID, userID)

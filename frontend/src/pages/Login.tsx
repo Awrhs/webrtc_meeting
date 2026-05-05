@@ -20,7 +20,7 @@ export default function Login() {
       message.success('登录成功')
       navigate('/')
     } catch (error: any) {
-      message.error(error)
+      message.error(error.message || error || '登录失败')
     } finally {
       setLoading(false)
     }

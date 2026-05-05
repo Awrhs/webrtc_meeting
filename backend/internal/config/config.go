@@ -22,10 +22,10 @@ type Config struct {
 	CoturnPassword string
 }
 
-func loadEnvFromFile(filename string) {
+func loadEnvFromFile(filename string) error {
 	file, err := os.Open(filename)
 	if err != nil {
-		return
+		return err
 	}
 	defer file.Close()
 
@@ -42,13 +42,17 @@ func loadEnvFromFile(filename string) {
 			os.Setenv(key, value)
 		}
 	}
+	return nil
 }
 
 func Load() *Config {
 	// 只有在开发环境（GO_ENV 不是 production）且 .env 文件存在时，才自动加载
 	goEnv := getEnv("GO_ENV", "development")
 	if goEnv != "production" {
-		loadEnvFromFile(".env")
+		// 尝试当前目录，再尝试父目录（支持 go run 在 backend 目录运行）
+		if err := loadEnvFromFile(".env"); err != nil {
+			loadEnvFromFile("../.env")
+		}
 	}
 
 	port := getEnv("SERVER_PORT", "8080")

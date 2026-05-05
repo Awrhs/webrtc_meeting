@@ -19,6 +19,7 @@ export interface Room {
   is_locked: boolean
   auth_type: 'none' | 'password' | 'invite_code'
   current_size: number
+  invite_code?: string
 }
 
 export interface RoomMember {

@@ -74,9 +74,11 @@ func main() {
 			auth.POST("/rooms", handler.CreateRoom)
 			auth.GET("/rooms", handler.GetMyRooms)
 			auth.GET("/rooms/:id", handler.GetRoom)
+			auth.GET("/rooms/number/:number", handler.GetRoomByNumber)
 			auth.POST("/rooms/:id/join", handler.JoinRoom)
 			auth.DELETE("/rooms/:id", handler.DeleteRoom)
 			auth.POST("/rooms/:id/lock", handler.LockRoom)
+			auth.POST("/rooms/:id/unlock", handler.UnlockRoom)
 
 			auth.POST("/rooms/:id/members/:userId/kick", handler.KickMember)
 			auth.POST("/rooms/:id/members/:userId/mute", handler.MuteMember)
@@ -87,6 +89,8 @@ func main() {
 
 			auth.GET("/rooms/:id/messages", handler.GetMessages)
 			auth.POST("/rooms/:id/messages", handler.SendMessage)
+
+			auth.PUT("/rooms/:id/media-state", handler.UpdateMediaState)
 		}
 		// Callback for SFU to notify peer connection failed
 		api.POST("/sfu/callback/:roomId/:userId/connection-failed", handler.NotifyConnectionFailed)

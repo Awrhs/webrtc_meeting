@@ -1,7 +1,12 @@
 {
   "permissions": {
     "allow": [
-      "Bash(protoc --go_out=api/gen/go --go_opt=paths=source_relative --go-grpc_out=api/gen/go --go-grpc_opt=paths=source_relative api/proto/sfu_control.proto)"
+      "Bash(protoc --go_out=api/gen/go --go_opt=paths=source_relative --go-grpc_out=api/gen/go --go-grpc_opt=paths=source_relative api/proto/sfu_control.proto)",
+      "Bash(docker exec *)",
+      "Bash(nc -zv localhost 5432)",
+      "Bash(PGPASSWORD=postgres psql -h localhost -U postgres -d conference -c \"SELECT 1\")",
+      "Bash(sudo service *)",
+      "Bash(sudo systemctl *)"
     ]
   }
 }

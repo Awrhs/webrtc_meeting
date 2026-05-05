@@ -19,6 +19,7 @@ type RoomRepository interface {
 	UpdateMember(member *models.RoomMember) error
 	GetMembers(roomID uint) ([]*models.RoomMember, error)
 	GetMember(roomID uint, userID uint) (*models.RoomMember, error)
+	GetAnyMember(roomID uint, userID uint) (*models.RoomMember, error)
 	RemoveMember(roomID uint, userID uint) error
 	CountMembers(roomID uint) (int64, error)
 	CreateKickBan(kb *models.KickBan) error
@@ -101,6 +102,15 @@ func (r *roomRepository) GetMember(roomID uint, userID uint) (*models.RoomMember
 	return &member, nil
 }
 
+func (r *roomRepository) GetAnyMember(roomID uint, userID uint) (*models.RoomMember, error) {
+	var member models.RoomMember
+	err := r.db.Where("room_id = ? AND user_id = ?", roomID, userID).Order("id DESC").First(&member).Error
+	if err != nil {
+		return nil, err
+	}
+	return &member, nil
+}
+
 func (r *roomRepository) RemoveMember(roomID uint, userID uint) error {
 	now := time.Now()
 	return r.db.Model(&models.RoomMember{}).
@@ -110,7 +120,7 @@ func (r *roomRepository) RemoveMember(roomID uint, userID uint) error {
 
 func (r *roomRepository) CountMembers(roomID uint) (int64, error) {
 	var count int64
-	err := r.db.Where("room_id = ? AND left_at IS NULL", roomID).Count(&count).Error
+	err := r.db.Model(&models.RoomMember{}).Where("room_id = ? AND left_at IS NULL", roomID).Count(&count).Error
 	return count, err
 }
 
@@ -120,7 +130,7 @@ func (r *roomRepository) CreateKickBan(kb *models.KickBan) error {
 
 func (r *roomRepository) IsKicked(roomID uint, userID uint) (bool, error) {
 	var count int64
-	err := r.db.Where("room_id = ? AND user_id = ? AND expires_at > NOW()", roomID, userID).Count(&count).Error
+	err := r.db.Model(&models.KickBan{}).Where("room_id = ? AND user_id = ? AND expires_at > NOW()", roomID, userID).Count(&count).Error
 	return count > 0, err
 }
 

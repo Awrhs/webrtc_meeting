@@ -63,16 +63,28 @@ func (h *Handler) GetRoom(c *gin.Context) {
 	})
 }
 
-func (h *Handler) JoinRoom(c *gin.Context) {
-	userID := GetUserID(c)
+func (h *Handler) GetRoomByNumber(c *gin.Context) {
+	roomNumber := c.Param("number")
 
-	var req models.JoinRoomRequest
-	if err := c.ShouldBindJSON(&req); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+	room, err := h.roomService.GetRoomByRoomID(roomNumber)
+	if err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "room not found"})
 		return
 	}
 
-	room, members, err := h.roomService.JoinRoom(userID, req.RoomID, req.VerifyCode)
+	c.JSON(http.StatusOK, gin.H{"room": room})
+}
+
+func (h *Handler) JoinRoom(c *gin.Context) {
+	userID := GetUserID(c)
+
+	// roomID 从 URL 路径参数获取（roomService 期望 string 类型）
+	roomIDStr := c.Param("id")
+
+	var req models.JoinRoomRequest
+	_ = c.ShouldBindJSON(&req) // verify_code 可选，绑定失败也没关系
+
+	room, members, err := h.roomService.JoinRoom(userID, roomIDStr, req.VerifyCode)
 	if err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
@@ -112,6 +124,20 @@ func (h *Handler) LockRoom(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"message": "room locked", "is_locked": true})
+}
+
+func (h *Handler) UnlockRoom(c *gin.Context) {
+	userID := GetUserID(c)
+	idStr := c.Param("id")
+	id, _ := strconv.Atoi(idStr)
+
+	err := h.roomService.LockRoom(uint(id), userID, false)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"message": "room unlocked", "is_locked": false})
 }
 
 func (h *Handler) KickMember(c *gin.Context) {
@@ -238,4 +264,22 @@ func (h *Handler) NotifyConnectionFailed(c *gin.Context) {
 
 	h.hub.SendConnectionFailed(uint(roomID), uint(userID))
 	c.JSON(http.StatusOK, gin.H{"message": "notification sent"})
+}
+
+func (h *Handler) UpdateMediaState(c *gin.Context) {
+	userID := GetUserID(c)
+	idStr := c.Param("id")
+	roomID, _ := strconv.Atoi(idStr)
+
+	var req struct {
+		VideoEnabled bool `json:"video_enabled"`
+		AudioEnabled bool `json:"audio_enabled"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	h.hub.BroadcastMediaState(uint(roomID), userID, req.VideoEnabled, req.AudioEnabled)
+	c.JSON(http.StatusOK, gin.H{"message": "media state updated"})
 }

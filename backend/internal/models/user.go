@@ -45,18 +45,18 @@ type LoginRequest struct {
 }
 
 type RegisterRequest struct {
-	Username string `json:"username" binding:"required,min:3,max:20"`
+	Username string `json:"username" binding:"required,min=3,max=20"`
 	Email    string `json:"email" binding:"required,email"`
 	Phone    string `json:"phone" binding:"required"`
-	Password string `json:"password" binding:"required,min:8,max:20"`
+	Password string `json:"password" binding:"required,min=8,max=20"`
 }
 
 type UpdateProfileRequest struct {
-	Nickname string `json:"nickname" binding:"required,min:2,max:10"`
+	Nickname string `json:"nickname" binding:"required,min=2,max=10"`
 	Avatar   string `json:"avatar"`
 }
 
 type UpdatePasswordRequest struct {
 	OldPassword string `json:"old_password" binding:"required"`
-	NewPassword string `json:"new_password" binding:"required,min:8,max:20"`
+	NewPassword string `json:"new_password" binding:"required,min=8,max=20"`
 }

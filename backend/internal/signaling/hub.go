@@ -212,6 +212,21 @@ func (h *Hub) SendConnectionFailed(roomID uint, userID uint) {
 	h.SendToUser(userID, data)
 }
 
+func (h *Hub) BroadcastMediaState(roomID uint, userID uint, videoEnabled bool, audioEnabled bool) {
+	data, _ := json.Marshal(map[string]bool{
+		"video_enabled": videoEnabled,
+		"audio_enabled": audioEnabled,
+	})
+	msg := Message{
+		Type:   MessageTypeMediaState,
+		RoomID: roomID,
+		UserID: userID,
+		Data:   data,
+	}
+	raw, _ := json.Marshal(msg)
+	h.BroadcastToRoom(roomID, raw, 0)
+}
+
 func (h *Hub) BroadcastMessage(roomID uint, message *models.Message, receiverID *uint) {
 	if receiverID != nil {
 		data, _ := json.Marshal(message)
