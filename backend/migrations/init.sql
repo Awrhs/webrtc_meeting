@@ -85,3 +85,39 @@ CREATE INDEX IF NOT EXISTS idx_messages_room_id ON messages(room_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sender_id ON messages(sender_id);
 CREATE INDEX IF NOT EXISTS idx_room_members_room_id ON room_members(room_id);
 CREATE INDEX IF NOT EXISTS idx_room_members_user_id ON room_members(user_id);
+
+-- ============================================
+-- v1.2 新增表
+-- ============================================
+
+-- E2EE 端到端加密公钥存储
+CREATE TABLE IF NOT EXISTS e2ee_public_keys (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER UNIQUE NOT NULL,
+    public_key TEXT NOT NULL,
+    key_type VARCHAR(20) DEFAULT 'ecdh_p256',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_e2ee_public_keys_user_id ON e2ee_public_keys(user_id);
+
+-- 操作审计日志
+CREATE TABLE IF NOT EXISTS audit_logs (
+    id SERIAL PRIMARY KEY,
+    room_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    target_id INTEGER,
+    action VARCHAR(50) NOT NULL,
+    details VARCHAR(500),
+    ip_address VARCHAR(50),
+    user_agent VARCHAR(255),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (room_id) REFERENCES rooms(id) ON DELETE CASCADE,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS idx_audit_logs_room_id ON audit_logs(room_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
+CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
