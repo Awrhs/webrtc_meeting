@@ -17,7 +17,7 @@ import { RootState, AppDispatch } from '@/store'
 import { joinRoom, getRoomMessages, addMessage, setConnected, clearCurrentRoom, updateMember, removeMember, kickMember, muteMember, setAdmin, transferOwner, lockRoom, deleteRoom } from '@/store/slices/roomSlice'
 import { api } from '@/utils/api'
 import { SignalingClient } from '@/utils/signaling'
-import { getMediaStream, connectToSFU } from '@/utils/webrtc'
+import { getMediaStream, SFUConnection } from '@/utils/webrtc'
 import VideoGrid from '@/components/VideoGrid'
 import Chat from '@/components/Chat'
 import MemberList from '@/components/MemberList'
@@ -36,12 +36,11 @@ export default function MeetingRoom() {
   const [audioOn, setAudioOn] = useState(true)
   const [screenShare, setScreenShare] = useState(false)
   const [loading, setLoading] = useState(false)
-  // 🔴 关键修复：使用 state 存储流，变化时触发重渲染
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null)
 
   const signalingRef = useRef<SignalingClient | null>(null)
-  const peerConnectionRef = useRef<RTCPeerConnection | null>(null)
+  const sfuConnectionRef = useRef<SFUConnection | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
   const screenStreamRef = useRef<MediaStream | null>(null)
   // 每个 user_id 对应一个 MediaStream 数组（可能有多个音视频轨道）
@@ -153,21 +152,39 @@ export default function MeetingRoom() {
         track.enabled = true
       })
 
-      const pc = await connectToSFU(parseInt(id!), currentUserId, stream)
-      peerConnectionRef.current = pc
-
-      // 处理远程媒体流
-      pc.ontrack = (event) => {
-        console.log('[Meeting] Received remote track:', event.track.kind, event.streams)
-        event.streams.forEach(stream => {
-          const existing = remoteStreamsRef.current.get(0) || []
+      // 使用新的 SFUConnection 类
+      const sfuConnection = new SFUConnection(
+        parseInt(id!),
+        currentUserId,
+        // 处理远程媒体流回调
+        (userId: number, track: MediaStreamTrack, stream: MediaStream) => {
+          console.log('[Meeting] Received remote track:', track.kind, 'from user', userId)
+          const existing = remoteStreamsRef.current.get(userId) || []
           if (!existing.includes(stream)) {
             existing.push(stream)
-            remoteStreamsRef.current.set(0, existing)
+            remoteStreamsRef.current.set(userId, existing)
             forceUpdate({})
           }
-        })
-      }
+        },
+        // 连接成功回调
+        () => {
+          console.log('[Meeting] SFU connection established successfully')
+          message.success('媒体连接已建立')
+        },
+        // 连接断开回调
+        () => {
+          console.log('[Meeting] SFU connection disconnected')
+        },
+        // 错误回调
+        (error: string) => {
+          console.error('[Meeting] SFU error:', error)
+          message.error(error)
+        }
+      )
+
+      sfuConnectionRef.current = sfuConnection
+      await sfuConnection.connect(stream)
+
     } catch (error) {
       console.error('Failed to get media stream', error)
       message.error('获取摄像头/麦克风权限失败')
@@ -183,9 +200,10 @@ export default function MeetingRoom() {
       localStreamRef.current.getTracks().forEach(track => track.stop())
       localStreamRef.current = null
     }
-    if (peerConnectionRef.current) {
-      peerConnectionRef.current.close()
-      peerConnectionRef.current = null
+    // 使用新的 SFUConnection.disconnect()
+    if (sfuConnectionRef.current) {
+      sfuConnectionRef.current.disconnect()
+      sfuConnectionRef.current = null
     }
     if (signalingRef.current) {
       signalingRef.current.disconnect()
@@ -206,16 +224,11 @@ export default function MeetingRoom() {
         const stream = await getMediaStream(true, audioOn)
         console.log('[Meeting] Got camera stream:', stream.getVideoTracks().length, 'tracks')
         localStreamRef.current = stream
-        // 🔴 关键：更新 state 触发重渲染
         setLocalStream(stream)
         const videoTrack = stream.getVideoTracks()[0]
-        if (peerConnectionRef.current) {
-          const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video')
-          if (sender) {
-            sender.replaceTrack(videoTrack)
-          } else {
-            peerConnectionRef.current.addTrack(videoTrack, stream)
-          }
+        // 使用 SFUConnection.replaceVideoTrack 更新视频轨道
+        if (sfuConnectionRef.current) {
+          await sfuConnectionRef.current.replaceVideoTrack(videoTrack)
         }
       } catch (error) {
         console.error('[Meeting] Camera error:', error)
@@ -223,10 +236,9 @@ export default function MeetingRoom() {
         return
       }
     } else {
-      const videoTracks = localStreamRef.current.getVideoTracks()
-      if (videoTracks.length > 0) {
-        videoTracks[0].enabled = !videoOn
-        console.log('[Meeting] Toggled video:', !videoOn)
+      // 直接使用 SFUConnection.muteVideo 切换
+      if (sfuConnectionRef.current) {
+        sfuConnectionRef.current.muteVideo(videoOn)
       }
     }
     setVideoOn(!videoOn)
@@ -247,9 +259,9 @@ export default function MeetingRoom() {
 
   const toggleAudio = () => {
     if (!localStreamRef.current) return
-    const audioTracks = localStreamRef.current.getAudioTracks()
-    if (audioTracks.length > 0) {
-      audioTracks[0].enabled = !audioOn
+    // 使用 SFUConnection.muteAudio
+    if (sfuConnectionRef.current) {
+      sfuConnectionRef.current.muteAudio(audioOn)
     }
     setAudioOn(!audioOn)
 
@@ -277,11 +289,9 @@ export default function MeetingRoom() {
           stopScreenShare()
         }
 
-        if (peerConnectionRef.current) {
-          const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video')
-          if (sender) {
-            sender.replaceTrack(videoTrack)
-          }
+        // 使用 SFUConnection.replaceVideoTrack 切换到屏幕共享
+        if (sfuConnectionRef.current) {
+          await sfuConnectionRef.current.replaceVideoTrack(videoTrack)
         }
         setScreenShare(true)
       } catch (error) {
@@ -297,11 +307,11 @@ export default function MeetingRoom() {
       screenStreamRef.current.getTracks().forEach(track => track.stop())
       screenStreamRef.current = null
     }
-    if (localStreamRef.current && peerConnectionRef.current) {
+    // 恢复本地摄像头视频流
+    if (localStreamRef.current && sfuConnectionRef.current && videoOn) {
       const videoTrack = localStreamRef.current.getVideoTracks()[0]
-      const sender = peerConnectionRef.current.getSenders().find(s => s.track?.kind === 'video')
-      if (sender && videoTrack) {
-        sender.replaceTrack(videoTrack)
+      if (videoTrack) {
+        sfuConnectionRef.current.replaceVideoTrack(videoTrack)
       }
     }
     setScreenStream(null)

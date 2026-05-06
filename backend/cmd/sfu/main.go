@@ -16,11 +16,12 @@ func main() {
 
 	sfuServer := sfu.NewSFUServer(log)
 
-	// Start gRPC control server
-	_, err := sfu.StartGRPCServer(sfuServer, cfg.SFUGRPCPort, log)
+	// Start gRPC control server (保存引用用于优雅关闭)
+	grpcServer, err := sfu.StartGRPCServer(sfuServer, cfg.SFUGRPCPort, log)
 	if err != nil {
 		log.Fatal("Failed to start gRPC server", zap.Error(err))
 	}
+	defer grpcServer.GracefulStop()
 
 	http.HandleFunc("/ws", sfuServer.HandleWebSocket)
 

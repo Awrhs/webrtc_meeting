@@ -18,22 +18,31 @@ export class SFUConnection {
   private roomId: number
   private userId: number
   private localStream: MediaStream | null = null
-  private onRemoteTrack: (track: MediaStreamTrack, stream: MediaStream) => void
+  private remoteStreams: Map<number, MediaStream> = new Map()
+  private onRemoteTrack: (userId: number, track: MediaStreamTrack, stream: MediaStream) => void
   private onConnected: () => void
+  private onDisconnected: () => void
   private onError: (error: string) => void
   private iceCandidates: RTCIceCandidateInit[] = []
+  private reconnectAttempts = 0
+  private maxReconnectAttempts = 5
+  private reconnectDelay = 3000
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  private isManualDisconnect = false
 
   constructor(
     roomId: number,
     userId: number,
-    onRemoteTrack: (track: MediaStreamTrack, stream: MediaStream) => void,
+    onRemoteTrack: (userId: number, track: MediaStreamTrack, stream: MediaStream) => void,
     onConnected: () => void,
+    onDisconnected: () => void,
     onError: (error: string) => void
   ) {
     this.roomId = roomId
     this.userId = userId
     this.onRemoteTrack = onRemoteTrack
     this.onConnected = onConnected
+    this.onDisconnected = onDisconnected
     this.onError = onError
   }
 
@@ -44,6 +53,7 @@ export class SFUConnection {
   }
 
   async connect(localStream: MediaStream): Promise<void> {
+    this.isManualDisconnect = false
     this.localStream = localStream
 
     const configuration: RTCConfiguration = {
@@ -63,19 +73,32 @@ export class SFUConnection {
     }
 
     this.pc.ontrack = (event) => {
+      console.log('[WebRTC] Received remote track:', event.track.kind)
       event.streams.forEach((stream) => {
         stream.getTracks().forEach((track) => {
-          this.onRemoteTrack(track, stream)
+          // SFU 场景：所有流统一归到 userId=0（所有远端流混合）
+          // 实际生产环境需要信令携带 userId，这里简化处理
+          this.onRemoteTrack(0, track, stream)
         })
       })
+    }
+
+    this.pc.oniceconnectionstatechange = () => {
+      console.log('[WebRTC] ICE connection state:', this.pc?.iceConnectionState)
+      // ICE 连接失败自动重连
+      if (this.pc?.iceConnectionState === 'failed' || this.pc?.iceConnectionState === 'disconnected') {
+        this.scheduleReconnect()
+      }
     }
 
     this.pc.onconnectionstatechange = () => {
       console.log('[WebRTC] Connection state:', this.pc?.connectionState)
       if (this.pc?.connectionState === 'connected') {
+        this.reconnectAttempts = 0
         this.onConnected()
       } else if (this.pc?.connectionState === 'failed') {
         this.onError('Connection failed')
+        this.scheduleReconnect()
       }
     }
 
@@ -85,11 +108,22 @@ export class SFUConnection {
 
     this.ws.onopen = () => {
       console.log('[WebRTC] Connected to SFU WebSocket, sending join...')
+      this.reconnectAttempts = 0
       this.send({
         type: 'join',
         room_id: this.roomId,
         user_id: this.userId,
       })
+      // 发送缓存的 ICE 候选
+      while (this.iceCandidates.length > 0) {
+        const candidate = this.iceCandidates.shift()!
+        this.send({
+          type: 'ice-candidate',
+          candidate: candidate.candidate,
+          sdp_m_line_index: candidate.sdpMLineIndex,
+          sdp_mid: candidate.sdpMid,
+        })
+      }
     }
 
     this.ws.onmessage = (event) => {
@@ -102,8 +136,37 @@ export class SFUConnection {
     }
 
     this.ws.onclose = (event) => {
-      console.log('[WebRTC] WebSocket closed, code:', event.code)
+      console.log('[WebRTC] WebSocket closed, code:', event.code, 'reason:', event.reason)
+      if (!this.isManualDisconnect && event.code !== 1000) {
+        this.scheduleReconnect()
+      }
+      this.onDisconnected()
     }
+  }
+
+  private scheduleReconnect() {
+    if (this.isManualDisconnect) return
+    if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+      console.error('[WebRTC] Max reconnect attempts reached')
+      this.onError('连接失败次数过多，请刷新页面重试')
+      return
+    }
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+    }
+
+    this.reconnectAttempts++
+    console.log(`[WebRTC] Scheduling reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`)
+
+    this.reconnectTimer = setTimeout(() => {
+      console.log('[WebRTC] Attempting reconnect...')
+      if (this.localStream) {
+        this.connect(this.localStream).catch((err) => {
+          console.error('[WebRTC] Reconnect failed:', err)
+        })
+      }
+    }, this.reconnectDelay)
   }
 
   private async handleMessage(event: MessageEvent) {
@@ -187,18 +250,24 @@ export class SFUConnection {
   }
 
   disconnect() {
+    this.isManualDisconnect = true
+
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
+
     if (this.ws) {
-      this.ws.close()
+      this.ws.close(1000, 'User disconnected')
       this.ws = null
     }
+
     if (this.pc) {
       this.pc.close()
       this.pc = null
     }
-    if (this.localStream) {
-      this.localStream.getTracks().forEach((track) => track.stop())
-      this.localStream = null
-    }
+
+    this.remoteStreams.clear()
   }
 
   muteAudio(muted: boolean) {
@@ -215,6 +284,19 @@ export class SFUConnection {
         track.enabled = !muted
       })
     }
+  }
+
+  // 动态添加轨道（用于切换摄像头/屏幕共享）
+  async replaceVideoTrack(newTrack: MediaStreamTrack) {
+    if (!this.pc) return
+    const sender = this.pc.getSenders().find((s) => s.track?.kind === 'video')
+    if (sender) {
+      await sender.replaceTrack(newTrack)
+    }
+  }
+
+  getConnectionState(): string {
+    return this.pc?.connectionState || 'disconnected'
   }
 }
 
