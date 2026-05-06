@@ -25,8 +25,10 @@ type Peer struct {
 	UserID       uint
 	RoomID       uint
 	PC           *webrtc.PeerConnection
+	Conn         *websocket.Conn
 	Tracks       map[string]*webrtc.TrackLocalStaticRTP
 	Subscriptions map[uint]*webrtc.RTPSender
+	mu           sync.Mutex
 }
 
 type SFUServer struct {
@@ -37,14 +39,15 @@ type SFUServer struct {
 	mu            sync.Mutex
 }
 
-type OfferRequest struct {
-	RoomID uint   `json:"room_id"`
-	UserID uint   `json:"user_id"`
-	SDP    string `json:"sdp"`
-}
-
-type AnswerResponse struct {
-	SDP string `json:"sdp"`
+type SignalingMessage struct {
+	Type    string          `json:"type"` // join, leave, offer, answer, ice-candidate, muted
+	RoomID  uint            `json:"room_id,omitempty"`
+	UserID  uint            `json:"user_id,omitempty"`
+	SDP     string          `json:"sdp,omitempty"`
+	Candidate string         `json:"candidate,omitempty"`
+	SDPMLineIndex *int       `json:"sdp_m_line_index,omitempty"`
+	SDPMid     *string      `json:"sdp_mid,omitempty"`
+	Data    interface{}     `json:"data,omitempty"`
 }
 
 func NewSFUServer(logger *zap.Logger) *SFUServer {
@@ -68,96 +71,6 @@ func NewSFUServer(logger *zap.Logger) *SFUServer {
 		configuration: configuration,
 		logger:        logger,
 	}
-}
-
-func (s *SFUServer) HandleOffer(w http.ResponseWriter, r *http.Request) {
-	var req OfferRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
-		return
-	}
-
-	s.mu.Lock()
-	if _, ok := s.rooms[req.RoomID]; !ok {
-		s.rooms[req.RoomID] = &Room{
-			ID:    req.RoomID,
-			Peers: make(map[uint]*Peer),
-		}
-	}
-	room := s.rooms[req.RoomID]
-	s.mu.Unlock()
-
-	room.mu.Lock()
-	defer room.mu.Unlock()
-
-	peerConnection, err := s.api.NewPeerConnection(s.configuration)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	peer := &Peer{
-		UserID:       req.UserID,
-		RoomID:       req.RoomID,
-		PC:           peerConnection,
-		Tracks:       make(map[string]*webrtc.TrackLocalStaticRTP),
-		Subscriptions: make(map[uint]*webrtc.RTPSender),
-	}
-
-	peerConnection.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-		s.onTrack(room, peer, track, receiver)
-	})
-
-	peerConnection.OnICECandidate(func(candidate *webrtc.ICECandidate) {
-		if candidate == nil {
-			return
-		}
-	})
-
-	peerConnection.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
-		s.onConnectionStateChange(room, peer, state)
-	})
-
-	err = peerConnection.SetRemoteDescription(webrtc.SessionDescription{
-		Type: webrtc.SDPTypeOffer,
-		SDP:  req.SDP,
-	})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	for _, existingPeer := range room.Peers {
-		if existingPeer.UserID != peer.UserID {
-			for _, track := range existingPeer.Tracks {
-				sender, err := peer.PC.AddTrack(track)
-				if err == nil {
-					peer.Subscriptions[existingPeer.UserID] = sender
-				}
-			}
-		}
-	}
-
-	answer, err := peerConnection.CreateAnswer(nil)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	err = peerConnection.SetLocalDescription(answer)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-	room.Peers[req.UserID] = peer
-
-	response := AnswerResponse{
-		SDP: answer.SDP,
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
 }
 
 func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
@@ -223,16 +136,23 @@ func (s *SFUServer) onConnectionStateChange(room *Room, peer *Peer, state webrtc
 func (s *SFUServer) notifyConnectionFailed(roomID uint, userID uint) {
 	apiHost := getAPIHost()
 	url := apiHost + "/api/v1/sfu/callback/" + strconv.Itoa(int(roomID)) + "/" + strconv.Itoa(int(userID)) + "/connection-failed"
-	
+
 	client := &http.Client{}
-	req, _ := http.NewRequest("POST", url, nil)
-	req.Header.Set("Content-Type", "application/json")
-	
-	_, err := client.Do(req)
+	req, err := http.NewRequest("POST", url, nil)
 	if err != nil {
-		s.logger.Error("Failed to notify connection failed to API server", 
+		s.logger.Error("Failed to create request for connection failed notification",
 			zap.Error(err),
-			zap.Uint("roomID", roomID), 
+			zap.Uint("roomID", roomID),
+			zap.Uint("userID", userID))
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	_, err = client.Do(req)
+	if err != nil {
+		s.logger.Error("Failed to notify connection failed to API server",
+			zap.Error(err),
+			zap.Uint("roomID", roomID),
 			zap.Uint("userID", userID))
 	}
 }
@@ -254,7 +174,15 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		s.logger.Error("Failed to upgrade websocket", zap.Error(err))
 		return
 	}
-	defer conn.Close()
+
+	var peer *Peer
+
+	defer func() {
+		if peer != nil {
+			s.removePeer(peer.RoomID, peer.UserID)
+		}
+		conn.Close()
+	}()
 
 	for {
 		_, message, err := conn.ReadMessage()
@@ -265,16 +193,223 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 
-		var msg struct {
-			Type string `json:"type"`
-			Data json.RawMessage `json:"data"`
-		}
+		var msg SignalingMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
+			s.logger.Error("Failed to parse signaling message", zap.Error(err))
 			continue
 		}
 
-		conn.WriteMessage(websocket.TextMessage, message)
+		switch msg.Type {
+		case "join":
+			peer, err = s.handleJoin(conn, &msg)
+			if err != nil {
+				s.logger.Error("Join failed", zap.Error(err))
+				sendError(conn, "join_failed", err.Error())
+			}
+		case "offer":
+			if peer == nil {
+				sendError(conn, "not_joined", "Please join first")
+				continue
+			}
+			err = s.handleOffer(peer, &msg)
+			if err != nil {
+				s.logger.Error("Offer failed", zap.Error(err))
+				sendError(conn, "offer_failed", err.Error())
+			}
+		case "ice-candidate":
+			if peer == nil {
+				sendError(conn, "not_joined", "Please join first")
+				continue
+			}
+			err = s.handleIceCandidate(peer, &msg)
+			if err != nil {
+				s.logger.Error("ICE candidate failed", zap.Error(err))
+			}
+		}
 	}
+}
+
+func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Peer, error) {
+	s.logger.Info("Peer joining", zap.Uint("room", msg.RoomID), zap.Uint("user", msg.UserID))
+
+	s.mu.Lock()
+	if _, ok := s.rooms[msg.RoomID]; !ok {
+		s.rooms[msg.RoomID] = &Room{
+			ID:    msg.RoomID,
+			Peers: make(map[uint]*Peer),
+		}
+	}
+	room := s.rooms[msg.RoomID]
+	s.mu.Unlock()
+
+	room.mu.Lock()
+	defer room.mu.Unlock()
+
+	// 创建PeerConnection
+	pc, err := s.api.NewPeerConnection(s.configuration)
+	if err != nil {
+		return nil, err
+	}
+
+	peer := &Peer{
+		UserID:       msg.UserID,
+		RoomID:       msg.RoomID,
+		PC:           pc,
+		Conn:         conn,
+		Tracks:       make(map[string]*webrtc.TrackLocalStaticRTP),
+		Subscriptions: make(map[uint]*webrtc.RTPSender),
+	}
+
+	// 监听轨道
+	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+		s.onTrack(room, peer, track, receiver)
+	})
+
+	// 监听ICE候选，发送给前端
+	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
+		if candidate == nil {
+			return
+		}
+		peer.mu.Lock()
+		defer peer.mu.Unlock()
+
+		sdpMLineIndex := int(candidate.SDPMLineIndex)
+		sdpMid := candidate.SDPMid
+		iceMsg := SignalingMessage{
+			Type:          "ice-candidate",
+			Candidate:     candidate.String(),
+			SDPMLineIndex: &sdpMLineIndex,
+			SDPMid:        &sdpMid,
+		}
+		conn.WriteJSON(iceMsg)
+	})
+
+	// 监听连接状态
+	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		s.onConnectionStateChange(room, peer, state)
+	})
+
+	// 订阅房间内已存在的其他用户的流
+	for _, existingPeer := range room.Peers {
+		for _, track := range existingPeer.Tracks {
+			sender, err := peer.PC.AddTrack(track)
+			if err == nil {
+				peer.Subscriptions[existingPeer.UserID] = sender
+			}
+		}
+	}
+
+	room.Peers[msg.UserID] = peer
+
+	// 通知其他房间内的新用户加入（让他们也订阅新用户的流）
+	// 注意：需要等待新用户发布流后再通知
+
+	s.logger.Info("Peer joined successfully", zap.Uint("room", msg.RoomID), zap.Uint("user", msg.UserID))
+
+	// 发送joined确认
+	conn.WriteJSON(SignalingMessage{
+		Type:   "joined",
+		RoomID: msg.RoomID,
+		UserID: msg.UserID,
+	})
+
+	return peer, nil
+}
+
+func (s *SFUServer) handleOffer(peer *Peer, msg *SignalingMessage) error {
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+
+	s.logger.Info("Received offer", zap.Uint("user", peer.UserID))
+
+	err := peer.PC.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeOffer,
+		SDP:  msg.SDP,
+	})
+	if err != nil {
+		return err
+	}
+
+	answer, err := peer.PC.CreateAnswer(nil)
+	if err != nil {
+		return err
+	}
+
+	err = peer.PC.SetLocalDescription(answer)
+	if err != nil {
+		return err
+	}
+
+	// 发送Answer回前端
+	peer.Conn.WriteJSON(SignalingMessage{
+		Type: "answer",
+		SDP:  answer.SDP,
+	})
+
+	s.logger.Info("Sent answer", zap.Uint("user", peer.UserID))
+	return nil
+}
+
+func (s *SFUServer) handleIceCandidate(peer *Peer, msg *SignalingMessage) error {
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+
+	candidate := webrtc.ICECandidateInit{
+		Candidate: msg.Candidate,
+	}
+	if msg.SDPMLineIndex != nil {
+		idx := uint16(*msg.SDPMLineIndex)
+		candidate.SDPMLineIndex = &idx
+	}
+	if msg.SDPMid != nil {
+		candidate.SDPMid = msg.SDPMid
+	}
+
+	err := peer.PC.AddICECandidate(candidate)
+	if err != nil {
+		s.logger.Warn("Failed to add ICE candidate", zap.Error(err))
+		return err
+	}
+
+	s.logger.Debug("Added ICE candidate", zap.Uint("user", peer.UserID))
+	return nil
+}
+
+func (s *SFUServer) removePeer(roomID, userID uint) {
+	s.mu.Lock()
+	room, ok := s.rooms[roomID]
+	s.mu.Unlock()
+
+	if !ok {
+		return
+	}
+
+	room.mu.Lock()
+	defer room.mu.Unlock()
+
+	peer, ok := room.Peers[userID]
+	if !ok {
+		return
+	}
+
+	peer.PC.Close()
+	delete(room.Peers, userID)
+
+	if len(room.Peers) == 0 {
+		s.mu.Lock()
+		delete(s.rooms, roomID)
+		s.mu.Unlock()
+	}
+
+	s.logger.Info("Peer removed", zap.Uint("room", roomID), zap.Uint("user", userID))
+}
+
+func sendError(conn *websocket.Conn, errorType, message string) {
+	conn.WriteJSON(map[string]string{
+		"type":    "error",
+		"error":   errorType,
+		"message": message,
+	})
 }
 
 var upgrader = websocket.Upgrader{
@@ -350,12 +485,16 @@ func (s *SFUServer) MuteUser(roomID, userID uint, isMuted bool) error {
 		return errors.New("peer not found in room")
 	}
 
-	// Note: Full mute implementation requires track management
-	// This is a simplified version - we just log the action
-	// Proper implementation would need to signal the client to stop sending
-	// or use RTP extension to mark as muted
+	// 发送静音通知给用户（通过信令WebSocket通知客户端）
+	if peer.Conn != nil {
+		muteMsg := SignalingMessage{
+			Type: "muted",
+			Data: map[string]bool{"is_muted": isMuted},
+		}
+		peer.Conn.WriteJSON(muteMsg)
+	}
 
-	s.logger.Info("User mute state changed",
+	s.logger.Info("User mute state changed - signaling sent to client",
 		zap.Uint("roomID", roomID),
 		zap.Uint("userID", userID),
 		zap.Bool("isMuted", isMuted),

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(mkdir -p frontend/public)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\My_PC\\myproject\\conference_based_on_the-SFU model\\frontend"
+    ]
+  }
+}

@@ -102,10 +102,15 @@ func (h *Handler) JoinRoom(c *gin.Context) {
 func (h *Handler) DeleteRoom(c *gin.Context) {
 	userID := GetUserID(c)
 	idStr := c.Param("id")
-	id, _ := strconv.Atoi(idStr)
-
-	err := h.roomService.DeleteRoom(uint(id), userID)
+	id, err := strconv.Atoi(idStr)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+
+	err = h.roomService.DeleteRoom(uint(id), userID)
+	if err != nil {
+		h.logger.Warn("Failed to delete room", zap.Error(err), zap.Uint("roomID", uint(id)), zap.Uint("userID", userID))
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
@@ -116,10 +121,15 @@ func (h *Handler) DeleteRoom(c *gin.Context) {
 func (h *Handler) LockRoom(c *gin.Context) {
 	userID := GetUserID(c)
 	idStr := c.Param("id")
-	id, _ := strconv.Atoi(idStr)
-
-	err := h.roomService.LockRoom(uint(id), userID, true)
+	id, err := strconv.Atoi(idStr)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+
+	err = h.roomService.LockRoom(uint(id), userID, true)
+	if err != nil {
+		h.logger.Warn("Failed to lock room", zap.Error(err), zap.Uint("roomID", uint(id)), zap.Uint("userID", userID))
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
@@ -130,10 +140,15 @@ func (h *Handler) LockRoom(c *gin.Context) {
 func (h *Handler) UnlockRoom(c *gin.Context) {
 	userID := GetUserID(c)
 	idStr := c.Param("id")
-	id, _ := strconv.Atoi(idStr)
-
-	err := h.roomService.LockRoom(uint(id), userID, false)
+	id, err := strconv.Atoi(idStr)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+
+	err = h.roomService.LockRoom(uint(id), userID, false)
+	if err != nil {
+		h.logger.Warn("Failed to unlock room", zap.Error(err), zap.Uint("roomID", uint(id)), zap.Uint("userID", userID))
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
@@ -144,12 +159,21 @@ func (h *Handler) UnlockRoom(c *gin.Context) {
 func (h *Handler) KickMember(c *gin.Context) {
 	userID := GetUserID(c)
 	idStr := c.Param("id")
-	roomID, _ := strconv.Atoi(idStr)
-	userIdStr := c.Param("userId")
-	targetID, _ := strconv.Atoi(userIdStr)
-
-	err := h.roomService.KickMember(uint(roomID), userID, uint(targetID))
+	roomID, err := strconv.Atoi(idStr)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+	userIdStr := c.Param("userId")
+	targetID, err := strconv.Atoi(userIdStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
+
+	err = h.roomService.KickMember(uint(roomID), userID, uint(targetID))
+	if err != nil {
+		h.logger.Warn("Failed to kick member", zap.Error(err), zap.Uint("roomID", uint(roomID)), zap.Uint("userID", userID), zap.Uint("targetID", uint(targetID)))
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
@@ -169,14 +193,30 @@ func (h *Handler) KickMember(c *gin.Context) {
 func (h *Handler) MuteMember(c *gin.Context) {
 	userID := GetUserID(c)
 	idStr := c.Param("id")
-	roomID, _ := strconv.Atoi(idStr)
-	userIdStr := c.Param("userId")
-	targetID, _ := strconv.Atoi(userIdStr)
-
-	err := h.roomService.MuteMember(uint(roomID), userID, uint(targetID), true)
+	roomID, err := strconv.Atoi(idStr)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+	userIdStr := c.Param("userId")
+	targetID, err := strconv.Atoi(userIdStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
+
+	err = h.roomService.MuteMember(uint(roomID), userID, uint(targetID), true)
+	if err != nil {
+		h.logger.Warn("Failed to mute member", zap.Error(err), zap.Uint("roomID", uint(roomID)), zap.Uint("userID", userID), zap.Uint("targetID", uint(targetID)))
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Call SFU to mute the user's media stream
+	if h.sfuClient != nil {
+		if err := h.sfuClient.MuteUser(uint(roomID), uint(targetID), true); err != nil {
+			h.logger.Warn("Failed to mute user in SFU, continuing with signaling", zap.Error(err))
+		}
 	}
 
 	h.hub.BroadcastMute(uint(roomID), uint(targetID), true)
@@ -187,14 +227,30 @@ func (h *Handler) MuteMember(c *gin.Context) {
 func (h *Handler) UnmuteMember(c *gin.Context) {
 	userID := GetUserID(c)
 	idStr := c.Param("id")
-	roomID, _ := strconv.Atoi(idStr)
-	userIdStr := c.Param("userId")
-	targetID, _ := strconv.Atoi(userIdStr)
-
-	err := h.roomService.MuteMember(uint(roomID), userID, uint(targetID), false)
+	roomID, err := strconv.Atoi(idStr)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+	userIdStr := c.Param("userId")
+	targetID, err := strconv.Atoi(userIdStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
+
+	err = h.roomService.MuteMember(uint(roomID), userID, uint(targetID), false)
+	if err != nil {
+		h.logger.Warn("Failed to unmute member", zap.Error(err), zap.Uint("roomID", uint(roomID)), zap.Uint("userID", userID), zap.Uint("targetID", uint(targetID)))
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
+	}
+
+	// Call SFU to unmute the user's media stream
+	if h.sfuClient != nil {
+		if err := h.sfuClient.MuteUser(uint(roomID), uint(targetID), false); err != nil {
+			h.logger.Warn("Failed to unmute user in SFU, continuing with signaling", zap.Error(err))
+		}
 	}
 
 	h.hub.BroadcastMute(uint(roomID), uint(targetID), false)
@@ -205,12 +261,21 @@ func (h *Handler) UnmuteMember(c *gin.Context) {
 func (h *Handler) SetAdmin(c *gin.Context) {
 	userID := GetUserID(c)
 	idStr := c.Param("id")
-	roomID, _ := strconv.Atoi(idStr)
-	userIdStr := c.Param("userId")
-	targetID, _ := strconv.Atoi(userIdStr)
-
-	err := h.roomService.SetAdmin(uint(roomID), userID, uint(targetID), true)
+	roomID, err := strconv.Atoi(idStr)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+	userIdStr := c.Param("userId")
+	targetID, err := strconv.Atoi(userIdStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
+
+	err = h.roomService.SetAdmin(uint(roomID), userID, uint(targetID), true)
+	if err != nil {
+		h.logger.Warn("Failed to set admin", zap.Error(err), zap.Uint("roomID", uint(roomID)), zap.Uint("userID", userID), zap.Uint("targetID", uint(targetID)))
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
@@ -223,12 +288,21 @@ func (h *Handler) SetAdmin(c *gin.Context) {
 func (h *Handler) RemoveAdmin(c *gin.Context) {
 	userID := GetUserID(c)
 	idStr := c.Param("id")
-	roomID, _ := strconv.Atoi(idStr)
-	userIdStr := c.Param("userId")
-	targetID, _ := strconv.Atoi(userIdStr)
-
-	err := h.roomService.SetAdmin(uint(roomID), userID, uint(targetID), false)
+	roomID, err := strconv.Atoi(idStr)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+	userIdStr := c.Param("userId")
+	targetID, err := strconv.Atoi(userIdStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
+
+	err = h.roomService.SetAdmin(uint(roomID), userID, uint(targetID), false)
+	if err != nil {
+		h.logger.Warn("Failed to remove admin", zap.Error(err), zap.Uint("roomID", uint(roomID)), zap.Uint("userID", userID), zap.Uint("targetID", uint(targetID)))
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
@@ -241,12 +315,21 @@ func (h *Handler) RemoveAdmin(c *gin.Context) {
 func (h *Handler) TransferOwner(c *gin.Context) {
 	userID := GetUserID(c)
 	idStr := c.Param("id")
-	roomID, _ := strconv.Atoi(idStr)
-	userIdStr := c.Param("userId")
-	targetID, _ := strconv.Atoi(userIdStr)
-
-	err := h.roomService.TransferOwner(uint(roomID), userID, uint(targetID))
+	roomID, err := strconv.Atoi(idStr)
 	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+	userIdStr := c.Param("userId")
+	targetID, err := strconv.Atoi(userIdStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
+
+	err = h.roomService.TransferOwner(uint(roomID), userID, uint(targetID))
+	if err != nil {
+		h.logger.Warn("Failed to transfer owner", zap.Error(err), zap.Uint("roomID", uint(roomID)), zap.Uint("userID", userID), zap.Uint("targetID", uint(targetID)))
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
@@ -259,9 +342,17 @@ func (h *Handler) TransferOwner(c *gin.Context) {
 
 func (h *Handler) NotifyConnectionFailed(c *gin.Context) {
 	idStr := c.Param("roomId")
-	roomID, _ := strconv.Atoi(idStr)
+	roomID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
 	userIdStr := c.Param("userId")
-	userID, _ := strconv.Atoi(userIdStr)
+	userID, err := strconv.Atoi(userIdStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid user id"})
+		return
+	}
 
 	h.hub.SendConnectionFailed(uint(roomID), uint(userID))
 	c.JSON(http.StatusOK, gin.H{"message": "notification sent"})
@@ -270,7 +361,11 @@ func (h *Handler) NotifyConnectionFailed(c *gin.Context) {
 func (h *Handler) UpdateMediaState(c *gin.Context) {
 	userID := GetUserID(c)
 	idStr := c.Param("id")
-	roomID, _ := strconv.Atoi(idStr)
+	roomID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
 
 	var req struct {
 		VideoEnabled bool `json:"video_enabled"`

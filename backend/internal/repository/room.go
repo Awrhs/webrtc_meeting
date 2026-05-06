@@ -27,6 +27,9 @@ type RoomRepository interface {
 	RemoveExpiredKicks() error
 	CreateAuditLog(log *models.AuditLog) error
 	GetAuditLogs(roomID uint, limit, offset int) ([]*models.AuditLog, error)
+	Begin() RoomRepository
+	Commit() error
+	Rollback() error
 }
 
 type roomRepository struct {
@@ -152,4 +155,16 @@ func (r *roomRepository) GetAuditLogs(roomID uint, limit, offset int) ([]*models
 		Offset(offset).
 		Find(&logs).Error
 	return logs, err
+}
+
+func (r *roomRepository) Begin() RoomRepository {
+	return &roomRepository{db: r.db.Begin()}
+}
+
+func (r *roomRepository) Commit() error {
+	return r.db.Commit().Error
+}
+
+func (r *roomRepository) Rollback() error {
+	return r.db.Rollback().Error
 }

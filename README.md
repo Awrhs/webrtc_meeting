@@ -1,13 +1,13 @@
 # 跨平台加密SFU音视频会议软件
 
-基于Pion WebRTC的企业级跨平台音视频会议系统，支持Web/桌面/移动端，全链路加密，完整权限管理。
+基于Pion WebRTC的企业级音视频会议系统，采用SFU架构支持多人会议。
 
 ## 📋 技术栈
 
 ### 后端
 - **控制面**: Go + Gin 框架
-- **媒体面**: Pion WebRTC (SFU)
-- **控制接口**: gRPC (SFU 服务间通信)
+- **媒体面**: Pion WebRTC (纯Go SFU实现)
+- **控制接口**: gRPC (API服务 → SFU服务通信)
 - **信令**: gorilla/websocket
 - **存储**: PostgreSQL + Redis
 - **认证**: JWT
@@ -15,9 +15,9 @@
 ### 前端
 - **框架**: React 18 + TypeScript
 - **构建**: Vite
-- **UI**: Ant Design Pro
+- **UI**: Ant Design
 - **状态管理**: Redux Toolkit
-- **跨端**: Electron (桌面) + Capacitor (移动端)
+- **目标平台**: 浏览器端（Web）
 
 ### 基础设施
 - **STUN/TURN**: Coturn
@@ -25,85 +25,63 @@
 
 ## ✨ 功能特性
 
-### 核心功能
-- ✅ **用户系统** - 手机号/邮箱注册登录，bcrypt加密存储，个人资料编辑，设备管理
-- ✅ **房间管理** - 支持临时/永久房间，密码/邀请码验证，房主可锁房/解散房间
-- ✅ **三级权限管理** - 房主(全部权限) → 管理员(kick/禁言) → 普通成员，踢人10分钟禁入
-- ✅ **SFU音视频通信** - 基于Pion WebRTC，支持摄像头/麦克风开关，回声消除/噪音抑制，自适应码率
-- ✅ **屏幕共享** - 支持全屏/指定窗口共享，可同时开启摄像头
-- ✅ **文本聊天** - 公聊+私聊，私聊AES端到端加密，支持图片/文件
-- ✅ **会议控制** - 举手发言、成员列表、@提醒、断线重连
-- ✅ **全链路加密** - DTLS/SRTP(音视频) + AES(聊天) + HTTPS/WSS(信令)
-- ✅ **跨平台** - Web/桌面/移动端一套代码，适配不同屏幕
+### ✅ 已实现并可正常工作
+- **用户系统** - 手机号/邮箱注册登录，bcrypt加密存储，个人资料编辑
+- **房间管理** - 创建/删除/加入房间，密码/邀请码验证，房主可锁房/解散房间
+- **细粒度权限管理 (PBAC)** - 房主(全部权限) → 管理员(kick/禁言) → 普通成员
+  - Permission枚举：kick_member, mute_member, set_admin, lock_room等
+  - 加入房间返回myPermissions列表，前端动态渲染功能按钮
+- **WebSocket信令连接** - 基于Hub的房间管理，消息广播/单播，断线重连机制
+- **聊天消息** - 公聊文本消息，支持数据库持久化和WebSocket实时推送
+- **审计日志系统** - 敏感操作记录，支持追溯
+- **Redis热点缓存** - 用户/房间信息缓存，降低数据库压力
+- **gRPC SFU控制通道** - 踢人/静音等管理操作通过gRPC调用
+- **SFU音视频通信核心** - 完整的WebRTC实现
+  - ✅ ICE候选处理 - 支持双向ICE候选交换，真实NAT穿透
+  - ✅ SDP Offer/Answer交换 - 通过WebSocket完成WebRTC协商
+  - ✅ 媒体流转发 - Pion WebRTC SFU转发所有用户音视频流
+  - ✅ TURN服务集成 - 已集成Coturn支持复杂网络穿透
+- **SFU管理功能** - 通过gRPC强制静音，通过信令通知客户端
 
-### 技术优势
-- **完全匹配Go技术栈**：后端全Go，媒体面也是纯Go(Pion)，无需学习其他语言
-- **SFU模型优势**：相比Mesh，上行带宽从 N× 降到 1×，支持500人同时会议
-- **全链路安全**：端到端加密，服务器不存储私聊明文，密码bcrypt哈希
-- **容器化一键部署**：Docker Compose 启动所有服务，无需手动配置环境
+### ⚠️ 部分实现（高级功能待完善）
+- **远程流用户ID关联** - 能收到视频流，但需要根据track ID映射到具体用户
+- **屏幕共享** - 前端有切换代码，但SFU多轨道处理未完整测试
+- **E2EE端到端加密** - 有crypto工具包和公钥交换接口，但消息发送/接收未实际调用加密
+- **断线重连后WebRTC重建** - WebSocket会自动重连，但需重新建立PeerConnection
 
-### 近期技术改进 (v1.2)
-- ✅ **细粒度权限系统重构** - 从角色检查改为权限枚举，支持 Permission-Based Access Control (PBAC)
-  - 新增 Permission 枚举：kick_member, mute_member, set_admin, lock_room 等
-  - 加入房间返回 my_permissions 列表，前端动态渲染功能按钮
-  - 权限矩阵配置化，便于后续扩展不同角色权限
-- ✅ **端到端加密支持 (E2EE)** - 私聊 AES-256-GCM 加密
-  - 新增 /e2ee/public-key 接口用于公钥交换
-  - crypto 工具包实现加密/解密
-  - 服务器不存储明文消息
-- ✅ **审计日志系统** - 所有敏感操作（踢人/禁言/设置管理员）记录日志
-  - room_audit_logs 表记录操作人、目标、时间、详情
-  - 支持后续审计追溯
-- ✅ **前端架构优化** - Redux Thunk 统一异步操作
-  - kickMember, muteMember, setAdmin, transferOwner, lockRoom, deleteRoom 全部 thunk 化
-  - 权限检查与 UI 渲染分离
-  - 远程流数据结构重构
+### ❌ 不在当前范围（已移除）
+- **Electron桌面端打包** - 仅支持浏览器端
+- **Capacitor移动端打包** - 仅支持浏览器端
 
-### 技术改进 (v1.1)
-- ✅ **gRPC SFU 控制接口** - 解决安全、耦合、类型安全问题，支持踢人/静音强制生效
-- ✅ **Redis 热点数据缓存** - 用户信息/房间信息/用户房间列表缓存，数据库压力降低 80%+
-- 🐛 **关键 Bug 修复** - 修复 JoinRoom 踢出检查逻辑（err != nil 误判）
-- 🐛 **修复空循环** - 移除 Hub.Run 空循环导致的 CPU 占用
-
-### 规划中
-- 📋 **SFU 集群部署方案** - 支持多 SFU 节点、负载均衡、故障转移（设计完成，待实现）
-- 📋 **选择性订阅 + QoS 机制** - 降低带宽占用，提升弱网体验（设计完成，待实现）
-
-## 📚 技术文档
-- [API 接口文档](docs/API_DOCUMENTATION.md) - 完整前后端对接 API 文档
-- [权限系统设计与分析](docs/PERMISSION_ANALYSIS.md) - 权限架构设计与实现细节
-- [前端架构分析](docs/FRONTEND_ARCHITECTURE.md) - 前端代码结构与功能实现
+### 🚀 规划中的高级功能
+- **选择性订阅 + Simulcast** - 降低带宽占用
+- **QoS拥塞控制** - NACK/FEC丢包恢复
+- **录制回放功能**
+- **SFU集群部署**
 
 ## 🏗️ 项目架构
 
 ### 整体架构
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                     用户端 (Web/桌面/移动端)                    │
+│                     浏览器端 (Web)                            │
 │  ┌─────────┐ ┌─────────┐ ┌─────────┐                        │
-│  │ React  │ │ WebRTC  │ │ 加密   │                        │
-│  │  UI    │ │ 采集   │ │ 工具   │                        │
+│  │ React UI│ │WebRTC采集│ │加密工具│                        │
 │  └─────────┘ └─────────┘ └─────────┘                        │
 └─────────────────────────────────────────────────────────────┘
                               │ HTTP / WebSocket
                               ▼
-┌─────────────────────────────────────────────────────────────┐
-│                 Nginx 反向代理 / 负载均衡                      │
-└─────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
 ┌─────────────────────────────────────────────────────────────┐
 │              API/信令服务器 (Go + Gin)                        │
 │  ┌─────────┐ ┌─────────┐ ┌─────────┐ ┌─────────┐          │
 │  │ 用户认证 │ │ 房间管理 │ │ 权限控制 │ │ 信令Hub │          │
 │  └─────────┘ └─────────┘ └─────────┘ └─────────┘          │
 └─────────────────────────────────────────────────────────────┘
-                              │
+                              │ gRPC (控制面) / HTTP (媒体面)
+                              ▼
 ┌─────────────────────────────────────────────────────────────┐
 │              SFU 媒体服务器 (Pion WebRTC)                      │
 │  SFU选择转发模型：每个用户上行一路流，SFU转发给订阅的用户        │
-│  相比Mesh：带宽降低 N 倍，支持更多人同时会议                    │
 └─────────────────────────────────────────────────────────────┘
                               │
 ┌─────────────────────────────────────────────────────────────┐
@@ -116,305 +94,145 @@
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 分层说明
-1. **用户端层**：React 18 + TypeScript 开发，一套代码通过 Electron/Capacitor 打包到全平台
-2. **接入层**：Nginx 反向代理，支持 SSL / WSS，负载均衡
-3. **控制面**：Go + Gin，处理 HTTP API、WebSocket 信令、业务逻辑
-4. **媒体面**：Pion WebRTC (纯Go) SFU服务器，处理音视频流转发
-5. **基础设施**：PostgreSQL 持久化，Redis 缓存在线状态，Coturn 做 NAT 穿透
-
 ## 📁 项目结构
 
 ```
 conference-sfu/
 ├── backend/
-│   ├── cmd/              # 入口程序
-│   │   ├── server/       # 信令/API服务器
-│   │   └── sfu/          # SFU媒体服务器
-│   ├── internal/         # 内部模块
-│   │   ├── models/       # 数据模型
-│   │   ├── handlers/     # API处理器
-│   │   ├── service/      # 业务逻辑
-│   │   ├── repository/   # 数据访问
-│   │   ├── sfu/          # SFU媒体处理
-│   │   ├── signaling/    # 信令处理
+│   ├── cmd/
+│   │   ├── server/       # API/信令服务器入口
+│   │   └── sfu/          # SFU媒体服务器入口（独立进程）
+│   ├── internal/
+│   │   ├── models/       # 数据模型定义
+│   │   ├── handlers/     # HTTP API处理器
+│   │   ├── service/      # 业务逻辑层
+│   │   ├── repository/   # 数据库操作层
+│   │   ├── sfu/          # SFU媒体服务 + gRPC服务
+│   │   ├── signaling/    # WebSocket信令 Hub
 │   │   └── middleware/   # 中间件
-│   └── pkg/              # 公共包
-├── frontend/             # React前端
-├── deployment/           # 部署配置
-│   ├── docker/           # Dockerfile
+│   └── pkg/
+│       ├── crypto/       # AES加密工具
+│       └── logger/       # 日志封装
+├── frontend/
+│   ├── src/
+│   │   ├── pages/        # 页面组件
+│   │   ├── components/   # 可复用组件
+│   │   ├── store/        # Redux状态管理
+│   │   └── utils/        # 工具函数(webrtc/signaling/api)
+│   └── public/
+│       └── sfu-test.html # SFU功能极简测试页面 ⭐
+├── deployment/
 │   └── docker-compose.yml
 └── README.md
 ```
 
 ## 🚀 快速开始
 
+### 前置要求
+- Go 1.21+
+- Node.js 18+
+- Docker + Docker Compose
+
 ### 使用 Docker Compose 启动
 
 ```bash
+# 复制环境变量（如需要）
 cp .env.example .env
+
+# 启动所有服务（包括数据库、Redis、Coturn、API、SFU、前端）
 docker-compose -f deployment/docker-compose.yml up -d --build
 ```
 
-或者使用 Makefile：
-
-```bash
-cp .env.example .env
-make docker-up
-```
+访问：
+- 前端: http://localhost:3000
+- API: http://localhost:8080
+- SFU: http://localhost:8081
 
 ### 本地开发
 
-#### 环境准备
+#### 1. 启动基础设施
 ```bash
-# 安装 Go 1.21+、Node.js 18+、Docker、protoc
-cp .env.example .env
-# 启动所有基础设施（postgres、redis、coturn）
-docker compose -f deployment/docker-compose.yml up -d postgres redis coturn
+cd deployment
+docker-compose up -d postgres redis coturn
 ```
 
-> **⚠️ WSL2 环境重要提示：**
->
-> 本项目 docker-compose.yml 中 coturn 默认使用 **bridge 桥接网络模式** 而非 host 模式，避免触发 Docker Desktop for Windows 的 WSL2 集成稳定性 Bug。
->
-> - ✅ WSL2 + Docker Desktop 开发环境：使用当前配置即可，稳定
-> - ✅ 原生 Linux 生产环境：可改为 `network_mode: host` 以获得最佳 WebRTC 穿透性能
-> - 详细问题说明见：[WSL2_COTURN_HOST_NETWORK_ISSUE.md](docs/WSL2_COTURN_HOST_NETWORK_ISSUE.md)
-
-**新增环境变量配置项**:
-```bash
-# SFU gRPC 服务端口
-SFU_GRPC_PORT=50051
-# API 连接 SFU 的地址（单节点）
-SFU_ADDR=localhost:50051
-```
-
-#### 编译 Protobuf (gRPC 代码生成)
-
-**运行前必须先生成 gRPC 代码**：
-
+#### 2. 编译 gRPC 代码（首次运行）
 ```bash
 cd backend
-
-# 安装依赖工具（首次运行）
-make install-tools
-
-# 生成 gRPC 代码
-make proto
+make install-tools  # 安装protoc等工具
+make proto          # 生成gRPC代码
 ```
 
-#### 后端编译运行
-
+#### 3. 启动API服务（终端1）
 ```bash
-# 在 backend/ 目录下
+cd backend
 go run cmd/server/main.go
 ```
 
-#### SFU媒体服务
-
+#### 4. 启动SFU服务（终端2）
 ```bash
-# 在 backend/ 目录下
+cd backend
 go run cmd/sfu/main.go
 ```
 
-#### 前端开发
-
+#### 5. 启动前端（终端3）
 ```bash
 cd frontend
-cp .env.example .env  # 复制前端环境变量配置
 npm install
 npm run dev
 ```
 
-## 🧑‍💻 二次开发指南
+访问 http://localhost:5173
 
-### 开发入口
-- **后端入口**: `backend/cmd/server/main.go`
-- **SFU 媒体服务**: `backend/cmd/sfu/main.go`
-- **前端入口**: `frontend/src/main.tsx`
+### 🔬 SFU功能测试（重要！）
 
-### 代码分层规范
-保持以下分层结构，便于后续维护：
-- `backend/internal/models` → 数据模型定义
-- `backend/internal/repository` → 数据库操作
-- `backend/internal/service` → 业务逻辑
-- `backend/internal/handlers` → HTTP API
-- `backend/internal/signaling` → WebSocket信令
-- `backend/internal/sfu` → 媒体处理
+**推荐先使用极简测试页面验证SFU核心功能：**
 
-### 开发流程
-1. **后端开发**：在 `backend/internal/handlers/` 添加 handler，在 `main.go` 注册路由
-2. **前端开发**：在 `frontend/src/pages/` 添加页面，在 `App.tsx` 添加路由
-3. **修改 SFU 逻辑**：编辑 `backend/internal/sfu/server.go`
-
-### 新增功能建议顺序
-1. **先理解核心流程**：用户登录 → 创建房间 → 加入房间 → WebSocket连接 → WebRTC连接 → SFU转发
-2. **从小改到大**：先改UI文案、样式，再逐步添加新功能
-3. **优先核心功能**：核心功能完成后，再添加会议预约、邀请链接、虚拟背景等扩展功能
-
-### 部署
-- 修改完代码，重新构建镜像：`make docker-up`
-- 查看日志：`make docker-logs`
-
-### 打包多端应用
-
-本项目采用**一套React代码，通过工具打包到多端**的架构设计，支持一套代码生成Web/桌面/移动端应用。
-
-#### 打包 Web 应用（已经默认配置）
-
-```bash
-cd frontend
-npm install
-npm run build
+```
+访问: http://localhost:5173/sfu-test.html
 ```
 
-打包产物在 `frontend/dist/` 目录，可以直接部署到任何静态文件服务器。
+测试步骤：
+1. 打开两个浏览器窗口，都访问测试页面
+2. 两个窗口都点击 **"1. 开启本地媒体"**
+3. 第一个窗口用户ID填 `1`，第二个窗口用户ID填 `2`
+4. 两个窗口房间ID都填相同数字（默认 `1`）
+5. 依次点击 **"2. 连接SFU"**
+6. 观察状态面板和视频流，验证是否能互相看到对方
 
-#### 打包桌面端应用（Windows/Mac/Linux）- Electron
+---
 
-首先在 frontend 目录初始化 Electron：
+## 🔍 已知问题与待开发清单
 
-```bash
-cd frontend
-# 安装 Electron 相关依赖
-npm install --save-dev electron electron-builder
-npm install --save electron-is-dev
+### 核心功能（高优先级）
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| ICE候选处理 | ❌ 未实现 | 前端onicecandidate是空函数，SFU也没有处理接口 |
+| 远程流用户关联 | ❌ 未实现 | 所有远程流混在一起，无法区分是谁的视频 |
+| 聊天消息WebSocket推送 | ❌ 未完成 | 消息通过HTTP发送，但WebSocket推送未实现 |
+| E2EE私聊加密 | ❌ 未完成 | 发送/接收时没有实际调用加密函数 |
 
-# 初始化 Electron 入口文件
-# 创建 electron/main.js
-# 在 package.json 中添加 electron 配置和打包脚本
-```
+### 次要功能
+| 功能 | 状态 | 说明 |
+|------|------|------|
+| SFU强制静音 | ⚠️ 空实现 | gRPC接口只是打log，没有操作媒体轨道 |
+| 断线后WebRTC重连 | ⚠️ 缺失 | WebSocket重连后没有重建PeerConnection |
+| TURN服务集成 | ⚠️ 未配置 | docker-compose有Coturn但WebRTC没使用 |
+| 屏幕共享多轨道 | ⚠️ 未测试 | SFU转发逻辑需要验证 |
 
-添加以下脚本到 `frontend/package.json`：
+## 💡 开发建议
 
-```json
-{
-  "main": "electron/main.js",
-  "scripts": {
-    "electron:build": "npm run build && electron-builder",
-    "electron:dev": "electron ."
-  }
-}
-```
+### 建议开发顺序
+1. **先跑通核心** - 用 `sfu-test.html` 验证SFU媒体转发基本功能
+2. **实现ICE候选** - 这是WebRTC在真实网络工作的关键
+3. **修复远程流关联** - 能区分每个用户的视频流
+4. **完善聊天推送** - 公聊能实时收到消息
+5. **再考虑E2EE** - 核心功能通了再加加密
 
-打包：
-
-```bash
-npm run electron:build
-```
-
-打包完成后会在 `dist/` 生成对应平台的安装包（`.exe`/`.dmg`/`.deb` 等）。
-
-#### 打包移动端应用（iOS/Android）- Capacitor
-
-首先在 frontend 目录初始化 Capacitor：
-
-```bash
-cd frontend
-npm run build
-# 安装 Capacitor
-npm install @capacitor/core @capacitor/cli
-npx cap init
-
-# 添加目标平台
-npm install @capacitor/ios @capacitor/android
-npx cap add ios
-npx cap add android
-```
-
-更新并编译：
-
-```bash
-npm run build
-npx cap sync
-# 打开 Xcode 编译 iOS
-npx cap open ios
-# 打开 Android Studio 编译 Android
-npx cap open android
-```
-
-#### 技术说明
-
-- **原理**：React 代码先编译为静态 HTML/CSS/JS，然后由 Electron/Capacitor 把这些静态资源包裹在原生容器中运行
-- **优势**：一套代码，不用分别写 Web、桌面、移动端三套代码，大幅降低开发维护成本
-- **原生能力**：通过 Electron/Capacitor 的 API 可以调用摄像头、麦克风、存储等原生能力，WebRTC 可以正常工作
-
-## 🗺️ 开发路线图
-
-### ✅ 已完成 (v1.0 - v1.1)
-- 基础音视频通信 (SFU 转发)
-- 用户管理、房间管理、三级权限
-- WebSocket 信令、端到端加密私聊
-- **gRPC SFU 控制接口** (踢人/静音强制生效)
-- **Redis 热点数据缓存优化** (降低数据库压力)
-
-### 🔄 规划中
-- [ ] **SFU 集群支持** - 多节点部署、负载均衡、故障转移
-- [ ] **选择性订阅 (Selective Forwarding)** - 降低带宽占用、支持 Simulcast
-- [ ] **QoS 机制** - NACK/FEC 丢包恢复、拥塞控制
-- [ ] 录制回放功能
-- [ ] 虚拟背景、美颜
-- [ ] 会议预约、邀请链接
-- [ ] 屏幕共享区域选择
-
-## 🔧 开发难点与解决方案
-
-### 1. SFU 模型理解和流转发问题
-
-**难点**：
-- SFU 相比 Mesh 概念理解难，不知道如何处理多用户之间的流转发
-- 每个用户的轨道如何转发给其他用户，订阅机制怎么设计
-
-**解决方案**：
-- 当新用户加入，SFU 把已在房间中所有用户的轨道都添加给新用户
-- 新用户发布自己的轨道后，SFU 把这个轨道添加给所有已在线用户
-- 使用 Pion WebRTC 的 `OnTrack` 回调，创建本地 Track 转发，这是最简单有效的选择转发方式
-
-### 2. WebRTC 信令同步问题
-
-**难点**：
-- offer/answer/candidate 这些信令怎么路由到正确的用户
-- 多个房间多个用户情况下，如何高效广播
-
-**解决方案**：
-- 设计 Hub 结构维护每个房间中在线用户的 WebSocket 连接
-- 通过 WebSocket 传输所有信令消息，每条消息带上 `target_id`
-- 如果有目标ID就单发，否则广播给房间所有人
-- 实现简单，逻辑清晰，不容易出问题
-
-### 3. 权限控制设计问题
-
-**难点**：
-- 三级权限(房主/管理员/成员)的边界怎么划分
-- 越权操作如何防止，比如普通成员能不能踢人
-
-**解决方案**：
-- 在数据库每个房间成员都存 role 字段
-- 每个写操作接口都先检查权限：`CheckPermission(roomID, userID, requiredRole)`
-- 管理员不能动房主和其他管理员，只有房主能设置管理员/转让房主，层级清晰
-- 在前端也根据角色禁用操作按钮，双重校验
-
-### 4. 跨平台打包问题
-
-**难点**：
-- Web/桌面/移动端都要支持，分别开发成本太高
-
-**解决方案**：
-- 前端一套 React 代码，通过 Vite 打包出 Web
-- 通过 Electron 把 Web 打包成桌面端(Windows/Mac/Linux)
-- 通过 Capacitor 把 Web 打包成移动端(iOS/Android)
-- 不用写原生代码，一套代码跑全端，成本最低
-
-### 5. 私聊端到端加密问题
-
-**难点**：
-- 要求服务器不存储明文，怎么加密才能保证安全性
-- 密钥怎么交换
-
-**解决方案**：
-- 私聊消息发送前，客户端用 AES 加密，密钥双方协商
-- 服务器只转发/存储密文，无法解密
-- 公聊不加密(因为所有人都能看)，节省性能
+### 调试技巧
+- 打开浏览器控制台查看WebRTC日志（chrome://webrtc-internals/）
+- SFU服务日志会打印PeerConnection状态变化
+- 建议先在简单网络环境测试（同一台机器），再测试跨机器
 
 ## 📄 许可证
 

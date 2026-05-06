@@ -25,7 +25,7 @@ func main() {
 		log.Fatal("Failed to connect to database", zap.Error(err))
 	}
 
-	redisClient := repository.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword)
+	redisClient := repository.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword, log)
 
 	userRepo := repository.NewUserRepository(db)
 	roomRepo := repository.NewRoomRepository(db)

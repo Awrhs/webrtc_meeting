@@ -4,9 +4,7 @@ import (
 	"conference-sfu/backend/internal/models"
 	"conference-sfu/backend/internal/service"
 	"encoding/json"
-	"log"
 	"net/http"
-	"sync"
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -15,27 +13,27 @@ import (
 type MessageType string
 
 const (
-	MessageTypeJoinRoom    MessageType = "join_room"
-	MessageTypeLeaveRoom   MessageType = "leave_room"
-	MessageTypeOffer       MessageType = "offer"
-	MessageTypeAnswer      MessageType = "answer"
-	MessageTypeIceCandidate MessageType = "ice_candidate"
-	MessageTypeChatMessage MessageType = "chat_message"
-	MessageTypeUserJoined  MessageType = "user_joined"
-	MessageTypeUserLeft    MessageType = "user_left"
-	MessageTypeKicked      MessageType = "kicked"
-	MessageTypeMuted       MessageType = "muted"
-	MessageTypeRoleChanged MessageType = "role_changed"
-	MessageTypeMediaState  MessageType = "media_state"
+	MessageTypeJoinRoom      MessageType = "join_room"
+	MessageTypeLeaveRoom     MessageType = "leave_room"
+	MessageTypeOffer         MessageType = "offer"
+	MessageTypeAnswer        MessageType = "answer"
+	MessageTypeIceCandidate  MessageType = "ice_candidate"
+	MessageTypeChatMessage   MessageType = "chat_message"
+	MessageTypeUserJoined    MessageType = "user_joined"
+	MessageTypeUserLeft      MessageType = "user_left"
+	MessageTypeKicked        MessageType = "kicked"
+	MessageTypeMuted         MessageType = "muted"
+	MessageTypeRoleChanged   MessageType = "role_changed"
+	MessageTypeMediaState    MessageType = "media_state"
 	MessageTypeConnectionFailed MessageType = "connection_failed"
 )
 
 type Message struct {
-	Type    MessageType     `json:"type"`
-	RoomID  uint            `json:"room_id,omitempty"`
-	UserID  uint            `json:"user_id,omitempty"`
-	TargetID uint           `json:"target_id,omitempty"`
-	Data    json.RawMessage `json:"data,omitempty"`
+	Type       MessageType     `json:"type"`
+	RoomID     uint            `json:"room_id,omitempty"`
+	UserID     uint            `json:"user_id,omitempty"`
+	TargetID   uint            `json:"target_id,omitempty"`
+	Data       json.RawMessage `json:"data,omitempty"`
 }
 
 type Client struct {
@@ -47,12 +45,38 @@ type Client struct {
 }
 
 type Hub struct {
-	clients    map[uint]*Client
-	rooms      map[uint]map[uint]*Client
+	// 所有在线客户端
+	clients map[uint]*Client
+	// 房间 -> 房间内的客户端集合
+	rooms map[uint]map[uint]*Client
+
+	// Channel用于序列化所有操作（不需要互斥锁）
+	register   chan *Client
+	unregister chan *Client
+	broadcast  chan *BroadcastMessage
+	sendToUser chan *UserMessage
+	addToRoom  chan *RoomClientAction
+	removeFromRoom chan *RoomClientAction
+
 	roomService service.RoomService
 	chatService service.ChatService
-	logger     *zap.Logger
-	mu         sync.Mutex
+	logger      *zap.Logger
+}
+
+type RoomClientAction struct {
+	Client  *Client
+	RoomID  uint
+}
+
+type BroadcastMessage struct {
+	RoomID         uint
+	Message        []byte
+	ExcludeUserID  uint
+}
+
+type UserMessage struct {
+	UserID  uint
+	Message []byte
 }
 
 var upgrader = websocket.Upgrader{
@@ -65,42 +89,121 @@ var upgrader = websocket.Upgrader{
 
 func NewHub(roomService service.RoomService, chatService service.ChatService, logger *zap.Logger) *Hub {
 	return &Hub{
-		clients:    make(map[uint]*Client),
-		rooms:      make(map[uint]map[uint]*Client),
-		roomService: roomService,
-		chatService: chatService,
-		logger:     logger,
+		clients:        make(map[uint]*Client),
+		rooms:          make(map[uint]map[uint]*Client),
+		register:       make(chan *Client),
+		unregister:     make(chan *Client),
+		broadcast:      make(chan *BroadcastMessage),
+		sendToUser:     make(chan *UserMessage),
+		addToRoom:      make(chan *RoomClientAction),
+		removeFromRoom: make(chan *RoomClientAction),
+		roomService:    roomService,
+		chatService:    chatService,
+		logger:         logger,
 	}
 }
 
+// Run 是Hub的主事件循环，所有操作通过channel串行化执行，无需互斥锁
 func (h *Hub) Run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.clients[client.userID] = client
+			h.logger.Info("Client registered", zap.Uint("userID", client.userID))
+
+		case client := <-h.unregister:
+			if _, ok := h.clients[client.userID]; ok {
+				// 从所有房间移除
+				for roomID := range client.roomIDs {
+					h.removeClientFromRoomNoLock(client, roomID)
+				}
+				delete(h.clients, client.userID)
+				close(client.send)
+				h.logger.Info("Client unregistered", zap.Uint("userID", client.userID))
+			}
+
+		case msg := <-h.broadcast:
+			if room, ok := h.rooms[msg.RoomID]; ok {
+				for _, client := range room {
+					if client.userID != msg.ExcludeUserID {
+						select {
+						case client.send <- msg.Message:
+						default:
+							close(client.send)
+							h.removeClientFromRoomNoLock(client, msg.RoomID)
+							delete(h.clients, client.userID)
+						}
+					}
+				}
+			}
+
+		case msg := <-h.sendToUser:
+			if client, ok := h.clients[msg.UserID]; ok {
+				select {
+				case client.send <- msg.Message:
+				default:
+					close(client.send)
+					delete(h.clients, client.userID)
+				}
+			}
+
+		case action := <-h.addToRoom:
+			if _, ok := h.rooms[action.RoomID]; !ok {
+				h.rooms[action.RoomID] = make(map[uint]*Client)
+			}
+			h.rooms[action.RoomID][action.Client.userID] = action.Client
+			action.Client.roomIDs[action.RoomID] = true
+			h.logger.Info("Client added to room", zap.Uint("userID", action.Client.userID), zap.Uint("roomID", action.RoomID))
+
+		case action := <-h.removeFromRoom:
+			h.removeClientFromRoomNoLock(action.Client, action.RoomID)
+			h.logger.Info("Client removed from room", zap.Uint("userID", action.Client.userID), zap.Uint("roomID", action.RoomID))
+		}
+	}
 }
 
+// ==================== 外部调用方法（通过channel提交任务） ====================
+
 func (h *Hub) Register(client *Client) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.clients[client.userID] = client
+	h.register <- client
 }
 
 func (h *Hub) Unregister(client *Client) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	for roomID := range client.roomIDs {
-		h.RemoveClientFromRoom(client, roomID)
+	h.unregister <- client
+}
+
+func (h *Hub) BroadcastToRoom(roomID uint, message []byte, excludeUserID uint) {
+	h.broadcast <- &BroadcastMessage{
+		RoomID:        roomID,
+		Message:       message,
+		ExcludeUserID: excludeUserID,
 	}
-	delete(h.clients, client.userID)
-	close(client.send)
+}
+
+func (h *Hub) SendToUser(userID uint, message []byte) {
+	h.sendToUser <- &UserMessage{
+		UserID:  userID,
+		Message: message,
+	}
 }
 
 func (h *Hub) AddClientToRoom(client *Client, roomID uint) {
-	if _, ok := h.rooms[roomID]; !ok {
-		h.rooms[roomID] = make(map[uint]*Client)
+	h.addToRoom <- &RoomClientAction{
+		Client: client,
+		RoomID: roomID,
 	}
-	h.rooms[roomID][client.userID] = client
-	client.roomIDs[roomID] = true
 }
 
 func (h *Hub) RemoveClientFromRoom(client *Client, roomID uint) {
+	h.removeFromRoom <- &RoomClientAction{
+		Client: client,
+		RoomID: roomID,
+	}
+}
+
+// ==================== 辅助方法（仅在Run() goroutine内部调用，无需锁） ====================
+
+func (h *Hub) removeClientFromRoomNoLock(client *Client, roomID uint) {
 	if room, ok := h.rooms[roomID]; ok {
 		if _, ok := room[client.userID]; ok {
 			delete(room, client.userID)
@@ -112,38 +215,7 @@ func (h *Hub) RemoveClientFromRoom(client *Client, roomID uint) {
 	}
 }
 
-func (h *Hub) BroadcastToRoom(roomID uint, message []byte, excludeUserID uint) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if room, ok := h.rooms[roomID]; ok {
-		for _, client := range room {
-			if client.userID != excludeUserID {
-				select {
-				case client.send <- message:
-				default:
-					close(client.send)
-					h.RemoveClientFromRoom(client, roomID)
-					delete(h.clients, client.userID)
-				}
-			}
-		}
-	}
-}
-
-func (h *Hub) SendToUser(userID uint, message []byte) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	if client, ok := h.clients[userID]; ok {
-		select {
-		case client.send <- message:
-		default:
-			close(client.send)
-			delete(h.clients, userID)
-		}
-	}
-}
+// ==================== 业务方法 ====================
 
 func (h *Hub) BroadcastUserJoined(roomID uint, userID uint) {
 	msg := Message{
@@ -167,8 +239,8 @@ func (h *Hub) BroadcastUserLeft(roomID uint, userID uint) {
 
 func (h *Hub) BroadcastKick(roomID uint, targetID uint) {
 	msg := Message{
-		Type:    MessageTypeKicked,
-		RoomID:  roomID,
+		Type:     MessageTypeKicked,
+		RoomID:   roomID,
 		TargetID: targetID,
 	}
 	data, _ := json.Marshal(msg)
@@ -184,8 +256,8 @@ func (h *Hub) BroadcastMute(roomID uint, targetID uint, isMuted bool) {
 		UserID: targetID,
 		Data:   json.RawMessage(data),
 	}
-	data, _ = json.Marshal(msg)
-	h.BroadcastToRoom(roomID, data, 0)
+	raw, _ := json.Marshal(msg)
+	h.BroadcastToRoom(roomID, raw, 0)
 }
 
 func (h *Hub) BroadcastRoleChanged(roomID uint, userID uint, role models.Role) {
@@ -194,7 +266,7 @@ func (h *Hub) BroadcastRoleChanged(roomID uint, userID uint, role models.Role) {
 		Type:   MessageTypeRoleChanged,
 		RoomID: roomID,
 		UserID: userID,
-		Data:   data,
+		Data:   json.RawMessage(data),
 	}
 	raw, _ := json.Marshal(msg)
 	h.BroadcastToRoom(roomID, raw, 0)
@@ -202,9 +274,9 @@ func (h *Hub) BroadcastRoleChanged(roomID uint, userID uint, role models.Role) {
 
 func (h *Hub) SendConnectionFailed(roomID uint, userID uint) {
 	msg := Message{
-		Type:    MessageTypeConnectionFailed,
-		RoomID:  roomID,
-		UserID:  userID,
+		Type:   MessageTypeConnectionFailed,
+		RoomID: roomID,
+		UserID: userID,
 	}
 	data, _ := json.Marshal(msg)
 	h.SendToUser(userID, data)
@@ -219,7 +291,7 @@ func (h *Hub) BroadcastMediaState(roomID uint, userID uint, videoEnabled bool, a
 		Type:   MessageTypeMediaState,
 		RoomID: roomID,
 		UserID: userID,
-		Data:   data,
+		Data:   json.RawMessage(data),
 	}
 	raw, _ := json.Marshal(msg)
 	h.BroadcastToRoom(roomID, raw, 0)
@@ -229,19 +301,19 @@ func (h *Hub) BroadcastMessage(roomID uint, message *models.Message, receiverID 
 	if receiverID != nil {
 		data, _ := json.Marshal(message)
 		msg := Message{
-			Type:    MessageTypeChatMessage,
-			RoomID:  roomID,
-			UserID:  message.SenderID,
-			Data:    data,
+			Type:     MessageTypeChatMessage,
+			RoomID:   roomID,
+			UserID:   message.SenderID,
+			Data:     json.RawMessage(data),
 		}
 		raw, _ := json.Marshal(msg)
 		h.SendToUser(message.SenderID, raw)
 		h.SendToUser(*receiverID, raw)
 	} else {
 		msg := Message{
-			Type:    MessageTypeChatMessage,
-			RoomID:  roomID,
-			UserID:  message.SenderID,
+			Type:   MessageTypeChatMessage,
+			RoomID: roomID,
+			UserID: message.SenderID,
 		}
 		msg.Data, _ = json.Marshal(message)
 		raw, _ := json.Marshal(msg)
@@ -249,29 +321,32 @@ func (h *Hub) BroadcastMessage(roomID uint, message *models.Message, receiverID 
 	}
 }
 
+// ==================== Client 读写循环 ====================
+
 func (c *Client) ReadPump() {
-		defer func() {
-			c.hub.Unregister(c)
-			c.conn.Close()
-		}()
+	defer func() {
+		c.hub.Unregister(c)
+		c.conn.Close()
+	}()
 
-		for {
-			_, message, err := c.conn.ReadMessage()
-			if err != nil {
-				if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-					log.Printf("error: %v", err)
-				}
-				break
+	for {
+		_, message, err := c.conn.ReadMessage()
+		if err != nil {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+				c.hub.logger.Error("Read error", zap.Error(err))
 			}
-
-			var msg Message
-			if err = json.Unmarshal(message, &msg); err != nil {
-				continue
-			}
-
-			c.handleMessage(&msg)
+			break
 		}
+
+		var msg Message
+		if err = json.Unmarshal(message, &msg); err != nil {
+			c.hub.logger.Warn("Failed to parse message", zap.Error(err))
+			continue
+		}
+
+		c.handleMessage(&msg)
 	}
+}
 
 func (c *Client) handleMessage(msg *Message) {
 	switch msg.Type {
@@ -300,7 +375,7 @@ func (c *Client) WritePump() {
 	for message := range c.send {
 		err := c.conn.WriteMessage(websocket.TextMessage, message)
 		if err != nil {
-			log.Printf("write error: %v", err)
+			c.hub.logger.Error("Write error", zap.Error(err))
 			break
 		}
 	}

@@ -68,8 +68,11 @@ func (s *roomService) CreateRoom(ownerID uint, req *models.CreateRoomRequest) (*
 		room.Password = string(hashed)
 	}
 
-	err := s.roomRepo.Create(room)
+	tx := s.roomRepo.Begin()
+
+	err := tx.Create(room)
 	if err != nil {
+		tx.Rollback()
 		return nil, err
 	}
 
@@ -82,11 +85,17 @@ func (s *roomService) CreateRoom(ownerID uint, req *models.CreateRoomRequest) (*
 		IsAudioOn: true,
 		JoinedAt:  time.Now(),
 	}
-	s.roomRepo.AddMember(member)
+	err = tx.AddMember(member)
+	if err != nil {
+		tx.Rollback()
+		return nil, err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 
 	s.redis.AddToRoom(room.ID, ownerID)
-
-	// Invalidate user's rooms cache after creating a new room
 	s.redis.DeleteUserRooms(ownerID)
 
 	return room, nil
@@ -332,8 +341,11 @@ func (s *roomService) KickMember(roomID uint, requesterID uint, targetID uint) e
 		return errors.New("permission denied")
 	}
 
-	err = s.roomRepo.RemoveMember(roomID, targetID)
+	tx := s.roomRepo.Begin()
+
+	err = tx.RemoveMember(roomID, targetID)
 	if err != nil {
+		tx.Rollback()
 		return err
 	}
 
@@ -345,16 +357,32 @@ func (s *roomService) KickMember(roomID uint, requesterID uint, targetID uint) e
 		ExpiresAt: expiresAt,
 		Reason:    "kicked by admin",
 	}
-	s.roomRepo.CreateKickBan(kb)
+	if err := tx.CreateKickBan(kb); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	count, err := tx.CountMembers(roomID)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	room, err := tx.FindByID(roomID)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	room.CurrentSize = int(count)
+	if err := tx.Update(room); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 
 	s.redis.RemoveFromRoom(roomID, targetID)
-
-	count, _ := s.roomRepo.CountMembers(roomID)
-	room, _ := s.roomRepo.FindByID(roomID)
-	room.CurrentSize = int(count)
-	s.roomRepo.Update(room)
-
-	// Invalidate caches after kicking a member
 	s.redis.DeleteRoom(roomID)
 	s.redis.DeleteUserRooms(targetID)
 
@@ -420,10 +448,26 @@ func (s *roomService) TransferOwner(roomID uint, oldOwnerID uint, newOwnerID uin
 	newOwnerMember.Role = models.RoleOwner
 	room.OwnerID = newOwnerID
 
-	s.roomRepo.UpdateMember(oldOwnerMember)
-	s.roomRepo.UpdateMember(newOwnerMember)
-	s.roomRepo.Update(room)
+	tx := s.roomRepo.Begin()
 
+	if err := tx.UpdateMember(oldOwnerMember); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.UpdateMember(newOwnerMember); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.Update(room); err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+
+	s.redis.DeleteRoom(roomID)
 	return nil
 }
 

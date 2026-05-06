@@ -10,12 +10,22 @@ import (
 
 func (h *Handler) GetMessages(c *gin.Context) {
 	idStr := c.Param("id")
-	roomID, _ := strconv.Atoi(idStr)
+	roomID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
 
 	limitStr := c.DefaultQuery("limit", "50")
 	offsetStr := c.DefaultQuery("offset", "0")
-	limit, _ := strconv.Atoi(limitStr)
-	offset, _ := strconv.Atoi(offsetStr)
+	limit, err := strconv.Atoi(limitStr)
+	if err != nil {
+		limit = 50
+	}
+	offset, err := strconv.Atoi(offsetStr)
+	if err != nil {
+		offset = 0
+	}
 
 	messages, err := h.chatService.GetMessages(uint(roomID), limit, offset)
 	if err != nil {
@@ -29,7 +39,11 @@ func (h *Handler) GetMessages(c *gin.Context) {
 func (h *Handler) SendMessage(c *gin.Context) {
 	senderID := GetUserID(c)
 	idStr := c.Param("id")
-	roomID, _ := strconv.Atoi(idStr)
+	roomID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
 
 	var req struct {
 		ReceiverID *uint               `json:"receiver_id"`

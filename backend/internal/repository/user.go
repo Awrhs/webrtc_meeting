@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/go-redis/redis/v8"
+	"go.uber.org/zap"
 	"gorm.io/gorm"
 )
 
@@ -92,40 +93,41 @@ func (r *userRepository) DeleteDevice(deviceID uint, userID uint) error {
 
 type RedisClient struct {
 	client *redis.Client
+	logger *zap.Logger
 }
 
-func NewRedisClient(addr, password string) *RedisClient {
+func NewRedisClient(addr, password string, logger *zap.Logger) *RedisClient {
 	rdb := redis.NewClient(&redis.Options{
 		Addr:     addr,
 		Password: password,
 		DB:       0,
 	})
-	return &RedisClient{client: rdb}
+	return &RedisClient{client: rdb, logger: logger}
 }
 
 func (r *RedisClient) SetOnline(userID uint, status string, expiration time.Duration) error {
 	ctx := context.Background()
-	return r.client.Set(ctx, "online:"+string(rune(userID)), status, expiration).Err()
+	return r.client.Set(ctx, "online:"+strconv.Itoa(int(userID)), status, expiration).Err()
 }
 
 func (r *RedisClient) GetOnline(userID uint) (string, error) {
 	ctx := context.Background()
-	return r.client.Get(ctx, "online:"+string(rune(userID))).Result()
+	return r.client.Get(ctx, "online:"+strconv.Itoa(int(userID))).Result()
 }
 
 func (r *RedisClient) AddToRoom(roomID uint, userID uint) error {
 	ctx := context.Background()
-	return r.client.SAdd(ctx, "room:"+string(rune(roomID)), userID).Err()
+	return r.client.SAdd(ctx, "room:"+strconv.Itoa(int(roomID)), userID).Err()
 }
 
 func (r *RedisClient) RemoveFromRoom(roomID uint, userID uint) error {
 	ctx := context.Background()
-	return r.client.SRem(ctx, "room:"+string(rune(roomID)), userID).Err()
+	return r.client.SRem(ctx, "room:"+strconv.Itoa(int(roomID)), userID).Err()
 }
 
 func (r *RedisClient) GetRoomMembers(roomID uint) ([]uint, error) {
 	ctx := context.Background()
-	result, err := r.client.SMembers(ctx, "room:"+string(rune(roomID))).Result()
+	result, err := r.client.SMembers(ctx, "room:"+strconv.Itoa(int(roomID))).Result()
 	if err != nil {
 		return nil, err
 	}
@@ -156,22 +158,32 @@ func (r *RedisClient) SetUser(user *models.User) error {
 	ctx := context.Background()
 	data, err := json.Marshal(user)
 	if err != nil {
+		r.logger.Error("Failed to marshal user for cache", zap.Error(err), zap.Uint("userID", user.ID))
 		return err
 	}
 	key := fmt.Sprintf("%s%d", userCacheKeyPrefix, user.ID)
-	return r.client.Set(ctx, key, data, userCacheTTL).Err()
+	if err := r.client.Set(ctx, key, data, userCacheTTL).Err(); err != nil {
+		r.logger.Error("Failed to set user cache", zap.Error(err), zap.Uint("userID", user.ID))
+		return err
+	}
+	return nil
 }
 
 func (r *RedisClient) GetUser(userID uint) (*models.User, error) {
 	ctx := context.Background()
 	key := fmt.Sprintf("%s%d", userCacheKeyPrefix, userID)
 	data, err := r.client.Get(ctx, key).Result()
-	if err != nil {
+	if err != nil && err != redis.Nil {
+		r.logger.Warn("Failed to get user from cache", zap.Error(err), zap.Uint("userID", userID))
+		return nil, err
+	}
+	if err == redis.Nil {
 		return nil, err
 	}
 
 	var user models.User
 	if err := json.Unmarshal([]byte(data), &user); err != nil {
+		r.logger.Error("Failed to unmarshal user from cache", zap.Error(err), zap.Uint("userID", userID))
 		return nil, err
 	}
 	return &user, nil
@@ -180,7 +192,11 @@ func (r *RedisClient) GetUser(userID uint) (*models.User, error) {
 func (r *RedisClient) DeleteUser(userID uint) error {
 	ctx := context.Background()
 	key := fmt.Sprintf("%s%d", userCacheKeyPrefix, userID)
-	return r.client.Del(ctx, key).Err()
+	if err := r.client.Del(ctx, key).Err(); err != nil {
+		r.logger.Warn("Failed to delete user cache", zap.Error(err), zap.Uint("userID", userID))
+		return err
+	}
+	return nil
 }
 
 // ==================== Room Cache Methods ====================
@@ -189,22 +205,32 @@ func (r *RedisClient) SetRoom(room *models.Room) error {
 	ctx := context.Background()
 	data, err := json.Marshal(room)
 	if err != nil {
+		r.logger.Error("Failed to marshal room for cache", zap.Error(err), zap.Uint("roomID", room.ID))
 		return err
 	}
 	key := fmt.Sprintf("%s%d", roomCacheKeyPrefix, room.ID)
-	return r.client.Set(ctx, key, data, roomCacheTTL).Err()
+	if err := r.client.Set(ctx, key, data, roomCacheTTL).Err(); err != nil {
+		r.logger.Error("Failed to set room cache", zap.Error(err), zap.Uint("roomID", room.ID))
+		return err
+	}
+	return nil
 }
 
 func (r *RedisClient) GetRoom(roomID uint) (*models.Room, error) {
 	ctx := context.Background()
 	key := fmt.Sprintf("%s%d", roomCacheKeyPrefix, roomID)
 	data, err := r.client.Get(ctx, key).Result()
-	if err != nil {
+	if err != nil && err != redis.Nil {
+		r.logger.Warn("Failed to get room from cache", zap.Error(err), zap.Uint("roomID", roomID))
+		return nil, err
+	}
+	if err == redis.Nil {
 		return nil, err
 	}
 
 	var room models.Room
 	if err := json.Unmarshal([]byte(data), &room); err != nil {
+		r.logger.Error("Failed to unmarshal room from cache", zap.Error(err), zap.Uint("roomID", roomID))
 		return nil, err
 	}
 	return &room, nil
@@ -213,7 +239,11 @@ func (r *RedisClient) GetRoom(roomID uint) (*models.Room, error) {
 func (r *RedisClient) DeleteRoom(roomID uint) error {
 	ctx := context.Background()
 	key := fmt.Sprintf("%s%d", roomCacheKeyPrefix, roomID)
-	return r.client.Del(ctx, key).Err()
+	if err := r.client.Del(ctx, key).Err(); err != nil {
+		r.logger.Warn("Failed to delete room cache", zap.Error(err), zap.Uint("roomID", roomID))
+		return err
+	}
+	return nil
 }
 
 // ==================== User Rooms Cache Methods ====================
@@ -222,22 +252,32 @@ func (r *RedisClient) SetUserRooms(userID uint, rooms []*models.Room) error {
 	ctx := context.Background()
 	data, err := json.Marshal(rooms)
 	if err != nil {
+		r.logger.Error("Failed to marshal user rooms for cache", zap.Error(err), zap.Uint("userID", userID))
 		return err
 	}
 	key := fmt.Sprintf("%s%d", userRoomsCachePrefix, userID)
-	return r.client.Set(ctx, key, data, userRoomsCacheTTL).Err()
+	if err := r.client.Set(ctx, key, data, userRoomsCacheTTL).Err(); err != nil {
+		r.logger.Error("Failed to set user rooms cache", zap.Error(err), zap.Uint("userID", userID))
+		return err
+	}
+	return nil
 }
 
 func (r *RedisClient) GetUserRooms(userID uint) ([]*models.Room, error) {
 	ctx := context.Background()
 	key := fmt.Sprintf("%s%d", userRoomsCachePrefix, userID)
 	data, err := r.client.Get(ctx, key).Result()
-	if err != nil {
+	if err != nil && err != redis.Nil {
+		r.logger.Warn("Failed to get user rooms from cache", zap.Error(err), zap.Uint("userID", userID))
+		return nil, err
+	}
+	if err == redis.Nil {
 		return nil, err
 	}
 
 	var rooms []*models.Room
 	if err := json.Unmarshal([]byte(data), &rooms); err != nil {
+		r.logger.Error("Failed to unmarshal user rooms from cache", zap.Error(err), zap.Uint("userID", userID))
 		return nil, err
 	}
 	return rooms, nil
@@ -246,5 +286,9 @@ func (r *RedisClient) GetUserRooms(userID uint) ([]*models.Room, error) {
 func (r *RedisClient) DeleteUserRooms(userID uint) error {
 	ctx := context.Background()
 	key := fmt.Sprintf("%s%d", userRoomsCachePrefix, userID)
-	return r.client.Del(ctx, key).Err()
+	if err := r.client.Del(ctx, key).Err(); err != nil {
+		r.logger.Warn("Failed to delete user rooms cache", zap.Error(err), zap.Uint("userID", userID))
+		return err
+	}
+	return nil
 }

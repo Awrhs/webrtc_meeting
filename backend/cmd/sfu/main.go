@@ -22,7 +22,6 @@ func main() {
 		log.Fatal("Failed to start gRPC server", zap.Error(err))
 	}
 
-	http.HandleFunc("/offer", sfuServer.HandleOffer)
 	http.HandleFunc("/ws", sfuServer.HandleWebSocket)
 
 	// Add CORS middleware

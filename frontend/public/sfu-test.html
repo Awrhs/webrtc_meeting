@@ -1,0 +1,450 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SFU 极简测试页面</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a2e;
+            color: #fff;
+            min-height: 100vh;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        h1 {
+            text-align: center;
+            margin-bottom: 20px;
+            color: #00d4ff;
+        }
+        .status-panel {
+            background: #16213e;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 20px;
+        }
+        .status-item {
+            display: flex;
+            align-items: center;
+            margin: 8px 0;
+        }
+        .status-label {
+            width: 120px;
+            font-weight: 500;
+        }
+        .status-dot {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            margin-right: 8px;
+        }
+        .status-dot.pending { background: #f39c12; }
+        .status-dot.success { background: #27ae60; }
+        .status-dot.error { background: #e74c3c; }
+        .controls {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+            flex-wrap: wrap;
+        }
+        button {
+            padding: 12px 24px;
+            border: none;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        .btn-primary {
+            background: #00d4ff;
+            color: #1a1a2e;
+        }
+        .btn-danger {
+            background: #e74c3c;
+            color: white;
+        }
+        .btn-success {
+            background: #27ae60;
+            color: white;
+        }
+        .input-group {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        input {
+            padding: 10px 15px;
+            border: 2px solid #0f3460;
+            border-radius: 6px;
+            background: #16213e;
+            color: white;
+            font-size: 14px;
+        }
+        input:focus {
+            outline: none;
+            border-color: #00d4ff;
+        }
+        .video-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(400px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .video-container {
+            background: #16213e;
+            border-radius: 8px;
+            padding: 15px;
+        }
+        .video-container h3 {
+            margin-bottom: 10px;
+            font-size: 14px;
+            color: #aaa;
+        }
+        video {
+            width: 100%;
+            background: #000;
+            border-radius: 4px;
+            aspect-ratio: 16/9;
+            object-fit: cover;
+        }
+        .logs {
+            background: #0f0f23;
+            border-radius: 8px;
+            padding: 15px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+        }
+        .log-entry {
+            margin: 4px 0;
+            padding: 4px 8px;
+            border-radius: 4px;
+        }
+        .log-info { background: rgba(0, 212, 255, 0.1); color: #00d4ff; }
+        .log-success { background: rgba(39, 174, 96, 0.1); color: #27ae60; }
+        .log-error { background: rgba(231, 76, 60, 0.1); color: #e74c3c; }
+        .log-warn { background: rgba(243, 156, 18, 0.1); color: #f39c12; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🔬 SFU 功能测试</h1>
+
+        <div class="status-panel">
+            <div class="status-item">
+                <span class="status-label">本地媒体：</span>
+                <span id="media-status" class="status-dot pending"></span>
+                <span id="media-text">等待开启</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">SDP Offer：</span>
+                <span id="offer-status" class="status-dot pending"></span>
+                <span id="offer-text">未发送</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">SDP Answer：</span>
+                <span id="answer-status" class="status-dot pending"></span>
+                <span id="answer-text">未接收</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">ICE连接：</span>
+                <span id="ice-status" class="status-dot pending"></span>
+                <span id="ice-text">未连接</span>
+            </div>
+            <div class="status-item">
+                <span class="status-label">媒体流转发：</span>
+                <span id="stream-status" class="status-dot pending"></span>
+                <span id="stream-text">等待中...</span>
+            </div>
+        </div>
+
+        <div class="input-group">
+            <input type="number" id="room-id" value="1" placeholder="房间ID">
+            <input type="number" id="user-id" value="1" placeholder="用户ID">
+            <input type="text" id="sfu-url" value="http://localhost:8081" placeholder="SFU地址" style="flex: 1;">
+        </div>
+
+        <div class="controls">
+            <button id="btn-media" class="btn-primary" onclick="startMedia()">1. 开启本地媒体</button>
+            <button id="btn-connect" class="btn-success" onclick="connectToSFU()" disabled>2. 连接SFU</button>
+            <button id="btn-disconnect" class="btn-danger" onclick="disconnect()" disabled>断开连接</button>
+        </div>
+
+        <div class="video-grid">
+            <div class="video-container">
+                <h3>📹 本地视频</h3>
+                <video id="local-video" autoplay muted playsinline></video>
+            </div>
+            <div class="video-container">
+                <h3>🌐 远程视频 (来自SFU)</h3>
+                <video id="remote-video" autoplay playsinline></video>
+            </div>
+        </div>
+
+        <div class="logs" id="logs"></div>
+    </div>
+
+    <script>
+        // 全局状态
+        let localStream = null;
+        let peerConnection = null;
+        let remoteStream = new MediaStream();
+        let sfuWs = null;
+
+        // DOM 元素
+        const localVideo = document.getElementById('local-video');
+        const remoteVideo = document.getElementById('remote-video');
+        const btnConnect = document.getElementById('btn-connect');
+        const btnDisconnect = document.getElementById('btn-disconnect');
+
+        // 工具函数
+        function log(message, type = 'info') {
+            const logs = document.getElementById('logs');
+            const entry = document.createElement('div');
+            entry.className = `log-entry log-${type}`;
+            const time = new Date().toLocaleTimeString();
+            entry.textContent = `[${time}] ${message}`;
+            logs.appendChild(entry);
+            logs.scrollTop = logs.scrollHeight;
+        }
+
+        function updateStatus(id, status, text) {
+            const dot = document.getElementById(`${id}-status`);
+            const textEl = document.getElementById(`${id}-text`);
+            dot.className = `status-dot ${status}`;
+            textEl.textContent = text;
+        }
+
+        // WebRTC 配置 - 包含本地TURN服务器
+        const rtcConfig = {
+            iceServers: [
+                { urls: 'stun:stun.l.google.com:19302' },
+                {
+                    urls: 'turn:localhost:3478',
+                    username: 'username',
+                    credential: 'password'
+                }
+            ]
+        };
+
+        // 1. 开启本地媒体
+        async function startMedia() {
+            try {
+                log('正在请求摄像头和麦克风权限...');
+
+                localStream = await navigator.mediaDevices.getUserMedia({
+                    video: { width: 640, height: 480 },
+                    audio: true
+                });
+
+                localVideo.srcObject = localStream;
+
+                log('本地媒体获取成功！', 'success');
+                updateStatus('media', 'success', '已获取');
+
+                btnConnect.disabled = false;
+
+            } catch (error) {
+                log(`获取媒体失败: ${error.message}`, 'error');
+                updateStatus('media', 'error', '失败');
+            }
+        }
+
+        // 2. 连接到SFU (WebSocket信令模式)
+        async function connectToSFU() {
+            const roomId = parseInt(document.getElementById('room-id').value);
+            const userId = parseInt(document.getElementById('user-id').value);
+            const sfuUrl = document.getElementById('sfu-url').value;
+
+            log(`开始连接SFU: 房间=${roomId}, 用户=${userId}`);
+
+            try {
+                // 1. 连接SFU WebSocket
+                const wsUrl = sfuUrl.replace('http', 'ws') + '/ws';
+                log(`连接SFU WebSocket: ${wsUrl}`);
+
+                sfuWs = new WebSocket(wsUrl);
+
+                sfuWs.onopen = async () => {
+                    log('SFU WebSocket已连接', 'success');
+
+                    // 发送join消息
+                    sfuWs.send(JSON.stringify({
+                        type: 'join',
+                        room_id: roomId,
+                        user_id: userId
+                    }));
+                };
+
+                sfuWs.onerror = (error) => {
+                    log('SFU WebSocket连接失败', 'error');
+                    updateStatus('offer', 'error', '连接失败');
+                };
+
+                // 处理SFU消息
+                sfuWs.onmessage = async (event) => {
+                    const msg = JSON.parse(event.data);
+                    log(`收到SFU消息: ${msg.type}`);
+
+                    switch(msg.type) {
+                        case 'joined':
+                            log('成功加入房间，开始WebRTC协商', 'success');
+                            await startWebRTC(roomId, userId);
+                            break;
+                        case 'answer':
+                            log('收到SDP Answer', 'success');
+                            updateStatus('answer', 'success', '已接收');
+                            await peerConnection.setRemoteDescription({
+                                type: 'answer',
+                                sdp: msg.sdp
+                            });
+                            log('WebRTC协商完成！', 'success');
+                            break;
+                        case 'ice-candidate':
+                            log('收到SFU ICE候选，添加到PeerConnection');
+                            await peerConnection.addIceCandidate({
+                                candidate: msg.candidate,
+                                sdpMLineIndex: msg.sdp_m_line_index,
+                                sdpMid: msg.sdp_mid
+                            });
+                            break;
+                        case 'error':
+                            log(`SFU错误: ${msg.message}`, 'error');
+                            break;
+                    }
+                };
+
+            } catch (error) {
+                log(`连接SFU失败: ${error.message}`, 'error');
+                updateStatus('offer', 'error', '发送失败');
+                updateStatus('answer', 'error', '接收失败');
+            }
+        }
+
+        // 启动WebRTC
+        async function startWebRTC(roomId, userId) {
+            // 创建 PeerConnection
+            peerConnection = new RTCPeerConnection(rtcConfig);
+
+            // 监听远程轨道 - 关联到用户ID（通过track id映射）
+            peerConnection.ontrack = (event) => {
+                log(`收到远程轨道: ${event.track.kind}, ID=${event.track.id}`);
+                event.streams[0].getTracks().forEach(track => {
+                    remoteStream.addTrack(track);
+                });
+                remoteVideo.srcObject = remoteStream;
+                updateStatus('stream', 'success', '正在接收');
+            };
+
+            // 监听ICE状态
+            peerConnection.oniceconnectionstatechange = () => {
+                const state = peerConnection.iceConnectionState;
+                log(`ICE连接状态变化: ${state}`);
+
+                if (state === 'connected' || state === 'completed') {
+                    updateStatus('ice', 'success', state);
+                } else if (state === 'failed' || state === 'disconnected') {
+                    updateStatus('ice', 'error', state);
+                }
+            };
+
+            // 监听ICE候选并发送到SFU
+            peerConnection.onicecandidate = (event) => {
+                if (event.candidate && sfuWs && sfuWs.readyState === WebSocket.OPEN) {
+                    log(`收集到ICE候选并发送到SFU`);
+                    sfuWs.send(JSON.stringify({
+                        type: 'ice-candidate',
+                        candidate: event.candidate.candidate,
+                        sdp_m_line_index: event.candidate.sdpMLineIndex,
+                        sdp_mid: event.candidate.sdpMid
+                    }));
+                }
+            };
+
+            // 添加本地轨道
+            localStream.getTracks().forEach(track => {
+                peerConnection.addTrack(track, localStream);
+                log(`添加本地轨道: ${track.kind}`);
+            });
+
+            // 创建 Offer
+            log('正在创建SDP Offer...');
+            const offer = await peerConnection.createOffer();
+            await peerConnection.setLocalDescription(offer);
+            updateStatus('offer', 'pending', '发送中...');
+
+            // 通过WebSocket发送Offer
+            if (sfuWs && sfuWs.readyState === WebSocket.OPEN) {
+                sfuWs.send(JSON.stringify({
+                    type: 'offer',
+                    sdp: offer.sdp
+                }));
+                updateStatus('offer', 'success', '已发送');
+                log('SDP Offer已发送到SFU');
+            }
+
+            btnDisconnect.disabled = false;
+        }
+
+        // 断开连接
+        function disconnect() {
+            log('断开连接...');
+
+            if (sfuWs) {
+                sfuWs.close();
+                sfuWs = null;
+            }
+
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+
+            if (localStream) {
+                localStream.getTracks().forEach(track => track.stop());
+                localStream = null;
+            }
+
+            localVideo.srcObject = null;
+            remoteVideo.srcObject = null;
+            remoteStream = new MediaStream();
+
+            // 重置状态
+            updateStatus('media', 'pending', '等待开启');
+            updateStatus('offer', 'pending', '未发送');
+            updateStatus('answer', 'pending', '未接收');
+            updateStatus('ice', 'pending', '未连接');
+            updateStatus('stream', 'pending', '等待中...');
+
+            btnConnect.disabled = true;
+            btnDisconnect.disabled = true;
+
+            log('已断开连接', 'warn');
+        }
+
+        log('SFU测试页面加载完成');
+        log('使用说明：');
+        log('1. 先开启两个浏览器窗口');
+        log('2. 两个窗口都点击"开启本地媒体"');
+        log('3. 第一个窗口用户ID填1，第二个窗口用户ID填2');
+        log('4. 两个窗口房间ID都填相同数字（比如1）');
+        log('5. 依次点击"连接SFU"');
+        log('6. 检查两个窗口是否都能看到对方视频');
+    </script>
+</body>
+</html>
