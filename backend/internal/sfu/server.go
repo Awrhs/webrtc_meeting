@@ -77,6 +77,26 @@ func NewSFUServer(logger *zap.Logger) *SFUServer {
 
 	settingEngine := webrtc.SettingEngine{}
 
+	// WSL2 兼容模式：强制使用 127.0.0.1 作为 ICE 候选地址
+	// 这解决了 Windows 主机浏览器无法连接 WSL2 内部 IP 的问题
+	if os.Getenv("WSL2_COMPAT") == "1" || os.Getenv("FORCE_LOOPBACK_CANDIDATE") == "1" {
+		// 强制 NAT 1:1 映射，让 SFU 只公布 127.0.0.1
+		settingEngine.SetNAT1To1IPs([]string{"127.0.0.1"}, webrtc.ICECandidateTypeHost)
+
+		// 关键：允许在所有网络接口上生成 loopback 候选
+		settingEngine.SetIncludeLoopbackCandidate(true)
+
+		// 禁用接口过滤，确保不会因为 WSL2 虚拟网卡而跳过候选
+		settingEngine.SetInterfaceFilter(func(iface string) bool {
+			return true // 允许所有接口，包括 lo/eth0/docker0 等
+		})
+
+		logger.Info("WSL2 compatibility mode enabled: forcing ICE candidate to 127.0.0.1, loopback enabled")
+	} else {
+		// 生产环境也启用 loopback，方便本地调试
+		settingEngine.SetIncludeLoopbackCandidate(true)
+	}
+
 	api := webrtc.NewAPI(
 		webrtc.WithSettingEngine(settingEngine),
 	)
@@ -237,7 +257,7 @@ func (s *SFUServer) notifyConnectionFailed(roomID uint, userID uint) {
 func getAPIHost() string {
 	apiHost := os.Getenv("API_SERVER_HOST")
 	if apiHost == "" {
-		return "http://api-server:8080"
+		return "http://localhost:8080"
 	}
 	if !strings.HasPrefix(apiHost, "http") {
 		return "http://" + apiHost
@@ -345,18 +365,36 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 	// 监听ICE候选，发送给前端
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
+			s.logger.Debug("ICE gathering completed",
+				zap.Uint("userID", peer.UserID))
 			return
 		}
+
+		candidateInit := candidate.ToJSON()
+		s.logger.Debug("ICE candidate generated",
+			zap.Uint("userID", peer.UserID),
+			zap.String("candidate", candidateInit.Candidate),
+			zap.String("foundation", candidate.Foundation),
+			zap.Uint16("component", candidate.Component),
+			zap.String("protocol", string(candidate.Protocol)),
+			zap.Uint32("priority", candidate.Priority),
+			zap.String("address", candidate.Address),
+			zap.Uint16("port", candidate.Port),
+			zap.String("typ", string(candidate.Typ)))
+
 		peer.mu.Lock()
 		defer peer.mu.Unlock()
 
-		sdpMLineIndex := int(candidate.SDPMLineIndex)
-		sdpMid := candidate.SDPMid
+		var sdpMLineIndex *int
+		if candidateInit.SDPMLineIndex != nil {
+			idx := int(*candidateInit.SDPMLineIndex)
+			sdpMLineIndex = &idx
+		}
 		iceMsg := SignalingMessage{
 			Type:          "ice-candidate",
-			Candidate:     candidate.String(),
-			SDPMLineIndex: &sdpMLineIndex,
-			SDPMid:        &sdpMid,
+			Candidate:     candidateInit.Candidate,
+			SDPMLineIndex: sdpMLineIndex,
+			SDPMid:        candidateInit.SDPMid,
 		}
 		conn.WriteJSON(iceMsg)
 	})
@@ -368,12 +406,20 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 
 	room.Peers[msg.UserID] = peer
 
-	// 收集所有现有轨道的SSRC映射，稍后发送给新用户
-	var allSSRCs []SSRC
+	// 发送joined确认
+	conn.WriteJSON(SignalingMessage{
+		Type:   "joined",
+		RoomID: msg.RoomID,
+		UserID: msg.UserID,
+	})
 
-	// 订阅房间内已存在的其他用户的所有流
+	// 重要：订阅房间内已存在的其他用户的所有流
+	// 必须在 SetRemoteDescription 之后，PeerConnection 可用时执行
+	room.mu.Lock()
+	var allSSRCs []SSRC
 	for _, existingPeer := range room.Peers {
 		if existingPeer.UserID != peer.UserID {
+			existingPeer.mu.Lock()
 			for trackKey, trackInfo := range existingPeer.Tracks {
 				sender, err := peer.PC.AddTrack(trackInfo.Track)
 				if err == nil {
@@ -388,31 +434,35 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 						zap.Uint("newUser", peer.UserID),
 						zap.Uint("existingUser", existingPeer.UserID),
 						zap.String("trackKey", trackKey))
+				} else {
+					s.logger.Warn("Failed to subscribe existing track",
+						zap.Uint("newUser", peer.UserID),
+						zap.Uint("existingUser", existingPeer.UserID),
+						zap.String("trackKey", trackKey),
+						zap.Error(err))
 				}
 			}
+			existingPeer.mu.Unlock()
 		}
 	}
-
-	// 发送joined确认（需要在发送SSRC映射之前，因为前端需要先完成握手）
-	conn.WriteJSON(SignalingMessage{
-		Type:   "joined",
-		RoomID: msg.RoomID,
-		UserID: msg.UserID,
-	})
-
-	s.logger.Info("Peer joined successfully",
-		zap.Uint("room", msg.RoomID),
-		zap.Uint("user", msg.UserID),
-		zap.Int("existingTracksCount", len(allSSRCs)))
+	room.mu.Unlock()
 
 	// 如果有现有流，发送批量SSRC映射给新用户
 	if len(allSSRCs) > 0 {
-		conn.WriteJSON(SignalingMessage{
+		peer.Conn.WriteJSON(SignalingMessage{
 			Type:   "ssrc_mapping",
 			RoomID: msg.RoomID,
 			SSRCs:  allSSRCs,
 		})
+		s.logger.Info("Existing tracks subscribed",
+			zap.Uint("userID", peer.UserID),
+			zap.Int("tracksCount", len(allSSRCs)))
 	}
+
+	s.logger.Info("Peer joined successfully",
+		zap.Uint("room", msg.RoomID),
+		zap.Uint("user", msg.UserID),
+		zap.Int("roomPeersCount", len(room.Peers)))
 
 	return peer, nil
 }

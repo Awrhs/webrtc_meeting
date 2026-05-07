@@ -248,6 +248,122 @@ npm run dev
 
 ---
 
+## 🐛 WSL2 环境 SFU ICE 连接问题诊断
+
+### 📌 最新发现
+
+**问题现象：**
+- 浏览器 `edge://webrtc-internals/` 中的 `ICE candidate grid` 为空
+- ICE 连接状态一直卡在 `new`，无法进入 `checking` 或 `connected`
+- SFU 日志中可能看不到任何 `ICE candidate generated` 输出
+
+**根本原因猜想：**
+1. **pion WebRTC 默认过滤 loopback 地址** - WSL2 的 172.x.x.x 内网地址可能被判定为"无效"而被过滤
+2. **WSL2 虚拟网卡被接口过滤器跳过** - pion 默认会跳过某些虚拟网络接口
+3. **NAT 1:1 映射没有正确应用** - SFU 收集到的是 WSL2 内网地址，但浏览器在 Windows 主机上无法访问
+
+---
+
+### ✅ 已实现的修复
+
+代码中已添加 `WSL2_COMPAT` 环境变量开关，启用以下兼容设置：
+- `SetNAT1To1IPs([]string{"127.0.0.1"}, ICECandidateTypeHost)` - 强制公布 127.0.0.1
+- `SetIncludeLoopbackCandidate(true)` - 允许生成 loopback 候选（**最关键**）
+- `SetInterfaceFilter(func(iface string) bool { return true })` - 不过滤任何网络接口
+- 详细的 ICE 候选生成日志，方便调试
+
+---
+
+### 🔍 验证猜想是否正确的方法
+
+#### 步骤 1：启用 WSL2 兼容模式启动 SFU
+```bash
+cd backend
+WSL2_COMPAT=1 go run cmd/sfu/main.go
+```
+
+✅ **确认日志中出现这行：**
+```
+{"level":"info", ... ,"msg":"WSL2 compatibility mode enabled: forcing ICE candidate to 127.0.0.1, loopback enabled"}
+```
+
+---
+
+#### 步骤 2：观察 SFU 日志中的 ICE 候选输出
+
+当有用户连接 SFU 时，**应该看到类似这样的日志**：
+```
+{"level":"debug", ... ,"msg":"ICE candidate generated",
+    "userID":1,
+    "candidate":"candidate:1 1 udp 1234567 127.0.0.1 50000 typ host",
+    "address":"127.0.0.1",
+    "port":50000}
+```
+
+| 日志现象 | 结论 |
+|---------|------|
+| 看到 `ICE candidate generated` 且 `address=127.0.0.1` | ✅ 修复生效 |
+| 看到候选但 `address=172.x.x.x` | ❌ NAT1To1 映射没生效 |
+| 完全看不到 `ICE candidate generated` | ❌ 候选收集被阻塞 |
+
+---
+
+#### 步骤 3：检查浏览器端
+
+打开 `edge://webrtc-internals/` 或 `chrome://webrtc-internals/`：
+- ✅ **正常情况**：`ICE candidate grid` 中应该看到 127.0.0.1 的候选
+- ❌ **异常情况**：grid 为空或候选是 172.x.x.x 且状态不变化
+
+---
+
+### 🛠️ 如果修复仍不生效，需要做的事情
+
+#### 方案 A：验证候选是否真的发送到了浏览器
+
+在 `sfu-test.html` 的 JS 代码中加入 console.log：
+```javascript
+// 在处理 ice-candidate 消息的地方添加
+console.log('Received ICE candidate from SFU:', candidate);
+```
+
+检查浏览器控制台是否收到 SFU 发来的候选。
+
+---
+
+#### 方案 B：确认浏览器端是否发送了候选给 SFU
+
+同样在测试页面添加日志，确认浏览器端的候选是否通过 WebSocket 发送到了 SFU。
+
+---
+
+#### 方案 C：降级为不使用 ICE（仅本地测试用）
+
+如果只是想验证媒体转发功能，可以临时使用 SRTP 端口直接转发（不推荐用于生产）。
+
+---
+
+#### 方案 D：改用 Docker 容器内运行 SFU
+
+Docker 的网络桥接模式可能比 WSL2 更稳定，参考 `deployment/docker-compose.yml`。
+
+---
+
+### 📋 给后续开发者的检查清单
+
+当遇到 ICE 连接问题时，按以下顺序排查：
+
+1. [ ] SFU 启动时是否启用了 `WSL2_COMPAT=1`？
+2. [ ] SFU 日志中是否有 `ICE candidate generated`？
+3. [ ] 候选中的 `address` 是 `127.0.0.1` 还是 `172.x.x.x`？
+4. [ ] 浏览器端是否收到了来自 SFU 的候选？
+5. [ ] 浏览器端是否收集到了自己的候选并发送给了 SFU？
+6. [ ] `webrtc-internals` 中的候选对状态是什么？
+7. [ ] 是否有 `STUN binding request` 相关的错误？
+
+**将以上 7 点的检查结果附在 Issue 中，可以大大加速问题定位。**
+
+---
+
 ## 🔍 已知问题
 
 > 📌 **所有之前列出的 Bug 均已全部修复完成**
@@ -258,9 +374,9 @@ npm run dev
 
 | 优先级 | 功能 | 实现说明 |
 |-------|------|---------|
-| 🟡 高 | **群聊端到端加密 (Sender Keys / MLS)** | 基于 MLS 协议架构，HKDF 棘轮算法<br>• ECDH P-256 密钥协商<br>• 自动分发 Sender Key<br>• 每条消息独立密钥，前向保密<br>• 消息缓存 + 序号追赶，丢包不影响后续解密 |
-| 🟡 高 | **公钥指纹验证** | SHA-256 指纹，8位可读格式，UI 弹窗支持线下验证，防止中间人攻击 |
-| 🟡 中 | **密钥持久化** | PBKDF2 10万轮迭代加密存储到 localStorage，刷新页面自动恢复密钥状态 |
+| 🟢 中 | **群聊端到端加密 (Sender Keys)** | 基于 Signal Sender Keys 架构，支持多用户群聊加密<br>• ECDH P-256 两两密钥协商<br>• HKDF 棘轮算法派生消息密钥<br>• Sender Key 通过加密信令分发<br>• 消息序号追赶 + 缓存自动解密 |
+| 🟢 中 | **公钥指纹验证** | SHA-256 指纹，8位可读格式，UI 弹窗支持线下比对 |
+| 🟢 低 | **密钥持久化** | PBKDF2 加密存储到 localStorage，刷新页面恢复密钥状态 |
 | 🟡 中 | **屏幕共享大屏模式** | 开启屏幕共享自动切换布局，大屏显示共享内容，侧边栏显示摄像头 |
 | 🟡 中 | **全局错误边界** | React ErrorBoundary 捕获渲染错误，友好提示用户 |
 | 🟡 中 | **TURN 服务器支持** | 支持环境变量配置 STUN/TURN 服务器，用于 NAT 穿透 |
@@ -274,7 +390,10 @@ npm run dev
 
 | 优先级 | 功能 | 技术方案 | 预期收益 |
 |-------|------|---------|---------|
-| 🔵 中 | 选择性订阅 | 前端通知 SFU 只订阅特定用户的流 | 降低带宽占用，支持大型会议 |
+| 🔴 高 | **媒体流端到端加密** | WebRTC Insertable Streams / Frame Encryption | 真正的全流程 E2EE |
+| 🔴 高 | **成员变更密钥轮换** | MLS 协议 TreeKEM 组密钥管理 | 加入/退出后向保密 |
+| 🟡 中 | **消息重放防护** | 消息序号验证 + 滑动窗口 | 防止消息重放攻击 |
+| 🟡 中 | 选择性订阅 | 前端通知 SFU 只订阅特定用户的流 | 降低带宽占用，支持大型会议 |
 | 🟢 低 | Simulcast 多层编码 | 发送方编码多分辨率，SFU 按需转发 | 适应不同网络环境 |
 | 🟢 低 | NACK/FEC 拥塞控制 | SFU 实现重传和前向纠错 | 弱网下视频流畅度提升 |
 | 🟢 低 | 录制回放功能 | SFU 将媒体流写入存储，提供回放接口 | 支持会议录播 |
@@ -322,11 +441,20 @@ cd frontend && npm install && npm run dev
 | `[WebRTC]` | webrtc.ts | SFU媒体连接 |
 | `[Meeting]` | MeetingRoom.tsx | 会议页面逻辑 |
 
-> **关于 E2EE 的特别说明**：当前 `VITE_ENCRYPTION_KEY` 全局加密方案**不是端到端加密**，后端仍然可以解密所有消息。真正的 E2EE 需要：
-> 1. 每个会话生成临时密钥对
-> 2. 通过信令通道交换公钥
-> 3. 浏览器本地计算共享密钥
-> 4. 消息在发送前加密，接收后在浏览器解密
+> **关于 E2EE 的特别说明**：
+>
+> ✅ **已实现 Sender Keys E2EE（仅文本消息）：
+> - 每个会话在浏览器独立生成 ECDH P-256 密钥对
+> - 通过 WebSocket 广播公钥交换
+> - 两两密钥仅保存在浏览器，后端无法计算
+> - 消息发送前本地加密，接收后本地解密
+>
+> ⚠️ **与理想群聊 E2EE 的差距：
+> 1. **媒体流未加密：音频/视频仍由 SFU 明文转发
+> 2. **无成员变更密钥轮换：加入/退出时不重新生成组密钥
+> 3. **元数据可见**：服务器可进行流量分析，可阻止/篡改信令
+> 4. **公钥无信任根**：依赖线下比对指纹，无证书机制
+> 5. **无双棘轮缺失**：仅支持 Sender Keys 单棘轮，不支持 MLS 全双工棘轮
 
 ## 📄 许可证
 
