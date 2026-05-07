@@ -40,8 +40,11 @@ export default function VideoGrid({
         />
       )}
       {remoteMembers.map((member, index) => {
-        // SFU 场景：所有远程流暂存于 key=0，按索引分配（单用户演示用）
-        const streams = remoteStreams.get(member.user_id) || remoteStreams.get(0) || []
+        // SFU 架构：所有远程流通过 SFU 转发，流统一存储在 key=0 中
+        // 按成员索引分配流（当前 SFU 未实现 SSRC 与用户 ID 映射）
+        const allRemoteStreams = remoteStreams.get(0) || []
+        const userSpecificStreams = remoteStreams.get(member.user_id) || []
+        const streams = userSpecificStreams.length > 0 ? userSpecificStreams : allRemoteStreams
         const stream = streams.length > index ? streams[index] : (streams[0] || null)
         return (
           <VideoCard

@@ -23,6 +23,66 @@
 - **STUN/TURN**: Coturn
 - **容器化**: Docker + Docker Compose
 
+---
+
+## 📐 前端架构详解
+
+### 核心目录结构
+```
+frontend/src/
+├── pages/
+│   ├── MeetingRoom.tsx    # 会议主页面 ✅ 所有SFU功能入口
+│   ├── RoomList.tsx       # 房间列表/创建/加入
+│   ├── Login/Register.tsx # 认证页面
+│   └── Profile.tsx        # 用户资料
+├── components/
+│   ├── VideoGrid.tsx      # 视频网格，远程流分配逻辑
+│   ├── MemberList.tsx     # 成员列表 + 权限操作菜单
+│   └── Chat.tsx           # 聊天消息组件
+├── store/slices/
+│   ├── authSlice.ts       # 认证状态
+│   └── roomSlice.ts       # 房间/成员/消息状态 + async thunks
+└── utils/
+    ├── webrtc.ts          # ✅ SFUConnection 核心类（WebSocket+WebRTC）
+    ├── signaling.ts       # 信令WebSocket客户端（聊天/控制）
+    ├── api.ts             # Axios实例 + 拦截器
+    └── encryption.ts      # AES加密工具（待整合）
+```
+
+### 双 WebSocket 架构设计
+```
+浏览器
+  ├─ Signaling WebSocket (端口 8080) → API Server
+  │    └─ 处理：聊天消息、成员列表变更、权限变更通知
+  │    └─ 事件：user_joined / user_left / chat_message / muted / role_changed / media_state
+  │
+  └─ SFU WebSocket (端口 8081) → SFU Server
+       └─ 处理：SDP协商、ICE候选交换、媒体流传输
+       └─ 事件：joined / offer / answer / ice-candidate
+```
+
+### SFUConnection 类核心功能
+| 方法/回调 | 作用 |
+|----------|------|
+| `connect(localStream)` | 建立SFU WebSocket + 创建PeerConnection |
+| `disconnect()` | 安全断开，清理所有资源（定时器/流/连接） |
+| `muteAudio(isMuted)` | 本地音频轨道启用/禁用 |
+| `muteVideo(isMuted)` | 本地视频轨道启用/禁用 |
+| `replaceVideoTrack(newTrack)` | 切换摄像头 ↔ 屏幕共享 |
+| `onRemoteTrack(userId, track, stream)` | 远程流回调，触发UI刷新 |
+| `scheduleReconnect()` | 连接失败自动重试（最多5次） |
+
+### 状态管理数据流
+```
+用户操作 → Redux Thunk → API Request → Response → 更新 Store
+                                          ↓
+                                      触发组件重渲染
+                                          ↓
+                                    VideoGrid 显示流
+                                    MemberList 显示状态
+                                    Chat 显示新消息
+```
+
 ## ✨ 功能特性
 
 ### ✅ 已实现并可正常工作
@@ -36,12 +96,13 @@
 - **审计日志系统** - 敏感操作记录，支持追溯
 - **Redis热点缓存** - 用户/房间信息缓存，降低数据库压力
 - **gRPC SFU控制通道** - 踢人/静音等管理操作通过gRPC调用
-- **SFU音视频通信核心** - 完整的WebRTC实现
-  - ✅ ICE候选处理 - 支持双向ICE候选交换，真实NAT穿透
-  - ✅ SDP Offer/Answer交换 - 通过WebSocket完成WebRTC协商
-  - ✅ 媒体流转发 - Pion WebRTC SFU转发所有用户音视频流
-  - ✅ TURN服务集成 - 已集成Coturn支持复杂网络穿透
-- **SFU管理功能** - 通过gRPC强制静音，通过信令通知客户端
+- **SFU音视频通信核心** - 完整的WebRTC实现（前端 `SFUConnection` 类封装）
+  - ✅ ICE候选处理 - 双向WebSocket交换，支持NAT穿透，含断线自动重连
+  - ✅ SDP Offer/Answer协商 - 连接SFU专用WebSocket端口完成握手
+  - ✅ 媒体流转发 - Pion WebRTC SFU转发音视频流，onTrack回调正确触发
+  - ✅ 多轨支持 - 摄像头/屏幕共享通过 replaceTrack 无缝切换
+  - ✅ 自动重连 - WebSocket/ICE连接失败自动重试5次，间隔3秒
+- **SFU管理功能** - 通过gRPC强制静音，通过信令广播通知所有客户端
 
 ### ⚠️ 部分实现（高级功能待完善）
 - **远程流用户ID关联** - 能收到视频流，但需要根据track ID映射到具体用户
@@ -204,35 +265,64 @@ npm run dev
 
 ## 🔍 已知问题与待开发清单
 
-### 核心功能（高优先级）
+### ✅ 已修复的核心功能
 | 功能 | 状态 | 说明 |
 |------|------|------|
-| ICE候选处理 | ❌ 未实现 | 前端onicecandidate是空函数，SFU也没有处理接口 |
-| 远程流用户关联 | ❌ 未实现 | 所有远程流混在一起，无法区分是谁的视频 |
-| 聊天消息WebSocket推送 | ❌ 未完成 | 消息通过HTTP发送，但WebSocket推送未实现 |
-| E2EE私聊加密 | ❌ 未完成 | 发送/接收时没有实际调用加密函数 |
+| SFU WebSocket连接 | ✅ 已修复 | 前端 MeetingRoom 正确初始化 SFUConnection 类 |
+| ICE候选处理 | ✅ 已修复 | SFUConnection 完整实现 onicecandidate 双向交换 |
+| 远程流回调处理 | ✅ 已修复 | onTrack 回调正确存储 remoteStreams 并刷新 UI |
+| 媒体状态信令广播 | ✅ 已修复 | 静音/开关摄像头通过 WebSocket 广播通知房间成员 |
+| SignalingClient资源清理 | ✅ 已修复 | disconnect() 正确清空 handlers、定时器、重置状态 |
+| RoomList删除房间API | ✅ 已修复 | 改用 Redux thunk 而非原生 fetch，统一错误处理 |
+| 断线后WebRTC自动重连 | ✅ 已实现 | SFUConnection 内置 scheduleReconnect，最多重试5次 |
+| 聊天消息WebSocket推送 | ✅ 已实现 | Chat组件已完整实现收发逻辑 |
 
-### 次要功能
+### 🔄 待完善功能
 | 功能 | 状态 | 说明 |
 |------|------|------|
+| 远程流用户ID关联 | ⚠️ 依赖后端 | SFU需在SDP/信令中携带SSRC→User映射，当前只能按索引分配 |
+| E2EE端到端加密 | ⚠️ 待完善 | encryption工具存在但未整合到消息发送/接收流程 |
 | SFU强制静音 | ⚠️ 空实现 | gRPC接口只是打log，没有操作媒体轨道 |
-| 断线后WebRTC重连 | ⚠️ 缺失 | WebSocket重连后没有重建PeerConnection |
-| TURN服务集成 | ⚠️ 未配置 | docker-compose有Coturn但WebRTC没使用 |
-| 屏幕共享多轨道 | ⚠️ 未测试 | SFU转发逻辑需要验证 |
+| TURN服务集成 | ⚠️ 未配置 | docker-compose有Coturn但WebRTC config未加入 |
+| 屏幕共享多轨道 | ⚠️ 未测试 | SFU转发逻辑需要在真实网络验证 |
 
 ## 💡 开发建议
 
-### 建议开发顺序
-1. **先跑通核心** - 用 `sfu-test.html` 验证SFU媒体转发基本功能
-2. **实现ICE候选** - 这是WebRTC在真实网络工作的关键
-3. **修复远程流关联** - 能区分每个用户的视频流
-4. **完善聊天推送** - 公聊能实时收到消息
-5. **再考虑E2EE** - 核心功能通了再加加密
+### 前端开发建议
+1. **先跑通核心** - 用 `npm run dev` 启动前端，先验证登录 + 房间创建功能
+2. **SFU连接调试** - 在 MeetingRoom 页面查看控制台的 `[WebRTC]` 前缀日志
+3. **Chrome调试技巧** - 访问 `chrome://webrtc-internals/` 查看ICE连接状态和流统计
+4. **信令调试** - Network面板筛选WS协议，查看两个WebSocket消息格式
+5. **Redux DevTools** - 安装Redux DevTools插件，追踪状态变更
 
-### 调试技巧
-- 打开浏览器控制台查看WebRTC日志（chrome://webrtc-internals/）
-- SFU服务日志会打印PeerConnection状态变化
-- 建议先在简单网络环境测试（同一台机器），再测试跨机器
+### 建议开发顺序
+1. **基础连通性** - 两个浏览器窗口能互相看到对方视频（局域网内测试）
+2. **音频互通** - 验证能听到对方声音
+3. **屏幕共享** - 验证 replaceTrack 切换画面正常
+4. **成员列表同步** - 静音/角色变更能实时广播
+5. **E2EE加密** - 最后再考虑端到端加密（需SFU支持加密流转发）
+
+### 后端服务启动顺序
+```bash
+# 1. 启动基础设施（PostgreSQL + Redis）
+docker-compose -f deployment/docker-compose.yml up -d postgres redis
+
+# 2. 启动API Server (端口8080)
+cd backend && go run cmd/server/main.go
+
+# 3. 启动SFU Server (端口8081 + gRPC 8082)
+cd backend && go run cmd/sfu/main.go
+
+# 4. 启动前端 (端口5173)
+cd frontend && npm install && npm run dev
+```
+
+### 调试输出前缀
+| 前缀 | 来源 | 说明 |
+|------|------|------|
+| `[Signaling]` | signaling.ts | 控制信令WebSocket |
+| `[WebRTC]` | webrtc.ts | SFU媒体连接 |
+| `[Meeting]` | MeetingRoom.tsx | 会议页面逻辑 |
 
 ## 📄 许可证
 

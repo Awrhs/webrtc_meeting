@@ -148,18 +148,11 @@ export default function RoomList() {
       okButtonProps: { danger: true },
       onOk: async () => {
         try {
-          const token = localStorage.getItem('token')
-          await fetch(`/api/v1/rooms/${manageRoom.id}`, {
-            method: 'DELETE',
-            headers: {
-              Authorization: `Bearer ${token}`,
-            },
-          })
+          await dispatch(deleteRoom(manageRoom.id)).unwrap()
           message.success('房间已解散')
           setManageRoomModalVisible(false)
-          dispatch(getMyRooms())
         } catch (error: any) {
-          message.error('操作失败')
+          message.error(error?.message || error || '操作失败')
         }
       },
     })

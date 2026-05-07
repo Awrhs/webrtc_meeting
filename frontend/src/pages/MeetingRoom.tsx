@@ -133,6 +133,20 @@ export default function MeetingRoom() {
         }))
       })
 
+      // 监听其他人的媒体状态变更
+      signaling.on('media_state', (msg) => {
+        if (msg.user_id !== currentUserId) {
+          const member = members.find(m => m.user_id === msg.user_id)
+          if (member) {
+            dispatch(updateMember({
+              ...member,
+              is_audio_on: msg.data.is_audio_on,
+              is_video_on: msg.data.is_video_on,
+            }))
+          }
+        }
+      })
+
       signaling.send({
         type: 'join_room',
         room_id: parseInt(id!),
