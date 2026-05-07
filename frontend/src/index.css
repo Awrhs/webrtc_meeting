@@ -40,12 +40,86 @@ html, body, #root {
   font-size: 12px;
 }
 
+.video-placeholder {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+}
+
+.user-avatar {
+  width: 80px;
+  height: 80px;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.2);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 32px;
+  font-weight: bold;
+  margin-bottom: 16px;
+}
+
+.user-name {
+  font-size: 18px;
+  font-weight: 500;
+  margin-bottom: 8px;
+}
+
+.waiting-indicator {
+  font-size: 12px;
+  opacity: 0.7;
+}
+
+.error-indicator {
+  font-size: 12px;
+  color: #ff6b6b;
+}
+
+.video-placeholder-container {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+}
+
 .video-grid {
   display: grid;
   grid-gap: 8px;
   padding: 8px;
   width: 100%;
   height: 100%;
+}
+
+/* 屏幕共享布局：大屏 + 侧边栏 */
+.video-grid-with-screen {
+  display: flex;
+  width: 100%;
+  height: 100%;
+  padding: 8px;
+  gap: 8px;
+}
+
+.screen-share-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.screen-share-sidebar {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 240px;
+}
+
+.screen-share-sidebar .video-container {
+  height: 180px;
+}
+
+.screen-share-container video {
+  object-fit: contain;
+  background: #000;
 }
 
 .chat-messages {

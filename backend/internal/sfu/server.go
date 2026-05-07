@@ -21,13 +21,21 @@ type Room struct {
 	mu       sync.Mutex
 }
 
+type TrackInfo struct {
+	Track        *webrtc.TrackLocalStaticRTP
+	SSRC         uint32
+	Kind         string // "audio" or "video"
+	StreamID     string // e.g., "camera" or "screen"
+	IsEnabled    bool
+}
+
 type Peer struct {
 	UserID       uint
 	RoomID       uint
 	PC           *webrtc.PeerConnection
 	Conn         *websocket.Conn
-	Tracks       map[string]*webrtc.TrackLocalStaticRTP
-	Subscriptions map[uint]*webrtc.RTPSender
+	Tracks       map[string]*TrackInfo // key: track kind + "-" + stream_id (e.g., "video-camera", "video-screen", "audio-main")
+	Subscriptions map[uint][]*webrtc.RTPSender // key: fromUserID, value: list of senders (one per track)
 	mu           sync.Mutex
 }
 
@@ -39,15 +47,23 @@ type SFUServer struct {
 	mu            sync.Mutex
 }
 
+type SSRC struct {
+	SSRC     uint32 `json:"ssrc"`
+	UserID   uint   `json:"user_id"`
+	Kind     string `json:"kind"`     // "audio" or "video"
+	StreamID string `json:"stream_id"` // "camera" or "screen"
+}
+
 type SignalingMessage struct {
-	Type    string          `json:"type"` // join, leave, offer, answer, ice-candidate, muted
-	RoomID  uint            `json:"room_id,omitempty"`
-	UserID  uint            `json:"user_id,omitempty"`
-	SDP     string          `json:"sdp,omitempty"`
-	Candidate string         `json:"candidate,omitempty"`
-	SDPMLineIndex *int       `json:"sdp_m_line_index,omitempty"`
-	SDPMid     *string      `json:"sdp_mid,omitempty"`
-	Data    interface{}     `json:"data,omitempty"`
+	Type          string          `json:"type"` // join, leave, offer, answer, ice-candidate, muted, ssrc_mapping
+	RoomID        uint            `json:"room_id,omitempty"`
+	UserID        uint            `json:"user_id,omitempty"`
+	SDP           string          `json:"sdp,omitempty"`
+	Candidate     string          `json:"candidate,omitempty"`
+	SDPMLineIndex *int            `json:"sdp_m_line_index,omitempty"`
+	SDPMid        *string         `json:"sdp_mid,omitempty"`
+	Data          interface{}     `json:"data,omitempty"`
+	SSRCs         []SSRC          `json:"ssrcs,omitempty"` // for ssrc_mapping message
 }
 
 func NewSFUServer(logger *zap.Logger) *SFUServer {
@@ -73,40 +89,101 @@ func NewSFUServer(logger *zap.Logger) *SFUServer {
 	}
 }
 
-func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
-	localTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), track.StreamID())
+func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
+	trackKind := string(track.Kind())
+	streamID := track.StreamID()
+	trackKey := trackKind + "-" + streamID
+
+	s.logger.Info("New track received",
+		zap.Uint("userID", peer.UserID),
+		zap.String("kind", trackKind),
+		zap.String("streamID", streamID),
+		zap.Uint32("ssrc", uint32(track.SSRC())))
+
+	// 创建本地轨道
+	localTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), streamID)
 	if err != nil {
 		s.logger.Error("Failed to create local track", zap.Error(err))
 		return
 	}
 
-	peer.Tracks[track.ID()] = localTrack
+	// 存储轨道信息（包括SSRC用于映射）
+	peer.mu.Lock()
+	peer.Tracks[trackKey] = &TrackInfo{
+		Track:     localTrack,
+		SSRC:      uint32(track.SSRC()),
+		Kind:      trackKind,
+		StreamID:  streamID,
+		IsEnabled: true,
+	}
+	peer.mu.Unlock()
 
+	// 启动转发goroutine
 	go func() {
 		buf := make([]byte, 1500)
 		for {
 			n, _, err := track.Read(buf)
 			if err != nil {
+				s.logger.Debug("Track read ended, stopping forwarding",
+					zap.Uint("userID", peer.UserID),
+					zap.String("trackKey", trackKey))
 				return
 			}
-			_, err = localTrack.Write(buf[:n])
-			if err != nil {
-				return
+
+			peer.mu.Lock()
+			trackInfo := peer.Tracks[trackKey]
+			isEnabled := trackInfo != nil && trackInfo.IsEnabled
+			peer.mu.Unlock()
+
+			// 只有启用的轨道才转发
+			if isEnabled {
+				_, err = localTrack.Write(buf[:n])
+				if err != nil {
+					return
+				}
 			}
 		}
 	}()
 
+	// 为房间内所有其他用户订阅这个新轨道
 	room.mu.Lock()
 	defer room.mu.Unlock()
 
+	// 构建SSRC映射消息
+	ssrcMapping := SignalingMessage{
+		Type:   "ssrc_mapping",
+		RoomID: room.ID,
+		SSRCs: []SSRC{
+			{
+				SSRC:     uint32(track.SSRC()),
+				UserID:   peer.UserID,
+				Kind:     trackKind,
+				StreamID: streamID,
+			},
+		},
+	}
+
 	for _, otherPeer := range room.Peers {
+		// 给所有用户（包括发布者自己）发送SSRC映射
+		if otherPeer.Conn != nil {
+			otherPeer.Conn.WriteJSON(ssrcMapping)
+		}
+
+		// 给其他用户添加轨道订阅
 		if otherPeer.UserID != peer.UserID {
 			sender, err := otherPeer.PC.AddTrack(localTrack)
 			if err != nil {
-				s.logger.Error("Failed to add track to peer", zap.Error(err))
+				s.logger.Error("Failed to add track to peer",
+					zap.Uint("fromUser", peer.UserID),
+					zap.Uint("toUser", otherPeer.UserID),
+					zap.Error(err))
 				continue
 			}
-			otherPeer.Subscriptions[peer.UserID] = sender
+			otherPeer.Subscriptions[peer.UserID] = append(otherPeer.Subscriptions[peer.UserID], sender)
+			s.logger.Debug("Track subscribed",
+				zap.Uint("from", peer.UserID),
+				zap.Uint("to", otherPeer.UserID),
+				zap.String("trackKey", trackKey))
 		}
 	}
 }
@@ -256,8 +333,8 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 		RoomID:       msg.RoomID,
 		PC:           pc,
 		Conn:         conn,
-		Tracks:       make(map[string]*webrtc.TrackLocalStaticRTP),
-		Subscriptions: make(map[uint]*webrtc.RTPSender),
+		Tracks:       make(map[string]*TrackInfo),
+		Subscriptions: make(map[uint][]*webrtc.RTPSender),
 	}
 
 	// 监听轨道
@@ -289,29 +366,53 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 		s.onConnectionStateChange(room, peer, state)
 	})
 
-	// 订阅房间内已存在的其他用户的流
+	room.Peers[msg.UserID] = peer
+
+	// 收集所有现有轨道的SSRC映射，稍后发送给新用户
+	var allSSRCs []SSRC
+
+	// 订阅房间内已存在的其他用户的所有流
 	for _, existingPeer := range room.Peers {
-		for _, track := range existingPeer.Tracks {
-			sender, err := peer.PC.AddTrack(track)
-			if err == nil {
-				peer.Subscriptions[existingPeer.UserID] = sender
+		if existingPeer.UserID != peer.UserID {
+			for trackKey, trackInfo := range existingPeer.Tracks {
+				sender, err := peer.PC.AddTrack(trackInfo.Track)
+				if err == nil {
+					peer.Subscriptions[existingPeer.UserID] = append(peer.Subscriptions[existingPeer.UserID], sender)
+					allSSRCs = append(allSSRCs, SSRC{
+						SSRC:     trackInfo.SSRC,
+						UserID:   existingPeer.UserID,
+						Kind:     trackInfo.Kind,
+						StreamID: trackInfo.StreamID,
+					})
+					s.logger.Debug("Subscribed to existing track",
+						zap.Uint("newUser", peer.UserID),
+						zap.Uint("existingUser", existingPeer.UserID),
+						zap.String("trackKey", trackKey))
+				}
 			}
 		}
 	}
 
-	room.Peers[msg.UserID] = peer
-
-	// 通知其他房间内的新用户加入（让他们也订阅新用户的流）
-	// 注意：需要等待新用户发布流后再通知
-
-	s.logger.Info("Peer joined successfully", zap.Uint("room", msg.RoomID), zap.Uint("user", msg.UserID))
-
-	// 发送joined确认
+	// 发送joined确认（需要在发送SSRC映射之前，因为前端需要先完成握手）
 	conn.WriteJSON(SignalingMessage{
 		Type:   "joined",
 		RoomID: msg.RoomID,
 		UserID: msg.UserID,
 	})
+
+	s.logger.Info("Peer joined successfully",
+		zap.Uint("room", msg.RoomID),
+		zap.Uint("user", msg.UserID),
+		zap.Int("existingTracksCount", len(allSSRCs)))
+
+	// 如果有现有流，发送批量SSRC映射给新用户
+	if len(allSSRCs) > 0 {
+		conn.WriteJSON(SignalingMessage{
+			Type:   "ssrc_mapping",
+			RoomID: msg.RoomID,
+			SSRCs:  allSSRCs,
+		})
+	}
 
 	return peer, nil
 }
@@ -467,7 +568,7 @@ func (s *SFUServer) KickUser(roomID, userID uint, reason string) error {
 	return nil
 }
 
-// MuteUser mutes or unmutes a user's audio by removing/adding audio tracks
+// MuteUser mutes or unmutes a user's audio by enabling/disabling track forwarding
 func (s *SFUServer) MuteUser(roomID, userID uint, isMuted bool) error {
 	s.mu.Lock()
 	room, ok := s.rooms[roomID]
@@ -485,20 +586,47 @@ func (s *SFUServer) MuteUser(roomID, userID uint, isMuted bool) error {
 		return errors.New("peer not found in room")
 	}
 
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+
+	// 实际控制所有音频轨道的转发
+	audioTracksCount := 0
+	for trackKey, trackInfo := range peer.Tracks {
+		if trackInfo.Kind == "audio" {
+			trackInfo.IsEnabled = !isMuted
+			audioTracksCount++
+			s.logger.Debug("Audio track state changed",
+				zap.String("trackKey", trackKey),
+				zap.Bool("enabled", trackInfo.IsEnabled))
+		}
+	}
+
 	// 发送静音通知给用户（通过信令WebSocket通知客户端）
 	if peer.Conn != nil {
 		muteMsg := SignalingMessage{
-			Type: "muted",
-			Data: map[string]bool{"is_muted": isMuted},
+			Type:   "muted",
+			UserID: userID,
+			Data:   map[string]bool{"is_muted": isMuted},
 		}
 		peer.Conn.WriteJSON(muteMsg)
 	}
 
-	s.logger.Info("User mute state changed - signaling sent to client",
+	// 广播静音状态给房间内所有用户
+	for _, otherPeer := range room.Peers {
+		if otherPeer.Conn != nil && otherPeer.UserID != userID {
+			otherPeer.Conn.WriteJSON(SignalingMessage{
+				Type:   "muted",
+				UserID: userID,
+				Data:   map[string]bool{"is_muted": isMuted},
+			})
+		}
+	}
+
+	s.logger.Info("User mute state changed - tracks enabled/disabled",
 		zap.Uint("roomID", roomID),
 		zap.Uint("userID", userID),
 		zap.Bool("isMuted", isMuted),
-		zap.Int("trackCount", len(peer.Tracks)))
+		zap.Int("audioTracksCount", audioTracksCount))
 
 	return nil
 }

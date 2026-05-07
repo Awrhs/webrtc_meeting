@@ -1,4 +1,5 @@
 import { SignalingMessage } from '@/types'
+import { groupE2EEManager } from './encryption'
 
 export class SignalingClient {
   private ws: WebSocket | null = null
@@ -8,6 +9,9 @@ export class SignalingClient {
   private reconnectDelay = 3000
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private isManualDisconnect = false
+  private roomMembers: Set<number> = new Set()
+  private currentUserId: number = 0
+  private currentRoomId: number = 0
 
   // 动态构建 WebSocket URL
   private getWsUrl(): string {
@@ -90,6 +94,7 @@ export class SignalingClient {
       this.ws = null
     }
 
+    this.roomMembers.clear()
     this.reconnectAttempts = 0
   }
 
@@ -99,6 +104,55 @@ export class SignalingClient {
     } else {
       console.warn('[Signaling] WebSocket not connected, message not sent')
     }
+  }
+
+  // 加入房间并启动 E2EE 密钥协商
+  async joinRoom(roomId: number, userId: number) {
+    this.currentRoomId = roomId
+    this.currentUserId = userId
+
+    // 初始化 E2EE 管理器
+    await groupE2EEManager.init()
+
+    this.send({
+      type: 'join_room',
+      room_id: roomId,
+      user_id: userId,
+      data: null,
+    })
+
+    // 广播我的身份公钥，用于 ECDH 密钥协商
+    this.broadcastPublicKey()
+  }
+
+  // 广播公钥给房间所有人
+  broadcastPublicKey() {
+    const publicKey = groupE2EEManager.getIdentityPublicKey()
+    this.send({
+      type: 'public_key',
+      room_id: this.currentRoomId,
+      user_id: this.currentUserId,
+      data: { public_key: publicKey },
+    })
+    console.log('[Signaling] Broadcasted public key for E2EE')
+  }
+
+  // 添加房间成员并建立 E2EE 共享密钥
+  async addRoomMember(userId: number, publicKey?: string) {
+    if (userId === this.currentUserId) return
+
+    this.roomMembers.add(userId)
+
+    // 如果有公钥，立即建立 ECDH 共享密钥
+    if (publicKey) {
+      await groupE2EEManager.addMember(userId, publicKey)
+      console.log(`[Signaling] E2EE shared key established with user ${userId}`)
+    }
+  }
+
+  // 检查是否与某用户有共享密钥
+  hasE2EEKey(userId: number): boolean {
+    return groupE2EEManager.isReady()
   }
 
   on(type: string, handler: (data: any) => void) {
@@ -118,9 +172,19 @@ export class SignalingClient {
     }
   }
 
-  private handleMessage(event: MessageEvent) {
+  private async handleMessage(event: MessageEvent) {
     try {
       const message = JSON.parse(event.data) as SignalingMessage
+
+      // 自动处理公钥消息，建立 E2EE 共享密钥
+      if (message.type === 'public_key' && message.user_id !== this.currentUserId) {
+        const publicKey = message.data?.public_key
+        if (publicKey) {
+          await groupE2EEManager.addMember(message.user_id, publicKey)
+        }
+      }
+
+      // 调用用户注册的处理器
       const handlers = this.handlers.get(message.type)
       if (handlers) {
         handlers.forEach(handler => handler(message))

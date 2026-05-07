@@ -147,12 +147,7 @@ export default function MeetingRoom() {
         }
       })
 
-      signaling.send({
-        type: 'join_room',
-        room_id: parseInt(id!),
-        user_id: currentUserId,
-        data: null,
-      })
+      signaling.joinRoom(parseInt(id!), currentUserId)
     })
 
     try {
@@ -303,12 +298,15 @@ export default function MeetingRoom() {
           stopScreenShare()
         }
 
-        // 使用 SFUConnection.replaceVideoTrack 切换到屏幕共享
+        // 使用 SFUConnection.addVideoTrack 添加屏幕共享轨道
+        // 不替换摄像头轨道，实现同时显示
         if (sfuConnectionRef.current) {
-          await sfuConnectionRef.current.replaceVideoTrack(videoTrack)
+          await sfuConnectionRef.current.addVideoTrack(videoTrack, screenStream)
         }
         setScreenShare(true)
+        message.success('屏幕共享已开启')
       } catch (error) {
+        console.error('Screen share error:', error)
         message.error('无法开启屏幕共享')
       }
     } else {
@@ -321,15 +319,15 @@ export default function MeetingRoom() {
       screenStreamRef.current.getTracks().forEach(track => track.stop())
       screenStreamRef.current = null
     }
-    // 恢复本地摄像头视频流
-    if (localStreamRef.current && sfuConnectionRef.current && videoOn) {
-      const videoTrack = localStreamRef.current.getVideoTracks()[0]
-      if (videoTrack) {
-        sfuConnectionRef.current.replaceVideoTrack(videoTrack)
-      }
+
+    // 移除屏幕共享轨道
+    if (sfuConnectionRef.current) {
+      sfuConnectionRef.current.removeScreenTrack()
     }
+
     setScreenStream(null)
     setScreenShare(false)
+    message.info('屏幕共享已关闭')
   }
 
   const handleLeave = () => {
@@ -374,9 +372,6 @@ export default function MeetingRoom() {
   }
 
   const getMyRemoteStream = () => {
-    if (screenShare && screenStream) {
-      return screenStream
-    }
     if (videoOn && localStream) {
       return localStream
     }
@@ -460,6 +455,7 @@ export default function MeetingRoom() {
             members={members}
             currentUserId={currentUserId}
             localStream={getMyRemoteStream()}
+            screenStream={screenShare ? screenStream : null}
             remoteStreams={remoteStreamsRef.current}
           />
         </Content>
@@ -476,7 +472,7 @@ export default function MeetingRoom() {
             defaultActiveKey="members"
             items={[
               { key: 'members', label: '成员列表', children: <MemberList roomId={parseInt(id!)} members={members} currentUserId={currentUserId} permissions={myPermissions} /> },
-              { key: 'chat', label: '聊天', children: <Chat roomId={parseInt(id!)} messages={messages} /> },
+              { key: 'chat', label: '聊天', children: <Chat roomId={parseInt(id!)} messages={messages} signaling={signalingRef.current} /> },
             ]}
           />
           <div style={{ padding: 16, borderTop: '1px solid #f0f0f0' }}>

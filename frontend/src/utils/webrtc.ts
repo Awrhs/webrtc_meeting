@@ -1,8 +1,15 @@
 const SFU_HOST = import.meta.env.VITE_SFU_HOST || 'http://localhost:8081'
 console.log('[WebRTC] SFU host:', SFU_HOST)
 
+interface SSRCInfo {
+  ssrc: number
+  user_id: number
+  kind: string
+  stream_id: string
+}
+
 interface SFUMessage {
-  type: 'join' | 'offer' | 'answer' | 'ice-candidate' | 'joined' | 'error'
+  type: 'join' | 'offer' | 'answer' | 'ice-candidate' | 'joined' | 'error' | 'ssrc_mapping' | 'muted'
   room_id?: number
   user_id?: number
   sdp?: string
@@ -10,6 +17,8 @@ interface SFUMessage {
   sdp_m_line_index?: number
   sdp_mid?: string
   error?: string
+  ssrcs?: SSRCInfo[]
+  data?: any
 }
 
 export class SFUConnection {
@@ -18,7 +27,12 @@ export class SFUConnection {
   private roomId: number
   private userId: number
   private localStream: MediaStream | null = null
+  private screenStream: MediaStream | null = null
   private remoteStreams: Map<number, MediaStream> = new Map()
+  // SSRC 到 UserID 的映射表（由 SFU 信令填充）
+  private ssrcToUserId: Map<number, number> = new Map()
+  // UserID 到 用户名的映射（用于显示）
+  private userIdToName: Map<number, string> = new Map()
   private onRemoteTrack: (userId: number, track: MediaStreamTrack, stream: MediaStream) => void
   private onConnected: () => void
   private onDisconnected: () => void
@@ -56,8 +70,25 @@ export class SFUConnection {
     this.isManualDisconnect = false
     this.localStream = localStream
 
+    const stunServer = import.meta.env.VITE_STUN_SERVER || 'stun:stun.l.google.com:19302'
+    const turnServer = import.meta.env.VITE_TURN_SERVER
+    const turnUsername = import.meta.env.VITE_TURN_USERNAME
+    const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL
+
+    const iceServers: RTCIceServer[] = [{ urls: stunServer }]
+
+    // 如果配置了 TURN 服务器，则添加
+    if (turnServer && turnUsername && turnCredential) {
+      iceServers.push({
+        urls: turnServer,
+        username: turnUsername,
+        credential: turnCredential,
+      })
+      console.log('[WebRTC] TURN server configured:', turnServer)
+    }
+
     const configuration: RTCConfiguration = {
-      iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
+      iceServers,
     }
 
     this.pc = new RTCPeerConnection(configuration)
@@ -73,14 +104,28 @@ export class SFUConnection {
     }
 
     this.pc.ontrack = (event) => {
-      console.log('[WebRTC] Received remote track:', event.track.kind)
-      event.streams.forEach((stream) => {
-        stream.getTracks().forEach((track) => {
-          // SFU 场景：所有流统一归到 userId=0（所有远端流混合）
-          // 实际生产环境需要信令携带 userId，这里简化处理
-          this.onRemoteTrack(0, track, stream)
-        })
-      })
+      const track = event.track
+      const stream = event.streams[0]
+      if (!stream) return
+
+      // 从RTCRtpReceiver获取SSRC（使用类型转换，因为浏览器API支持但TS类型不完整）
+      const receiver = event.receiver
+      const syncSource = receiver?.getSynchronizationSources?.()[0]
+      const ssrc = syncSource ? (syncSource as any).ssrc ?? syncSource.source ?? 0 : 0
+
+      console.log('[WebRTC] Received remote track:', track.kind, 'SSRC:', ssrc, 'StreamID:', stream.id)
+
+      // 尝试从 SSRC 映射获取 UserID
+      const mappedUserId = this.ssrcToUserId.get(ssrc)
+
+      if (mappedUserId !== undefined) {
+        // 有 SSRC 映射，正确关联到用户
+        this.onRemoteTrack(mappedUserId, track, stream)
+      } else {
+        // 暂未收到 SSRC 映射，暂存到 userId=0
+        // VideoGrid 会按成员顺序分配显示
+        this.onRemoteTrack(0, track, stream)
+      }
     }
 
     this.pc.oniceconnectionstatechange = () => {
@@ -120,8 +165,8 @@ export class SFUConnection {
         this.send({
           type: 'ice-candidate',
           candidate: candidate.candidate,
-          sdp_m_line_index: candidate.sdpMLineIndex,
-          sdp_mid: candidate.sdpMid,
+          sdp_m_line_index: candidate.sdpMLineIndex ?? undefined,
+          sdp_mid: candidate.sdpMid ?? undefined,
         })
       }
     }
@@ -205,6 +250,20 @@ export class SFUConnection {
       case 'error':
         console.error('[WebRTC] SFU error:', message.error)
         this.onError(message.error || 'SFU error')
+        break
+      case 'ssrc_mapping':
+        // 处理SSRC到UserID的映射
+        if (message.ssrcs && message.ssrcs.length > 0) {
+          console.log('[WebRTC] Received SSRC mapping:', message.ssrcs)
+          this.setSsrcMappings(message.ssrcs.map(s => ({
+            ssrc: s.ssrc,
+            userId: s.user_id,
+          })))
+        }
+        break
+      case 'muted':
+        // 处理静音通知（由管理员强制静音）
+        console.log('[WebRTC] User mute state changed:', message.user_id, message.data)
         break
     }
   }
@@ -293,6 +352,44 @@ export class SFUConnection {
     if (sender) {
       await sender.replaceTrack(newTrack)
     }
+  }
+
+  // 添加新的视频轨道（用于屏幕共享，不替换摄像头）
+  async addVideoTrack(newTrack: MediaStreamTrack, stream: MediaStream) {
+    if (!this.pc) return
+    this.pc.addTrack(newTrack, stream)
+    this.screenStream = stream
+  }
+
+  // 移除屏幕共享轨道
+  async removeScreenTrack() {
+    if (!this.pc || !this.screenStream) return
+    const senders = this.pc.getSenders()
+    for (const sender of senders) {
+      if (sender.track && this.screenStream.getTracks().includes(sender.track)) {
+        this.pc.removeTrack(sender)
+      }
+    }
+    this.screenStream = null
+  }
+
+  // 设置 SSRC 到 UserID 的映射（由 SFU 信令调用）
+  setSsrcMapping(ssrc: number, userId: number) {
+    this.ssrcToUserId.set(ssrc, userId)
+    console.log(`[WebRTC] SSRC mapping set: ${ssrc} -> user ${userId}`)
+  }
+
+  // 批量设置 SSRC 映射
+  setSsrcMappings(mappings: { ssrc: number; userId: number }[]) {
+    mappings.forEach(({ ssrc, userId }) => {
+      this.ssrcToUserId.set(ssrc, userId)
+    })
+    console.log(`[WebRTC] Bulk SSRC mappings set: ${mappings.length} entries`)
+  }
+
+  // 设置用户名映射
+  setUserName(userId: number, name: string) {
+    this.userIdToName.set(userId, name)
   }
 
   getConnectionState(): string {
