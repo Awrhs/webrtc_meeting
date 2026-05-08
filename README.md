@@ -22,6 +22,7 @@
 ### 基础设施
 - **STUN/TURN**: Coturn
 - **容器化**: Docker + Docker Compose
+- **反向代理**: Nginx（可选，用于生产环境统一入口）
 
 ---
 
@@ -168,7 +169,12 @@ conference-sfu/
 │   └── public/
 │       └── sfu-test.html # SFU功能极简测试页面 ⭐
 ├── deployment/
-│   └── docker-compose.yml
+│   ├── docker-compose.yml  # Docker 服务编排
+│   ├── nginx.conf          # Nginx 反向代理配置（生产环境用）
+│   └── docker/             # Dockerfile 目录
+│       ├── Dockerfile.frontend
+│       ├── Dockerfile.server
+│       └── Dockerfile.sfu
 └── README.md
 ```
 
@@ -196,46 +202,76 @@ docker-compose -f deployment/docker-compose.yml up -d --build
 
 ### 本地开发
 
-#### 1. 启动基础设施
+#### 方式一：Docker 方式（推荐，最简单）
+```bash
+cd deployment
+docker-compose up -d postgres redis coturn
+docker-compose up --build api-server sfu-server frontend
+```
+
+访问 http://localhost:3000
+
+---
+
+#### 方式二：WSL2 原生运行（适合开发调试）
+
+##### 1. 启动基础设施
 ```bash
 cd deployment
 docker-compose up -d postgres redis coturn
 ```
 
-#### 2. 编译 gRPC 代码（首次运行）
+##### 2. 获取 WSL2 的真实 IP
+在 Windows PowerShell 中：
+```powershell
+wsl.exe hostname -I
+```
+记下这个 IP（例如 `172.25.24.77`）
+
+##### 3. 配置前端环境变量
+编辑 `frontend/.env`：
+```env
+VITE_API_HOST=http://172.25.24.77:8080
+VITE_SFU_HOST=http://172.25.24.77:8081
+```
+
+##### 4. 编译 gRPC 代码（首次运行）
 ```bash
 cd backend
 make install-tools  # 安装protoc等工具
 make proto          # 生成gRPC代码
 ```
 
-#### 3. 启动API服务（终端1）
+##### 5. 启动API服务（终端1）
 ```bash
 cd backend
 go run cmd/server/main.go
 ```
 
-#### 4. 启动SFU服务（终端2）
+##### 6. 启动SFU服务（终端2，**必须加 WSL2_COMPAT**）
 ```bash
 cd backend
-go run cmd/sfu/main.go
+WSL2_COMPAT=1 go run cmd/sfu/main.go
 ```
 
-#### 5. 启动前端（终端3）
+##### 7. 启动前端（终端3）
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-访问 http://localhost:5173
+**访问：http://localhost:3000**（如果前端在 Windows 运行）
+或 **http://172.25.24.77:3000**（如果前端在 WSL2 运行）
+
+---
 
 ### 🔬 SFU功能测试（重要！）
 
 **推荐先使用极简测试页面验证SFU核心功能：**
 
 ```
-访问: http://localhost:5173/sfu-test.html
+访问: http://localhost:3000/sfu-test.html
 ```
 
 测试步骤：
@@ -250,113 +286,150 @@ npm run dev
 
 ## 🐛 WSL2 环境 SFU ICE 连接问题诊断
 
-### 📌 最新发现
+### 📌 问题背景与核心原理
 
-**问题现象：**
-- 浏览器 `edge://webrtc-internals/` 中的 `ICE candidate grid` 为空
-- ICE 连接状态一直卡在 `new`，无法进入 `checking` 或 `connected`
-- SFU 日志中可能看不到任何 `ICE candidate generated` 输出
+**WSL2 网络架构：**
+```
+Windows 主机 (浏览器)
+    │
+    │ 虚拟网络交换机 (WSL Virtual Switch)
+    ├─ Windows IP: 172.25.16.1
+    │
+    │ 路由可达 (不是端口映射NAT！)
+    │
+    └─ WSL2 虚拟机
+         └─ eth0 IP: 172.25.24.77 (例子)
+```
 
-**根本原因猜想：**
-1. **pion WebRTC 默认过滤 loopback 地址** - WSL2 的 172.x.x.x 内网地址可能被判定为"无效"而被过滤
-2. **WSL2 虚拟网卡被接口过滤器跳过** - pion 默认会跳过某些虚拟网络接口
-3. **NAT 1:1 映射没有正确应用** - SFU 收集到的是 WSL2 内网地址，但浏览器在 Windows 主机上无法访问
+**关键事实（通过实验验证）：**
+- ✅ Windows 能直接访问 WSL2 的真实 IP（172.x.x.x），包括 TCP **和 UDP**
+- ❌ `127.0.0.1` 在 Windows 和 WSL2 里是不同的网络命名空间，互不相通
+- ⚠️ 微软的 localhost 转发**只针对 TCP**，**不包括 UDP**（WebRTC用UDP）
+
+**之前的错误理解（已修正）：**
+- ❌ 旧代码让 SFU 公布 127.0.0.1 → 浏览器连自己去了，根本到不了 WSL2
+- ✅ 正确做法：让 SFU 公布 WSL2 的真实 IP（172.x.x.x）
 
 ---
 
-### ✅ 已实现的修复
+### ✅ 正确的解决方案
 
-代码中已添加 `WSL2_COMPAT` 环境变量开关，启用以下兼容设置：
-- `SetNAT1To1IPs([]string{"127.0.0.1"}, ICECandidateTypeHost)` - 强制公布 127.0.0.1
-- `SetIncludeLoopbackCandidate(true)` - 允许生成 loopback 候选（**最关键**）
-- `SetInterfaceFilter(func(iface string) bool { return true })` - 不过滤任何网络接口
-- 详细的 ICE 候选生成日志，方便调试
+#### 步骤 1：获取 WSL2 的真实 IP
+
+在 **Windows PowerShell** 中运行（注意是大写 i）：
+```powershell
+wsl.exe hostname -I
+```
+
+输出示例：
+```
+172.25.24.77
+```
+
+**注意：**
+- `wsl hostname -i`（小写 i）返回 127.0.1.1，这是错的！
+- `wsl hostname -I`（大写 i）返回真实的 172.x.x.x，这才是对的！
 
 ---
 
-### 🔍 验证猜想是否正确的方法
+#### 步骤 2：配置前端环境变量
 
-#### 步骤 1：启用 WSL2 兼容模式启动 SFU
+编辑 `frontend/.env`：
+```env
+# 用你刚才获取到的 WSL2 IP
+VITE_API_HOST=http://172.25.24.77:8080
+VITE_SFU_HOST=http://172.25.24.77:8081
+```
+
+---
+
+#### 步骤 3：启用 WSL2 兼容模式启动 SFU
+
+在 WSL2 中：
 ```bash
 cd backend
 WSL2_COMPAT=1 go run cmd/sfu/main.go
 ```
 
-✅ **确认日志中出现这行：**
+✅ **确认日志中出现类似这行：**
 ```
-{"level":"info", ... ,"msg":"WSL2 compatibility mode enabled: forcing ICE candidate to 127.0.0.1, loopback enabled"}
+{"level":"info", ... ,"msg":"WSL2 compatibility mode enabled",
+    "wsl2_ip":"172.25.24.77",
+    "note":"use this IP in frontend VITE_SFU_HOST"}
 ```
+
+**WSL2_COMPAT 会自动：**
+- 检测 WSL2 的 eth0 IP（172.x.x.x）
+- 通过 `SetNAT1To1IPs` 让 SFU 公布这个真实 IP
+- 允许所有网络接口
 
 ---
 
-#### 步骤 2：观察 SFU 日志中的 ICE 候选输出
+#### 步骤 4：验证 ICE 候选是否正确
 
-当有用户连接 SFU 时，**应该看到类似这样的日志**：
+当有用户连接时，SFU 日志中应该看到：
 ```
 {"level":"debug", ... ,"msg":"ICE candidate generated",
     "userID":1,
-    "candidate":"candidate:1 1 udp 1234567 127.0.0.1 50000 typ host",
-    "address":"127.0.0.1",
+    "candidate":"candidate:1 1 udp 1234567 172.25.24.77 50000 typ host",
+    "address":"172.25.24.77",
     "port":50000}
 ```
 
-| 日志现象 | 结论 |
-|---------|------|
-| 看到 `ICE candidate generated` 且 `address=127.0.0.1` | ✅ 修复生效 |
-| 看到候选但 `address=172.x.x.x` | ❌ NAT1To1 映射没生效 |
-| 完全看不到 `ICE candidate generated` | ❌ 候选收集被阻塞 |
+**关键点：候选 IP 是 WSL2 的真实 IP（172.x.x.x），不是 127.0.0.1！**
 
 ---
 
-#### 步骤 3：检查浏览器端
+#### 步骤 5：检查浏览器端
 
 打开 `edge://webrtc-internals/` 或 `chrome://webrtc-internals/`：
-- ✅ **正常情况**：`ICE candidate grid` 中应该看到 127.0.0.1 的候选
-- ❌ **异常情况**：grid 为空或候选是 172.x.x.x 且状态不变化
+- ✅ **正常情况**：`ICE candidate grid` 中应该看到 172.x.x.x 的候选
+- ✅ **连接状态**：应该变成 `connected` 或 `completed`
+- ❌ **异常情况**：候选是 127.0.0.1 或连接卡住
 
 ---
 
-### 🛠️ 如果修复仍不生效，需要做的事情
+### 🐛 如果还是连不上，排查清单
 
-#### 方案 A：验证候选是否真的发送到了浏览器
+按以下顺序检查：
 
-在 `sfu-test.html` 的 JS 代码中加入 console.log：
-```javascript
-// 在处理 ice-candidate 消息的地方添加
-console.log('Received ICE candidate from SFU:', candidate);
+1. [ ] 确认你用 `wsl hostname -I`（大写 i）获取的 IP
+2. [ ] 确认 frontend/.env 里的 IP 和 SFU 日志显示的一致
+3. [ ] 确认启动 SFU 时加了 `WSL2_COMPAT=1`
+4. [ ] 确认浏览器访问的不是 `localhost:3000`，而是 `http://172.25.24.77:3000`（如果Vite也在WSL2）
+5. [ ] 检查 WSL2 防火墙有没有阻止 UDP 端口（通常不需要）
+6. [ ] 用简单的 UDP 测试程序验证：
+   ```go
+   // 在WSL2运行，Windows发UDP到172.x.x.x:49152测试
+   ```
+
+---
+
+### 📋 两种开发模式对比
+
+| 模式 | 优点 | 缺点 | 推荐度 |
+|------|------|------|--------|
+| **WSL2 原生运行** | 调试方便，编译快 | 需要手动配置 IP | ⭐⭐⭐⭐ |
+| **Docker Desktop** | IP 固定（localhost），端口映射处理好了 | 编译稍慢 | ⭐⭐⭐⭐⭐ |
+
+---
+
+### 🔧 Docker 模式的配置
+
+如果不想处理 WSL2 IP，直接用 Docker：
+
+```bash
+cd deployment
+docker-compose up -d postgres redis coturn
+docker-compose up --build api-server sfu-server frontend
 ```
 
-检查浏览器控制台是否收到 SFU 发来的候选。
+然后浏览器访问 `http://localhost:3000`，不需要改任何 IP！
 
----
-
-#### 方案 B：确认浏览器端是否发送了候选给 SFU
-
-同样在测试页面添加日志，确认浏览器端的候选是否通过 WebSocket 发送到了 SFU。
-
----
-
-#### 方案 C：降级为不使用 ICE（仅本地测试用）
-
-如果只是想验证媒体转发功能，可以临时使用 SRTP 端口直接转发（不推荐用于生产）。
-
----
-
-#### 方案 D：改用 Docker 容器内运行 SFU
-
-Docker 的网络桥接模式可能比 WSL2 更稳定，参考 `deployment/docker-compose.yml`。
-
----
-
-### 📋 给后续开发者的检查清单
-
-当遇到 ICE 连接问题时，按以下顺序排查：
-
-1. [ ] SFU 启动时是否启用了 `WSL2_COMPAT=1`？
-2. [ ] SFU 日志中是否有 `ICE candidate generated`？
-3. [ ] 候选中的 `address` 是 `127.0.0.1` 还是 `172.x.x.x`？
-4. [ ] 浏览器端是否收到了来自 SFU 的候选？
-5. [ ] 浏览器端是否收集到了自己的候选并发送给了 SFU？
+**Docker 模式的原理：**
+- Docker Desktop 做了真正的全协议端口映射（TCP+UDP）
+- SFU 用 `FORCE_LOOPBACK_CANDIDATE=1` 公布 127.0.0.1
+- 浏览器连 localhost 的 UDP 端口能被转发到容器里
 6. [ ] `webrtc-internals` 中的候选对状态是什么？
 7. [ ] 是否有 `STUN binding request` 相关的错误？
 

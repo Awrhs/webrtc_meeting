@@ -66,6 +66,53 @@ type SignalingMessage struct {
 	SSRCs         []SSRC          `json:"ssrcs,omitempty"` // for ssrc_mapping message
 }
 
+// getWSL2IP 自动检测 WSL2 的真实 IP 地址（eth0 网卡）
+func getWSL2IP() string {
+	// 优先从环境变量读取
+	if ip := os.Getenv("WSL2_IP"); ip != "" {
+		return ip
+	}
+
+	// 自动检测 eth0 网卡的 IP
+	ifaces, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+
+	for _, iface := range ifaces {
+		// WSL2 通常是 eth0，也可能有其他名字
+		if !strings.HasPrefix(iface.Name, "eth") &&
+			!strings.HasPrefix(iface.Name, "en") &&
+			!strings.HasPrefix(iface.Name, "Ethernet") {
+			continue
+		}
+
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+
+		for _, addr := range addrs {
+			ipNet, ok := addr.(*net.IPNet)
+			if !ok {
+				continue
+			}
+
+			// 只返回 IPv4，且不是回环地址
+			ip := ipNet.IP.To4()
+			if ip != nil && !ip.IsLoopback() {
+				// 检查是否是 WSL2 常见的 172.x.x.x 或 192.168.x.x
+				ipStr := ip.String()
+				if strings.HasPrefix(ipStr, "172.") || strings.HasPrefix(ipStr, "192.168.") || strings.HasPrefix(ipStr, "10.") {
+					return ipStr
+				}
+			}
+		}
+	}
+
+	return ""
+}
+
 func NewSFUServer(logger *zap.Logger) *SFUServer {
 	configuration := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -77,23 +124,46 @@ func NewSFUServer(logger *zap.Logger) *SFUServer {
 
 	settingEngine := webrtc.SettingEngine{}
 
-	// WSL2 兼容模式：强制使用 127.0.0.1 作为 ICE 候选地址
-	// 这解决了 Windows 主机浏览器无法连接 WSL2 内部 IP 的问题
-	if os.Getenv("WSL2_COMPAT") == "1" || os.Getenv("FORCE_LOOPBACK_CANDIDATE") == "1" {
-		// 强制 NAT 1:1 映射，让 SFU 只公布 127.0.0.1
-		settingEngine.SetNAT1To1IPs([]string{"127.0.0.1"}, webrtc.ICECandidateTypeHost)
+	// WebRTC 端口范围配置（可选）
+	if minPortStr := os.Getenv("WEBRTC_PORT_RANGE_MIN"); minPortStr != "" {
+		if maxPortStr := os.Getenv("WEBRTC_PORT_RANGE_MAX"); maxPortStr != "" {
+			minPort, _ := strconv.Atoi(minPortStr)
+			maxPort, _ := strconv.Atoi(maxPortStr)
+			if minPort > 0 && maxPort > minPort {
+				settingEngine.SetEphemeralUDPPortRange(uint16(minPort), uint16(maxPort))
+			}
+		}
+	}
 
-		// 关键：允许在所有网络接口上生成 loopback 候选
+	// WSL2 兼容模式：自动检测并公布 WSL2 的真实 IP 地址
+	// 这解决了 Windows 主机浏览器无法连接 WSL2 的 WebRTC 问题
+	if os.Getenv("WSL2_COMPAT") == "1" {
+		// 自动检测 WSL2 的真实 IP（172.x.x.x）
+		wslIP := getWSL2IP()
+
+		if wslIP != "" {
+			// 关键：让 SFU 公布 WSL2 的真实 IP，而不是 127.0.0.1
+			// Windows 主机浏览器可以直接通过这个 IP 访问 WSL2
+			settingEngine.SetNAT1To1IPs([]string{wslIP}, webrtc.ICECandidateTypeHost)
+			logger.Info("WSL2 compatibility mode enabled",
+				zap.String("wsl2_ip", wslIP),
+				zap.String("note", "use this IP in frontend VITE_SFU_HOST"))
+		} else {
+			logger.Warn("WSL2_COMPAT enabled but could not detect WSL2 IP, trying fallback")
+		}
+
+		// 允许所有网络接口
 		settingEngine.SetIncludeLoopbackCandidate(true)
-
-		// 禁用接口过滤，确保不会因为 WSL2 虚拟网卡而跳过候选
 		settingEngine.SetInterfaceFilter(func(iface string) bool {
-			return true // 允许所有接口，包括 lo/eth0/docker0 等
+			return true
 		})
-
-		logger.Info("WSL2 compatibility mode enabled: forcing ICE candidate to 127.0.0.1, loopback enabled")
+	} else if os.Getenv("FORCE_LOOPBACK_CANDIDATE") == "1" {
+		// Docker 环境下使用 127.0.0.1（配合 Docker 端口映射）
+		settingEngine.SetNAT1To1IPs([]string{"127.0.0.1"}, webrtc.ICECandidateTypeHost)
+		settingEngine.SetIncludeLoopbackCandidate(true)
+		logger.Info("Loopback candidate forced for Docker environment")
 	} else {
-		// 生产环境也启用 loopback，方便本地调试
+		// 普通环境
 		settingEngine.SetIncludeLoopbackCandidate(true)
 	}
 
