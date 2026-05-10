@@ -7,6 +7,12 @@ import (
 	"strings"
 )
 
+// Config 聚合了后端服务（API 服务器 + SFU 服务器）所需的全部配置项
+//
+// 预期正确逻辑：
+//   极简测试页面只依赖 SFU 相关的配置（SFUPort、CoturnURL 等），
+//   但 Config 结构体同时承载了 API 服务器的配置，因为两个服务共用同一套配置加载逻辑。
+//   开发环境下会自动加载 .env 文件，生产环境则依赖容器注入的环境变量。
 type Config struct {
 	ServerPort     string
 	SFUPort        string
@@ -45,6 +51,13 @@ func loadEnvFromFile(filename string) error {
 	return nil
 }
 
+// Load 从环境变量加载配置，开发环境会自动读取 .env 文件
+//
+// 预期正确逻辑：
+//   1) 非生产环境时尝试加载当前目录或父目录的 .env 文件
+//   2) 从环境变量读取各配置项，若未设置则使用默认值
+//   3) 构建 PostgreSQL DSN 连接字符串
+//   对极简测试页面而言，最关键的默认值是 SFUPort=8081（SFU WebSocket 监听端口）
 func Load() *Config {
 	// 只有在开发环境（GO_ENV 不是 production）且 .env 文件存在时，才自动加载
 	goEnv := getEnv("GO_ENV", "development")

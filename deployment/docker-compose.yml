@@ -35,6 +35,13 @@ services:
       # 注意：在桥接模式下，过大的端口范围会导致Docker启动缓慢
       # 开发环境只映射必要端口即可，如需完整端口范围请使用host网络模式（仅Linux原生环境）
       - "49152-49200:49152-49200/udp"
+    command:
+      - turnserver
+      - --log-file=stdout
+      - --external-ip=$(detect-external-ip)
+      - --realm=conference
+      - --user=username:password
+      - --lt-cred-mech
     environment:
       - TURN_STATIC_AUTH_SECRET=your-turn-secret-change-in-production
       - TURN_USER=username

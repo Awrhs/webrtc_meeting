@@ -4,11 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
@@ -148,6 +150,26 @@ func NewSFUServer(logger *zap.Logger) *SFUServer {
 			logger.Info("WSL2 compatibility mode enabled",
 				zap.String("wsl2_ip", wslIP),
 				zap.String("note", "use this IP in frontend VITE_SFU_HOST"))
+
+			// WSL2 模式下自动配置 TURN 服务器（SFU 和 Coturn 都在 WSL2 中，通过 localhost 可达）
+			// TURN 作为直接 UDP 连接失败时的中继回退路径
+			if os.Getenv("TURN_SERVER_URL") == "" {
+				turnUser := os.Getenv("TURN_SERVER_USERNAME")
+				turnPass := os.Getenv("TURN_SERVER_PASSWORD")
+				if turnUser == "" {
+					turnUser = "username"
+				}
+				if turnPass == "" {
+					turnPass = "password"
+				}
+				configuration.ICEServers = append(configuration.ICEServers, webrtc.ICEServer{
+					URLs:       []string{"turn:localhost:3478"},
+					Username:   turnUser,
+					Credential: turnPass,
+				})
+				logger.Info("TURN server auto-configured for WSL2 mode",
+					zap.String("url", "turn:localhost:3478"))
+			}
 		} else {
 			logger.Warn("WSL2_COMPAT enabled but could not detect WSL2 IP, trying fallback")
 		}
@@ -179,6 +201,15 @@ func NewSFUServer(logger *zap.Logger) *SFUServer {
 	}
 }
 
+// onTrack 当 SFU 从某个浏览器收到 RTP 媒体轨道时触发
+// 核心职责：1) 将收到的远程轨道包装为本地可转发轨道；2) 启动 RTP 包转发 goroutine；
+//          3) 将新书目推送给房间内所有其他用户；4) 触发重新协商让已连接用户接收新轨道
+//
+// 预期正确逻辑：
+//   当用户A先连接、用户B后加入时，用户B的handleJoin会为其PC添加用户A的现有轨道（用户B能看到A）。
+//   但用户A的PC已经连接完成，如果不重新协商，用户A的浏览器不会知道有新的接收轨道，就看不到B。
+//   因此，在 onTrack 中给已连接用户的PC AddTrack 后，必须调用 renegotiate() 创建新offer并发送给浏览器，
+//   浏览器收到offer后创建answer回传，SFU设置远程描述，新轨道才能正式传输。
 func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 	trackKind := string(track.Kind())
 	streamID := track.StreamID()
@@ -190,14 +221,18 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 		zap.String("streamID", streamID),
 		zap.Uint32("ssrc", uint32(track.SSRC())))
 
-	// 创建本地轨道
+	// 创建本地可转发轨道：TrackLocalStaticRTP 用于将收到的 RTP 包原样转发给其他用户
 	localTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), streamID)
 	if err != nil {
 		s.logger.Error("Failed to create local track", zap.Error(err))
 		return
 	}
 
-	// 存储轨道信息（包括SSRC用于映射）
+	// 统一锁顺序：先 room.mu 后 peer.mu，避免与 handleJoin 发生死锁
+	// handleJoin 获取锁的顺序也是 room.mu -> peer.mu，保持一致
+	room.mu.Lock()
+	defer room.mu.Unlock()
+
 	peer.mu.Lock()
 	peer.Tracks[trackKey] = &TrackInfo{
 		Track:     localTrack,
@@ -208,7 +243,8 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 	}
 	peer.mu.Unlock()
 
-	// 启动转发goroutine
+	// 启动 RTP 包转发 goroutine：从浏览器发来的 track 读取 RTP 包，写入 localTrack
+	// localTrack 会被挂载到其他用户的 PeerConnection 上，Pion 会自动将其 RTP 包发送出去
 	go func() {
 		buf := make([]byte, 1500)
 		for {
@@ -225,7 +261,7 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 			isEnabled := trackInfo != nil && trackInfo.IsEnabled
 			peer.mu.Unlock()
 
-			// 只有启用的轨道才转发
+			// 只有启用的轨道才转发（被 MuteUser 禁用的轨道会跳过）
 			if isEnabled {
 				_, err = localTrack.Write(buf[:n])
 				if err != nil {
@@ -235,11 +271,7 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 		}
 	}()
 
-	// 为房间内所有其他用户订阅这个新轨道
-	room.mu.Lock()
-	defer room.mu.Unlock()
-
-	// 构建SSRC映射消息
+	// 构建 SSRC 映射消息：通知所有客户端有一条新轨道到达（用于前端将流归属到具体用户）
 	ssrcMapping := SignalingMessage{
 		Type:   "ssrc_mapping",
 		RoomID: room.ID,
@@ -254,12 +286,12 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 	}
 
 	for _, otherPeer := range room.Peers {
-		// 给所有用户（包括发布者自己）发送SSRC映射
+		// 给所有用户（包括发布者自己）发送 SSRC 映射，方便前端做流归属
 		if otherPeer.Conn != nil {
 			otherPeer.Conn.WriteJSON(ssrcMapping)
 		}
 
-		// 给其他用户添加轨道订阅
+		// 给其他用户添加轨道订阅：将 localTrack 挂载到对方的 PeerConnection 上
 		if otherPeer.UserID != peer.UserID {
 			sender, err := otherPeer.PC.AddTrack(localTrack)
 			if err != nil {
@@ -274,7 +306,52 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 				zap.Uint("from", peer.UserID),
 				zap.Uint("to", otherPeer.UserID),
 				zap.String("trackKey", trackKey))
+
+			// 【关键修复】为新加入的轨道触发重新协商
+			// 原因：otherPeer 的 PC 可能已经连接完成（answer 已交换），浏览器不知道有新轨道
+			// 做法：SFU 主动创建新 offer 发送给浏览器，浏览器回复 answer，完成二次协商
+			go s.renegotiate(otherPeer)
 		}
+	}
+}
+
+// renegotiate 当已连接的 PeerConnection 需要增加新接收轨道时触发重新协商
+// 预期正确逻辑：
+//   WebRTC 连接建立后，如果一方需要增加新的发送轨道（如SFU要转发新用户的书目），
+//   必须通过新的 Offer/Answer 交换让对端知道有新的 m-line 或 SSRC。
+//   这里SFU作为offerer创建新offer，通过WebSocket发送给浏览器，浏览器回复answer，
+//   SFU收到answer后调用SetRemoteDescription，新轨道才能开始传输RTP包。
+func (s *SFUServer) renegotiate(peer *Peer) {
+	// 短暂等待，避免与 SetLocalDescription 的 ICE 候选生成冲突
+	// Pion 中 SetLocalDescription 后需要一小段时间才能安全调用 CreateOffer
+	time.Sleep(100 * time.Millisecond)
+
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+
+	s.logger.Info("Starting renegotiation", zap.Uint("userID", peer.UserID))
+
+	// 创建重新协商用的 Offer
+	offer, err := peer.PC.CreateOffer(nil)
+	if err != nil {
+		s.logger.Error("Failed to create renegotiation offer", zap.Uint("userID", peer.UserID), zap.Error(err))
+		return
+	}
+
+	// 设置本地描述：Pion 会根据本地轨道生成 SDP
+	err = peer.PC.SetLocalDescription(offer)
+	if err != nil {
+		s.logger.Error("Failed to set local description for renegotiation", zap.Uint("userID", peer.UserID), zap.Error(err))
+		return
+	}
+
+	// 通过 WebSocket 将新的 Offer 发送给浏览器
+	if peer.Conn != nil {
+		peer.Conn.WriteJSON(SignalingMessage{
+			Type: "offer",
+			SDP:  offer.SDP,
+		})
+		s.logger.Info("Sent renegotiation offer", zap.Uint("userID", peer.UserID))
 	}
 }
 
@@ -383,6 +460,18 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 				s.logger.Error("Offer failed", zap.Error(err))
 				sendError(conn, "offer_failed", err.Error())
 			}
+		case "answer":
+			// 处理浏览器回复的 Answer（用于重新协商场景）
+			// 初次协商时浏览器是 offerer、SFU 是 answerer，浏览器不会发 answer。
+			// 重新协商时 SFU 是 offerer，浏览器回复 answer，需要在这里处理。
+			if peer == nil {
+				sendError(conn, "not_joined", "Please join first")
+				continue
+			}
+			err = s.handleAnswer(peer, &msg)
+			if err != nil {
+				s.logger.Error("Answer handling failed", zap.Uint("userID", peer.UserID), zap.Error(err))
+			}
 		case "ice-candidate":
 			if peer == nil {
 				sendError(conn, "not_joined", "Please join first")
@@ -435,13 +524,13 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 	// 监听ICE候选，发送给前端
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
-			s.logger.Debug("ICE gathering completed",
+			s.logger.Info("ICE gathering completed",
 				zap.Uint("userID", peer.UserID))
 			return
 		}
 
 		candidateInit := candidate.ToJSON()
-		s.logger.Debug("ICE candidate generated",
+		s.logger.Info("ICE candidate generated",
 			zap.Uint("userID", peer.UserID),
 			zap.String("candidate", candidateInit.Candidate),
 			zap.String("foundation", candidate.Foundation),
@@ -484,8 +573,7 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 	})
 
 	// 重要：订阅房间内已存在的其他用户的所有流
-	// 必须在 SetRemoteDescription 之后，PeerConnection 可用时执行
-	room.mu.Lock()
+	// 注意：room.mu 已在函数开头通过 defer 持有，此处无需再次加锁
 	var allSSRCs []SSRC
 	for _, existingPeer := range room.Peers {
 		if existingPeer.UserID != peer.UserID {
@@ -515,7 +603,6 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 			existingPeer.mu.Unlock()
 		}
 	}
-	room.mu.Unlock()
 
 	// 如果有现有流，发送批量SSRC映射给新用户
 	if len(allSSRCs) > 0 {
@@ -537,6 +624,13 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 	return peer, nil
 }
 
+// handleOffer 处理浏览器发来的初始 SDP Offer（初次协商）
+// 预期正确逻辑：
+//   浏览器是 offerer，SFU 是 answerer。
+//   1) SFU 将浏览器的 offer 设为远程描述（声明浏览器要发送的轨道）
+//   2) SFU 创建 answer（包含 SFU 要发送给浏览器的轨道，如现有用户的流）
+//   3) SFU 将 answer 设为本地描述，启动 ICE 收集
+//   4) 通过 WebSocket 将 answer 发送回浏览器
 func (s *SFUServer) handleOffer(peer *Peer, msg *SignalingMessage) error {
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
@@ -571,6 +665,29 @@ func (s *SFUServer) handleOffer(peer *Peer, msg *SignalingMessage) error {
 	return nil
 }
 
+// handleAnswer 处理浏览器回复的 SDP Answer（重新协商场景）
+// 预期正确逻辑：
+//   重新协商时 SFU 是 offerer，浏览器是 answerer。
+//   浏览器收到 renegotiate() 发来的 offer 后，创建 answer 并发回。
+//   SFU 收到 answer 后设为远程描述，新添加的轨道即可开始传输。
+func (s *SFUServer) handleAnswer(peer *Peer, msg *SignalingMessage) error {
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+
+	s.logger.Info("Received answer (renegotiation)", zap.Uint("user", peer.UserID))
+
+	err := peer.PC.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer,
+		SDP:  msg.SDP,
+	})
+	if err != nil {
+		return err
+	}
+
+	s.logger.Info("Renegotiation completed", zap.Uint("user", peer.UserID))
+	return nil
+}
+
 func (s *SFUServer) handleIceCandidate(peer *Peer, msg *SignalingMessage) error {
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
@@ -592,7 +709,9 @@ func (s *SFUServer) handleIceCandidate(peer *Peer, msg *SignalingMessage) error 
 		return err
 	}
 
-	s.logger.Debug("Added ICE candidate", zap.Uint("user", peer.UserID))
+	s.logger.Info("Added remote ICE candidate",
+		zap.Uint("user", peer.UserID),
+		zap.String("candidate", msg.Candidate[:min(len(msg.Candidate), 100)]))
 	return nil
 }
 

@@ -1,7 +1,21 @@
 {
   "permissions": {
     "allow": [
-      "Bash(mkdir -p frontend/public)"
+      "Bash(mkdir -p frontend/public)",
+      "Bash(python3 *)",
+      "Bash(go build *)",
+      "Bash(sudo ss *)",
+      "Bash(docker inspect *)",
+      "Bash(docker run *)",
+      "Bash(nc -zv 127.0.0.1 3478)",
+      "Bash(nc -zv -u 127.0.0.1 3478)",
+      "Bash(nc -zv 172.30.92.105 3478)",
+      "Bash(docker compose *)",
+      "Bash(apt list *)",
+      "Bash(sudo apt-get *)",
+      "Bash(sudo -n apt-get update)",
+      "Bash(sudo -n apt-get install -y coturn)",
+      "Bash(sudo -l)"
     ],
     "additionalDirectories": [
       "C:\\Users\\My_PC\\myproject\\conference_based_on_the-SFU model\\frontend"
