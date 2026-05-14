@@ -692,8 +692,33 @@ func (s *SFUServer) handleIceCandidate(peer *Peer, msg *SignalingMessage) error 
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
 
+	candidateStr := msg.Candidate
+
+	// WSL2 本地测试兼容：将浏览器发来的 mDNS 候选替换为 WebSocket 连接的已知真实 IP。
+	// 原理：Chrome 等浏览器默认用 .local mDNS 地址保护隐私，WSL2 中的 Linux 进程无法解析该域名。
+	// 但 WebSocket 的 RemoteAddr 已经暴露了浏览器在 WSL2 虚拟子网中的真实 IP（如 172.25.24.1）。
+	// 用该 IP 替换 mDNS 地址后，SFU 的 ICE agent 就能直接向浏览器发送 UDP STUN 探测包，
+	// 实现同一台物理机上的 host-host UDP 直连，无需 coturn 或关闭浏览器 mDNS。
+	if strings.Contains(candidateStr, ".local") {
+		if tcpAddr, ok := peer.Conn.RemoteAddr().(*net.TCPAddr); ok {
+			realIP := tcpAddr.IP.String()
+			// candidate 格式: candidate:<foundation> <component> <protocol> <priority> <addr> <port> <typ> ...
+			parts := strings.Split(candidateStr, " ")
+			if len(parts) >= 6 {
+				originalAddr := parts[4]
+				parts[4] = realIP
+				candidateStr = strings.Join(parts, " ")
+				s.logger.Info("Replaced mDNS candidate with WebSocket RemoteAddr",
+					zap.Uint("userID", peer.UserID),
+					zap.String("originalAddr", originalAddr),
+					zap.String("realIP", realIP),
+					zap.String("newCandidate", candidateStr[:min(len(candidateStr), 120)]))
+			}
+		}
+	}
+
 	candidate := webrtc.ICECandidateInit{
-		Candidate: msg.Candidate,
+		Candidate: candidateStr,
 	}
 	if msg.SDPMLineIndex != nil {
 		idx := uint16(*msg.SDPMLineIndex)
@@ -711,7 +736,7 @@ func (s *SFUServer) handleIceCandidate(peer *Peer, msg *SignalingMessage) error 
 
 	s.logger.Info("Added remote ICE candidate",
 		zap.Uint("user", peer.UserID),
-		zap.String("candidate", msg.Candidate[:min(len(msg.Candidate), 100)]))
+		zap.String("candidate", candidateStr[:min(len(candidateStr), 100)]))
 	return nil
 }
 
