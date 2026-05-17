@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
-	"net"
 	"net/http"
 	"os"
 	"strconv"
@@ -68,53 +67,6 @@ type SignalingMessage struct {
 	SSRCs         []SSRC          `json:"ssrcs,omitempty"` // for ssrc_mapping message
 }
 
-// getWSL2IP 自动检测 WSL2 的真实 IP 地址（eth0 网卡）
-func getWSL2IP() string {
-	// 优先从环境变量读取
-	if ip := os.Getenv("WSL2_IP"); ip != "" {
-		return ip
-	}
-
-	// 自动检测 eth0 网卡的 IP
-	ifaces, err := net.Interfaces()
-	if err != nil {
-		return ""
-	}
-
-	for _, iface := range ifaces {
-		// WSL2 通常是 eth0，也可能有其他名字
-		if !strings.HasPrefix(iface.Name, "eth") &&
-			!strings.HasPrefix(iface.Name, "en") &&
-			!strings.HasPrefix(iface.Name, "Ethernet") {
-			continue
-		}
-
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-
-		for _, addr := range addrs {
-			ipNet, ok := addr.(*net.IPNet)
-			if !ok {
-				continue
-			}
-
-			// 只返回 IPv4，且不是回环地址
-			ip := ipNet.IP.To4()
-			if ip != nil && !ip.IsLoopback() {
-				// 检查是否是 WSL2 常见的 172.x.x.x 或 192.168.x.x
-				ipStr := ip.String()
-				if strings.HasPrefix(ipStr, "172.") || strings.HasPrefix(ipStr, "192.168.") || strings.HasPrefix(ipStr, "10.") {
-					return ipStr
-				}
-			}
-		}
-	}
-
-	return ""
-}
-
 func NewSFUServer(logger *zap.Logger) *SFUServer {
 	configuration := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
@@ -137,57 +89,8 @@ func NewSFUServer(logger *zap.Logger) *SFUServer {
 		}
 	}
 
-	// WSL2 兼容模式：自动检测并公布 WSL2 的真实 IP 地址
-	// 这解决了 Windows 主机浏览器无法连接 WSL2 的 WebRTC 问题
-	if os.Getenv("WSL2_COMPAT") == "1" {
-		// 自动检测 WSL2 的真实 IP（172.x.x.x）
-		wslIP := getWSL2IP()
-
-		if wslIP != "" {
-			// 关键：让 SFU 公布 WSL2 的真实 IP，而不是 127.0.0.1
-			// Windows 主机浏览器可以直接通过这个 IP 访问 WSL2
-			settingEngine.SetNAT1To1IPs([]string{wslIP}, webrtc.ICECandidateTypeHost)
-			logger.Info("WSL2 compatibility mode enabled",
-				zap.String("wsl2_ip", wslIP),
-				zap.String("note", "use this IP in frontend VITE_SFU_HOST"))
-
-			// WSL2 模式下自动配置 TURN 服务器（SFU 和 Coturn 都在 WSL2 中，通过 localhost 可达）
-			// TURN 作为直接 UDP 连接失败时的中继回退路径
-			if os.Getenv("TURN_SERVER_URL") == "" {
-				turnUser := os.Getenv("TURN_SERVER_USERNAME")
-				turnPass := os.Getenv("TURN_SERVER_PASSWORD")
-				if turnUser == "" {
-					turnUser = "username"
-				}
-				if turnPass == "" {
-					turnPass = "password"
-				}
-				configuration.ICEServers = append(configuration.ICEServers, webrtc.ICEServer{
-					URLs:       []string{"turn:localhost:3478"},
-					Username:   turnUser,
-					Credential: turnPass,
-				})
-				logger.Info("TURN server auto-configured for WSL2 mode",
-					zap.String("url", "turn:localhost:3478"))
-			}
-		} else {
-			logger.Warn("WSL2_COMPAT enabled but could not detect WSL2 IP, trying fallback")
-		}
-
-		// 允许所有网络接口
-		settingEngine.SetIncludeLoopbackCandidate(true)
-		settingEngine.SetInterfaceFilter(func(iface string) bool {
-			return true
-		})
-	} else if os.Getenv("FORCE_LOOPBACK_CANDIDATE") == "1" {
-		// Docker 环境下使用 127.0.0.1（配合 Docker 端口映射）
-		settingEngine.SetNAT1To1IPs([]string{"127.0.0.1"}, webrtc.ICECandidateTypeHost)
-		settingEngine.SetIncludeLoopbackCandidate(true)
-		logger.Info("Loopback candidate forced for Docker environment")
-	} else {
-		// 普通环境
-		settingEngine.SetIncludeLoopbackCandidate(true)
-	}
+	// 允许回环候选，支持本地开发测试
+	settingEngine.SetIncludeLoopbackCandidate(true)
 
 	api := webrtc.NewAPI(
 		webrtc.WithSettingEngine(settingEngine),
@@ -693,29 +596,6 @@ func (s *SFUServer) handleIceCandidate(peer *Peer, msg *SignalingMessage) error 
 	defer peer.mu.Unlock()
 
 	candidateStr := msg.Candidate
-
-	// WSL2 本地测试兼容：将浏览器发来的 mDNS 候选替换为 WebSocket 连接的已知真实 IP。
-	// 原理：Chrome 等浏览器默认用 .local mDNS 地址保护隐私，WSL2 中的 Linux 进程无法解析该域名。
-	// 但 WebSocket 的 RemoteAddr 已经暴露了浏览器在 WSL2 虚拟子网中的真实 IP（如 172.25.24.1）。
-	// 用该 IP 替换 mDNS 地址后，SFU 的 ICE agent 就能直接向浏览器发送 UDP STUN 探测包，
-	// 实现同一台物理机上的 host-host UDP 直连，无需 coturn 或关闭浏览器 mDNS。
-	if strings.Contains(candidateStr, ".local") {
-		if tcpAddr, ok := peer.Conn.RemoteAddr().(*net.TCPAddr); ok {
-			realIP := tcpAddr.IP.String()
-			// candidate 格式: candidate:<foundation> <component> <protocol> <priority> <addr> <port> <typ> ...
-			parts := strings.Split(candidateStr, " ")
-			if len(parts) >= 6 {
-				originalAddr := parts[4]
-				parts[4] = realIP
-				candidateStr = strings.Join(parts, " ")
-				s.logger.Info("Replaced mDNS candidate with WebSocket RemoteAddr",
-					zap.Uint("userID", peer.UserID),
-					zap.String("originalAddr", originalAddr),
-					zap.String("realIP", realIP),
-					zap.String("newCandidate", candidateStr[:min(len(candidateStr), 120)]))
-			}
-		}
-	}
 
 	candidate := webrtc.ICECandidateInit{
 		Candidate: candidateStr,

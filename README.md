@@ -253,7 +253,7 @@ conference-sfu/
 
 | 文件 | 职责 | 应实现的具体逻辑 |
 |------|------|-----------------|
-| `server.go` | SFU 媒体引擎（最核心） | ① **数据结构**：`Room`（房间，含 `Peers` 映射）、`Peer`（用户，含 `PC` PeerConnection、`Conn` WebSocket、`Tracks` 本地轨道映射、`Subscriptions` RTPSender 列表）、`TrackInfo`（轨道元数据：SSRC/Kind/StreamID/启用状态）；② **生命周期**：`HandleWebSocket`（WebSocket 升级 → 消息循环：`join`→`handleJoin`、`offer`→`handleOffer`、`ice-candidate`→`handleIceCandidate`）；③ **WebRTC 协商**：`handleJoin` 创建 `PeerConnection`（Pion API + 动态 ICE 配置）→ 注册 `OnTrack`/`OnICECandidate`/`OnConnectionStateChange` → 发送 `joined` → 为新用户订阅房间内已有轨道 → 发送 `ssrc_mapping`；④ **媒体转发**：`onTrack` 收到远程轨道 → 创建 `TrackLocalStaticRTP` → 启动 goroutine `Read/Write` 转发 RTP 包 → 为房间内所有其他用户 `AddTrack` → 广播 `ssrc_mapping`；⑤ **ICE 交换**：双向通过 WebSocket 透传 `ice-candidate` 消息；⑥ **控制方法**：`KickUser`（关闭 PC + 清理房间）、`MuteUser`（设置 `TrackInfo.IsEnabled` + 广播 `muted` 信令）、`GetRoomStats`/`ListRooms`；⑦ **WSL2 兼容**：`getWSL2IP` 检测 eth0 IP → `SetNAT1To1IPs` 公布真实 IP → 自动配置 `turn:localhost:3478` |
+| `server.go` | SFU 媒体引擎（最核心） | ① **数据结构**：`Room`（房间，含 `Peers` 映射）、`Peer`（用户，含 `PC` PeerConnection、`Conn` WebSocket、`Tracks` 本地轨道映射、`Subscriptions` RTPSender 列表）、`TrackInfo`（轨道元数据：SSRC/Kind/StreamID/启用状态）；② **生命周期**：`HandleWebSocket`（WebSocket 升级 → 消息循环：`join`→`handleJoin`、`offer`→`handleOffer`、`ice-candidate`→`handleIceCandidate`）；③ **WebRTC 协商**：`handleJoin` 创建 `PeerConnection`（Pion API + 标准 ICE 配置）→ 注册 `OnTrack`/`OnICECandidate`/`OnConnectionStateChange` → 发送 `joined` → 为新用户订阅房间内已有轨道 → 发送 `ssrc_mapping`；④ **媒体转发**：`onTrack` 收到远程轨道 → 创建 `TrackLocalStaticRTP` → 启动 goroutine `Read/Write` 转发 RTP 包 → 为房间内所有其他用户 `AddTrack` → 广播 `ssrc_mapping`；⑤ **ICE 交换**：双向通过 WebSocket 透传 `ice-candidate` 消息；⑥ **控制方法**：`KickUser`（关闭 PC + 清理房间）、`MuteUser`（设置 `TrackInfo.IsEnabled` + 广播 `muted` 信令）、`GetRoomStats`/`ListRooms` |
 | `grpc_server.go` | gRPC 控制服务端 | ① `ControlServer` 实现 protobuf 生成的 `SFUControlServer` 接口；② 将 gRPC 请求参数转换为 `SFUServer` 方法调用：`KickUser`/`MuteUser`/`SetVideoEnabled`（占位）/`GetRoomStats`/`ListRooms`/`ClosePeerConnection`；③ `StartGRPCServer`：创建 TCP Listener → 注册 gRPC 服务 → 后台 goroutine 启动 |
 | `grpc_client.go` | gRPC 控制客户端 | ① `ControlClient`：维护到 SFU gRPC 服务的 `grpc.ClientConn`；② 提供 `KickUser`/`MuteUser`/`ClosePeerConnection`/`GetRoomStats`/`ListRooms` 的同步调用封装（5 秒超时 + 错误日志） |
 
@@ -326,7 +326,7 @@ docker-compose up --build api-server sfu-server frontend
 
 ---
 
-#### 方式二：WSL2 原生运行（适合开发调试）
+#### 方式二：原生运行（适合开发调试）
 
 ##### 1. 启动基础设施
 ```bash
@@ -334,48 +334,33 @@ cd deployment
 docker-compose up -d postgres redis coturn
 ```
 
-##### 2. 获取 WSL2 的真实 IP
-在 Windows PowerShell 中：
-```powershell
-wsl.exe hostname -I
-```
-记下这个 IP（例如 `172.25.24.77`）
-
-##### 3. 配置前端环境变量
-编辑 `frontend/.env`：
-```env
-VITE_API_HOST=http://172.25.24.77:8080
-VITE_SFU_HOST=http://172.25.24.77:8081
-```
-
-##### 4. 编译 gRPC 代码（首次运行）
+##### 2. 编译 gRPC 代码（首次运行）
 ```bash
 cd backend
 make install-tools  # 安装protoc等工具
 make proto          # 生成gRPC代码
 ```
 
-##### 5. 启动API服务（终端1）
+##### 3. 启动API服务（终端1）
 ```bash
 cd backend
 go run cmd/server/main.go
 ```
 
-##### 6. 启动SFU服务（终端2，**必须加 WSL2_COMPAT**）
+##### 4. 启动SFU服务（终端2）
 ```bash
 cd backend
-WSL2_COMPAT=1 go run cmd/sfu/main.go
+go run cmd/sfu/main.go
 ```
 
-##### 7. 启动前端（终端3）
+##### 5. 启动前端（终端3）
 ```bash
 cd frontend
 npm install
 npm run dev
 ```
 
-**访问：http://localhost:3000**（如果前端在 Windows 运行）
-或 **http://172.25.24.77:3000**（如果前端在 WSL2 运行）
+**访问：http://localhost:3000**
 
 ---
 
@@ -613,339 +598,6 @@ npm run dev
 - `backend/internal/config/config.go`
 - `backend/pkg/logger/logger.go`
 - `frontend/public/sfu-test.html`
-
----
-
-## 🐛 WSL2 环境 SFU ICE 连接问题诊断
-
-### 📌 问题背景与核心原理
-
-**WSL2 网络架构：**
-```
-Windows 主机 (浏览器)
-    │
-    │ 虚拟网络交换机 (WSL Virtual Switch)
-    ├─ Windows IP: 172.25.16.1
-    │
-    │ 路由可达 (不是端口映射NAT！)
-    │
-    └─ WSL2 虚拟机
-         └─ eth0 IP: 172.25.24.77 (例子)
-```
-
-**关键事实（通过实验验证）：**
-- ✅ Windows 能直接访问 WSL2 的真实 IP（172.x.x.x），包括 TCP **和 UDP**
-- ❌ `127.0.0.1` 在 Windows 和 WSL2 里是不同的网络命名空间，互不相通
-- ⚠️ 微软的 localhost 转发**只针对 TCP**，**不包括 UDP**（WebRTC用UDP）
-
-**为什么信令能通、媒体不能通？**
-> 这往往是调试时最困惑的地方。WebSocket信令（HTTP Upgrade）和前端dev server（Vite）都走**TCP**，WSL2有一个init进程专门做Windows侧的TCP端口代理，所以`localhost:8081`和`localhost:3000`都能通。但WebRTC媒体面走**UDP**，微软的localhost转发不支持UDP。更关键的是：ICE候选是SFU在SDP中**主动告诉浏览器"我的地址在这里，请你直接连过来"**，浏览器按候选地址字面直连，不经过任何代理。如果候选写的是`127.0.0.1`，浏览器就连Windows本机的127.0.0.1去了，根本不是WSL2。
-
-**之前的错误理解（已修正）：**
-- ❌ 旧代码让 SFU 在ICE候选中写入 127.0.0.1 → 浏览器连自己去了，根本到不了 WSL2
-- ✅ 正确做法：通过 `SetNAT1To1IPs` 将ICE候选中的 host 地址重写为 WSL2 的真实 IP（172.x.x.x）
-
----
-
-### ✅ 正确的解决方案
-
-#### 步骤 1：获取 WSL2 的真实 IP
-
-在 **Windows PowerShell** 中运行（注意是大写 i）：
-```powershell
-wsl.exe hostname -I
-```
-
-输出示例：
-```
-172.25.24.77
-```
-
-**注意：**
-- `wsl hostname -i`（小写 i）返回 127.0.1.1，这是错的！
-- `wsl hostname -I`（大写 i）返回真实的 172.x.x.x，这才是对的！
-
----
-
-#### 步骤 2：配置前端环境变量
-
-编辑 `frontend/.env`：
-```env
-# 用你刚才获取到的 WSL2 IP
-VITE_API_HOST=http://172.25.24.77:8080
-VITE_SFU_HOST=http://172.25.24.77:8081
-```
-
----
-
-#### 步骤 3：启用 WSL2 兼容模式启动 SFU
-
-在 WSL2 中：
-```bash
-cd backend
-WSL2_COMPAT=1 go run cmd/sfu/main.go
-```
-
-✅ **确认日志中出现类似这行：**
-```
-{"level":"info", ... ,"msg":"WSL2 compatibility mode enabled",
-    "wsl2_ip":"172.25.24.77",
-    "note":"use this IP in frontend VITE_SFU_HOST"}
-```
-
-**WSL2_COMPAT 会自动：**
-- 检测 WSL2 的 eth0 IP（172.x.x.x）
-- 通过 `SetNAT1To1IPs` 让 SFU 公布这个真实 IP
-- 允许所有网络接口
-
----
-
-#### 步骤 4：验证 ICE 候选是否正确
-
-当有用户连接时，SFU 日志中应该看到：
-```
-{"level":"debug", ... ,"msg":"ICE candidate generated",
-    "userID":1,
-    "candidate":"candidate:1 1 udp 1234567 172.25.24.77 50000 typ host",
-    "address":"172.25.24.77",
-    "port":50000}
-```
-
-**关键点：候选 IP 是 WSL2 的真实 IP（172.x.x.x），不是 127.0.0.1！**
-
----
-
-#### 步骤 5：检查浏览器端
-
-打开 `edge://webrtc-internals/` 或 `chrome://webrtc-internals/`：
-- ✅ **正常情况**：`ICE candidate grid` 中应该看到 172.x.x.x 的候选
-- ✅ **连接状态**：应该变成 `connected` 或 `completed`
-- ❌ **异常情况**：候选是 127.0.0.1 或连接卡住
-
----
-
-### 🐛 如果还是连不上，排查清单
-
-按以下顺序检查：
-
-1. [ ] 确认你用 `wsl hostname -I`（大写 i）获取的 IP
-2. [ ] 确认 frontend/.env 里的 `VITE_SFU_HOST` 使用的是 WSL2 真实 IP（如 `http://172.25.24.77:8081`），不是 `localhost`
-3. [ ] 确认启动 SFU 时加了 `WSL2_COMPAT=1`，且日志中出现了 `wsl2_ip` 字段
-4. [ ] 确认浏览器通过 `http://172.25.24.77:3000`（或前端实际端口）加载页面，且页面中 SFU 地址输入框也填的是 WSL2 真实 IP
-5. [ ] 检查 WSL2 防火墙有没有阻止 UDP 端口（通常不需要）
-6. [ ] 用简单的 UDP 测试程序验证：
-   ```go
-   // 在WSL2运行，Windows发UDP到172.x.x.x:49152测试
-   ```
-
----
-
-### 📋 两种开发模式对比
-
-| 模式 | 优点 | 缺点 | 推荐度 |
-|------|------|------|--------|
-| **WSL2 原生运行** | 调试方便，编译快，与Windows文件共享无缝 | 需要手动配置IP，ICE候选需重写 | ⭐⭐⭐⭐ |
-| **Docker Desktop** | IP 固定（localhost），端口映射处理好了 | 编译稍慢 | ⭐⭐⭐⭐⭐ |
-| **VirtualBox + 桥接网卡** | 网络模型最干净，无NAT/localhost歧义 | 需额外安装虚拟机，环境配置较繁琐 | ⭐⭐⭐⭐ |
-
----
-
-### 🔧 Docker 模式的配置
-
-如果不想处理 WSL2 IP，直接用 Docker：
-
-```bash
-cd deployment
-docker-compose up -d postgres redis coturn
-docker-compose up --build api-server sfu-server frontend
-```
-
-然后浏览器访问 `http://localhost:3000`，不需要改任何 IP！
-
-**Docker 模式的原理：**
-- Docker Desktop 做了真正的全协议端口映射（TCP+UDP）
-- SFU 用 `FORCE_LOOPBACK_CANDIDATE=1` 强制ICE候选地址为 127.0.0.1
-- 浏览器连 localhost 的 UDP 端口能被转发到容器里
-
----
-
-### 📖 WebRTC ICE 与 WSL2 网络原理 FAQ
-
-本节整理开发者在 WSL2 环境下调试 WebRTC 时最常遇到的困惑。
-
-#### Q1：为什么 WSL2 里的 HTTP 服务（如 Vite dev server）在 Windows 浏览器访问 `localhost:3000` 能通，WebRTC 媒体流却不行？
-
-**答：WSL2 的 localhost 转发是 TCP 层代理，而 ICE 候选是应用层自宣告地址，浏览器按字面直连，不走代理。**
-
-具体而言：
-- WSL2 内部有一个 init 进程充当 Windows 侧的 **TCP 端口代理**。当你在 WSL2 里启动 echo/Vite 监听 `0.0.0.0:3000` 时，Windows 访问 `localhost:3000` 会被劫持并隧道转发到 WSL2 内部。
-- WebSocket 信令（HTTP Upgrade 握手）走 TCP，因此 `ws://localhost:8081/ws` 也能连上。
-- 但 WebRTC 媒体传输默认走 **UDP**（SRTP over UDP），微软的 localhost 转发**只支持 TCP，不支持 UDP**。
-- 更关键的是：ICE 候选不是"请求先发到某个网关再转发"，而是 SFU 在 SDP 中直接告诉浏览器"我的媒体端口在 `candidate:... 127.0.0.1:50000`"，浏览器解析后直接向 `127.0.0.1:50000` 发送 UDP 包。这个 `127.0.0.1` 被浏览器理解成** Windows 本机**，不是 WSL2。
-
-因此现象是：信令通了（WebSocket TCP），ICE 连不上（UDP + 地址歧义）。
-
-#### Q2：`WSL2_COMPAT=1` 到底是什么？为什么网上搜不到？
-
-**答：这是本项目自定义的环境变量，不是操作系统命令。**
-
-它的作用在 `backend/internal/sfu/server.go:142`：
-
-```go
-if os.Getenv("WSL2_COMPAT") == "1" {
-    wslIP := getWSL2IP()  // 自动探测 172.x.x.x
-    // 关键：每当 Pion 生成 typ host 的 ICE 候选时，将其地址强制替换为 WSL2 真实 IP
-    settingEngine.SetNAT1To1IPs([]string{wslIP}, webrtc.ICECandidateTypeHost)
-}
-```
-
-如果你在网上搜索，应该用这些关键词：
-- **Pion WebRTC `SetNAT1To1IPs` WSL2**
-- **WebRTC ICE host candidate NAT mapping**
-- **Pion webrtc NAT 1:1 IP mapping virtual machine**
-
-#### Q3：CORS 配置在 `sfu-test.html` 中是否会导致问题？
-
-**答：取决于你如何打开页面。**
-
-- **通过 `npm run dev`（`http://localhost:3000`）访问**：不会。`backend/cmd/sfu/main.go:44` 已用 `rs/cors` 白名单了 `localhost:3000`。
-- **直接双击 HTML 文件用 `file://` 协议打开**：会。此时 `Origin` 为 `null`，不在白名单内，WebSocket 会被 CORS 拒绝。而且 `file://` 协议下的页面无法调用 `getUserMedia`（现代浏览器限制），摄像头权限会直接被拒绝。
-
-因此务必通过 HTTP 服务器（Vite、Python http.server 等）托管页面。
-
-#### Q4：TURN 服务器在 WSL2 模式下是必须的吗？
-
-**答：不是必须的，但它是 ICE 连接失败时的安全回退。**
-
-在 `WSL2_COMPAT=1` 模式下，代码会自动追加一个 TURN 服务器配置：
-
-```go
-configuration.ICEServers = append(configuration.ICEServers, webrtc.ICEServer{
-    URLs:       []string{"turn:localhost:3478"},
-    Username:   turnUser,
-    Credential: turnPass,
-})
-```
-
-注意这里的 `turn:localhost:3478` 中的 `localhost` 指的是 **WSL2 内部的 localhost**（因为 SFU 和 Coturn 都在 WSL2 里运行），对 SFU 自身而言是正确的。但浏览器端在 WSL2 环境下直连时，由于 `WSL2_COMPAT` 已经让 SFU 公布了 `172.x.x.x` 的 host 候选，大多数情况下 STUN + host 直连即可成功，不需要走 TURN 中继。TURN 只是在 host/srflx 都失败时的兜底方案。
-
----
-
-### 🔧 VirtualBox + 桥接网卡模式（网络最干净的方案）
-
-如果你反复遇到 WSL2 的 ICE 连接问题，或者希望有一个与生产环境网络模型最接近的本地开发环境，可以使用 VirtualBox + 桥接网卡。
-
-**桥接网卡的核心优势**：虚拟机获得与 Windows 宿主机同一网段的独立 IP（如 `192.168.1.xxx`），Windows 浏览器直接通过该 IP 访问虚拟机内的所有服务，UDP 和 TCP 都能直达，不存在 `localhost` 歧义问题。
-
-#### 步骤 1：创建虚拟机
-
-1. 安装 [VirtualBox](https://www.virtualbox.org/wiki/Downloads) 和 [VirtualBox Extension Pack](https://www.virtualbox.org/wiki/Downloads)（Extension Pack 包含 USB 和 webcam 支持，测试音视频时需要）。
-2. 创建一台 Ubuntu 22.04/24.04 虚拟机，分配至少 **4GB 内存** 和 **2 核 CPU**。
-3. 在虚拟机设置的 **网络** 选项卡中：
-   - **连接方式**：选择 `桥接网卡 (Bridged Adapter)`
-   - **界面名称**：选择你的物理网卡（如 Intel(R) Wi-Fi 或 Realtek Ethernet）
-   - 勾选 `接入网线 (Cable connected)`
-   - 展开 **高级**，将 `混杂模式` 设为 `全部允许`
-4. 启动虚拟机并完成 Ubuntu 系统安装。
-
-#### 步骤 2：在虚拟机内安装开发环境
-
-```bash
-# 安装基础工具
-sudo apt update && sudo apt install -y git curl build-essential
-
-# 安装 Go（以 1.21+ 为例）
-wget https://go.dev/dl/go1.21.6.linux-amd64.tar.gz
-sudo rm -rf /usr/local/go && sudo tar -C /usr/local -xzf go1.21.6.linux-amd64.tar.gz
-export PATH=$PATH:/usr/local/go/bin
-echo 'export PATH=$PATH:/usr/local/go/bin' >> ~/.bashrc
-
-# 安装 Node.js 18+
-curl -fsSL https://deb.nodesource.com/setup_18.x | sudo -E bash -
-sudo apt install -y nodejs
-
-# 安装 Docker（可选，用于启动 postgres/redis/coturn）
-curl -fsSL https://get.docker.com | sh
-sudo usermod -aG docker $USER
-newgrp docker
-```
-
-#### 步骤 3：配置项目并启动服务
-
-```bash
-# 克隆项目（或在Windows侧用共享文件夹映射）
-git clone <your-repo-url> conference-sfu
-cd conference-sfu
-
-# 1. 启动基础设施（postgres + redis + coturn）
-cd deployment
-docker-compose up -d postgres redis coturn
-
-# 2. 编译后端gRPC代码（首次运行）
-cd ../backend
-make install-tools
-make proto
-
-# 3. 启动API服务（终端1）
-go run cmd/server/main.go
-
-# 4. 启动SFU服务（终端2，桥接模式下不需要 WSL2_COMPAT）
-go run cmd/sfu/main.go
-
-# 5. 启动前端（终端3）
-cd ../frontend
-npm install
-npm run dev -- --host 0.0.0.0
-```
-
-#### 步骤 4：在 Windows 浏览器中访问
-
-1. 在 Ubuntu 虚拟机终端中查看IP：
-   ```bash
-   ip addr show | grep "inet " | grep -v 127.0.0.1
-   # 输出示例：inet 192.168.1.105/24 brd 192.168.1.255 scope global dynamic eth0
-   ```
-2. 编辑 `frontend/.env`（在虚拟机内编辑）：
-   ```env
-   VITE_API_HOST=http://192.168.1.105:8080
-   VITE_SFU_HOST=http://192.168.1.105:8081
-   ```
-3. 在 Windows 浏览器中访问：
-   ```
-   http://192.168.1.105:3000/sfu-test.html
-   # 或 npm run dev 的默认端口 5173
-   http://192.168.1.105:5173/sfu-test.html
-   ```
-
-#### 桥接模式 vs WSL2 的核心差异
-
-| 对比项 | WSL2 | VirtualBox 桥接 |
-|--------|------|----------------|
-| 虚拟机IP | `172.x.x.x`（虚拟子网） | `192.168.x.x`（与宿主机同网段） |
-| localhost | TCP可被转发，UDP不可 | 完全独立，无歧义 |
-| ICE候选 | 需`WSL2_COMPAT=1`重写为172.x.x.x | 无需特殊处理，直接生成真实IP |
-| 防火墙 | Windows Defender可能拦截172网段 | 通常无额外防火墙问题 |
-| 文件共享 | 无缝挂载Windows目录 | 需配置共享文件夹或SMB |
-| 浏览器访问地址 | `http://172.x.x.x:3000` | `http://192.168.x.x:3000` |
-
-#### 常见问题
-
-**Q：VirtualBox中摄像头无法被浏览器识别？**
-A：需要安装 VirtualBox Extension Pack，并在虚拟机设置的 **USB设备** 中勾选你的摄像头设备。或者使用浏览器虚拟摄像头插件（如 ManyCam）进行测试。
-
-**Q：桥接模式下虚拟机无法获取IP？**
-A：检查宿主机网络是否开启了AP隔离，或尝试将桥接网卡的 `界面名称` 换成其他物理网卡（如从Wi-Fi换成有线网卡）。
-
----
-
-### 🐛 如果还是连不上，进阶排查清单
-
-在上面的 5 点基础检查之外，如果ICE仍然连接失败，请补充检查：
-
-1. [ ] `webrtc-internals` 中的候选对状态是什么？（`chrome://webrtc-internals/`）
-2. [ ] 是否有 `STUN binding request` 相关的错误？
-
-**将以上检查结果附在 Issue 中，可以大大加速问题定位。**
 
 ---
 

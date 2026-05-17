@@ -282,29 +282,19 @@
         };
 
         /**
-         * 根据 SFU 地址动态构建 ICE 服务器配置
-         * 核心逻辑：
-         * 1. 解析 SFU 地址的主机名，作为 TURN 服务器地址
-         * 2. 在 WSL2 环境下，强制使用 TCP 传输的 TURN，绕过 Windows 防火墙对 UDP 的阻拦
-         * 3. 保留公共 STUN 作为首选直连路径
+         * 构建 ICE 服务器配置
+         * 本地开发环境使用公共 STUN 即可，无需 TURN
          *
          * @param {string} sfuUrl - SFU HTTP 地址，如 http://localhost:8081
          * @returns {object} RTCConfiguration 对象
          */
         function buildRtcConfig(sfuUrl) {
-            const sfuHost = new URL(sfuUrl).hostname;
             const config = {
                 iceServers: [
-                    { urls: 'stun:stun.l.google.com:19302' },
-                    {
-                        // WSL2 环境下强制使用 TCP TURN，避免 UDP 被 Windows 防火墙阻止
-                        urls: `turn:${sfuHost}:3478?transport=tcp`,
-                        username: 'username',
-                        credential: 'password'
-                    }
+                    { urls: 'stun:stun.l.google.com:19302' }
                 ]
             };
-            log(`ICE服务器配置: STUN=stun:stun.l.google.com:19302, TURN=${sfuHost}:3478?transport=tcp`);
+            log('ICE服务器配置: STUN=stun:stun.l.google.com:19302');
             return config;
         }
 
@@ -560,34 +550,6 @@
         }
 
         // ============================================================
-        // TURN 服务器 TCP 连通性预检（开发调试辅助）
-        // ============================================================
-        /**
-         * 在建立 WebRTC 连接前，先用 fetch 测试 TURN 服务器的 TCP 端口是否可达
-         * 注意：TURN 不响应 HTTP，所以 fetch 会失败，但可以通过错误类型判断连通性
-         * - 快速收到错误（连接被拒绝/非HTTP响应）→ 端口可达
-         * - 超时 → 可能被防火墙阻断
-         */
-        async function testTurnConnectivity(sfuHost) {
-            log(`正在测试TURN服务器(${sfuHost}:3478) TCP连通性...`);
-            try {
-                const controller = new AbortController();
-                const timeout = setTimeout(() => controller.abort(), 3000);
-                await fetch(`http://${sfuHost}:3478/`, { method: 'HEAD', signal: controller.signal, mode: 'no-cors' });
-                clearTimeout(timeout);
-                log(`TURN服务器TCP端口可达`, 'success');
-            } catch (err) {
-                if (err.name === 'AbortError' || err.message.includes('timeout')) {
-                    log(`TURN服务器TCP连接超时。Windows防火墙可能阻止了到WSL2的TCP连接`, 'warn');
-                } else if (err.message.includes('Failed to fetch') || err.message.includes('NetworkError')) {
-                    log(`TURN服务器TCP连接被拒绝或网络错误。可能是防火墙或端口未开放`, 'warn');
-                } else {
-                    log(`TURN服务器TCP测试: ${err.message}`, 'info');
-                }
-            }
-        }
-
-        // ============================================================
         // 启动 WebRTC（在 joined 确认后调用）
         // ============================================================
         /**
@@ -600,9 +562,6 @@
          */
         async function startWebRTC(roomId, userId, sfuUrl) {
             try {
-                const sfuHost = new URL(sfuUrl).hostname;
-                await testTurnConnectivity(sfuHost);
-
                 // 创建 PeerConnection，传入动态配置的 ICE 服务器
                 const pcConfig = buildRtcConfig(sfuUrl);
                 peerConnection = new RTCPeerConnection(pcConfig);
@@ -796,7 +755,7 @@
         log('5. 依次点击"连接SFU"');
         log('6. 检查两个窗口是否都能看到对方的模拟视频');
         log('====================');
-        log('提示：在 WSL2 环境下，请确保 SFU 以 WSL2_COMPAT=1 启动，且前端 .env 中使用 WSL2 真实 IP');
+        log('提示：本地开发环境无需特殊配置，直接使用 localhost 即可');
     </script>
 </body>
 </html>
