@@ -92,7 +92,14 @@ func NewSFUServer(logger *zap.Logger) *SFUServer {
 	// 允许回环候选，支持本地开发测试
 	settingEngine.SetIncludeLoopbackCandidate(true)
 
+	// 关键修复：创建并注册默认音视频编解码器，否则 Pion 会拒绝所有媒体协商
+	m := &webrtc.MediaEngine{}
+	if err := m.RegisterDefaultCodecs(); err != nil {
+		logger.Fatal("Failed to register default codecs", zap.Error(err))
+	}
+
 	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(m),
 		webrtc.WithSettingEngine(settingEngine),
 	)
 
@@ -424,7 +431,8 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 		s.onTrack(room, peer, track, receiver)
 	})
 
-	// 监听ICE候选，发送给前端
+	// 监听ICE候选
+	// 关键修复：非 Trickle 模式下，候选已包含在 Answer SDP 中，不再单独通过 WebSocket 下发
 	pc.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
 			s.logger.Info("ICE gathering completed",
@@ -433,32 +441,9 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 		}
 
 		candidateInit := candidate.ToJSON()
-		s.logger.Info("ICE candidate generated",
+		s.logger.Debug("ICE candidate generated (included in complete answer)",
 			zap.Uint("userID", peer.UserID),
-			zap.String("candidate", candidateInit.Candidate),
-			zap.String("foundation", candidate.Foundation),
-			zap.Uint16("component", candidate.Component),
-			zap.String("protocol", string(candidate.Protocol)),
-			zap.Uint32("priority", candidate.Priority),
-			zap.String("address", candidate.Address),
-			zap.Uint16("port", candidate.Port),
-			zap.String("typ", string(candidate.Typ)))
-
-		peer.mu.Lock()
-		defer peer.mu.Unlock()
-
-		var sdpMLineIndex *int
-		if candidateInit.SDPMLineIndex != nil {
-			idx := int(*candidateInit.SDPMLineIndex)
-			sdpMLineIndex = &idx
-		}
-		iceMsg := SignalingMessage{
-			Type:          "ice-candidate",
-			Candidate:     candidateInit.Candidate,
-			SDPMLineIndex: sdpMLineIndex,
-			SDPMid:        candidateInit.SDPMid,
-		}
-		conn.WriteJSON(iceMsg)
+			zap.String("candidate", candidateInit.Candidate))
 	})
 
 	// 监听连接状态
@@ -558,13 +543,21 @@ func (s *SFUServer) handleOffer(peer *Peer, msg *SignalingMessage) error {
 		return err
 	}
 
-	// 发送Answer回前端
+	// 关键修复：等待 ICE 收集完成，获取包含所有候选的完整 SDP
+	<-webrtc.GatheringCompletePromise(peer.PC)
+
+	completeAnswer := peer.PC.CurrentLocalDescription()
+	if completeAnswer == nil {
+		completeAnswer = &answer
+	}
+
+	// 发送包含完整 ICE 候选的 Answer 回前端
 	peer.Conn.WriteJSON(SignalingMessage{
 		Type: "answer",
-		SDP:  answer.SDP,
+		SDP:  completeAnswer.SDP,
 	})
 
-	s.logger.Info("Sent answer", zap.Uint("user", peer.UserID))
+	s.logger.Info("Sent complete answer with ICE candidates", zap.Uint("user", peer.UserID))
 	return nil
 }
 
