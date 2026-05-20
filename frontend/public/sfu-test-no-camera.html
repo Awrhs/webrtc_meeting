@@ -346,10 +346,10 @@
 
                     // 中心信息面板
                     simCtx.fillStyle = 'rgba(0, 0, 0, 0.6)';
-                    simCtx.fillRect(40, h / 2 - 60, w - 80, 120);
+                    simCtx.fillRect(40, h / 2 - 60, w - 80, 160);
                     simCtx.strokeStyle = '#00d4ff';
                     simCtx.lineWidth = 2;
-                    simCtx.strokeRect(40, h / 2 - 60, w - 80, 120);
+                    simCtx.strokeRect(40, h / 2 - 60, w - 80, 160);
 
                     // 时间戳文字
                     simCtx.fillStyle = '#ffffff';
@@ -362,6 +362,12 @@
                     simCtx.fillStyle = '#00d4ff';
                     simCtx.fillText(`模拟视频流 | 帧: ${frameCount++}`, w / 2, h / 2 + 25);
                     simCtx.fillText('无摄像头模式', w / 2, h / 2 + 50);
+
+                    // 房间号和用户ID（从输入框实时读取）
+                    const roomId = document.getElementById('room-id').value;
+                    const userId = document.getElementById('user-id').value;
+                    simCtx.fillStyle = '#f39c12';
+                    simCtx.fillText(`房间: ${roomId} | 用户: ${userId}`, w / 2, h / 2 + 75);
 
                     animationId = requestAnimationFrame(drawFrame);
                 }
