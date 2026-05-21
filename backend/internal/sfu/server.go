@@ -46,7 +46,6 @@ type SFUServer struct {
 	configuration webrtc.Configuration
 	logger        *zap.Logger
 	mu            sync.Mutex
-	testMode      bool
 }
 
 type SSRC struct {
@@ -69,25 +68,12 @@ type SignalingMessage struct {
 }
 
 func NewSFUServer(logger *zap.Logger) *SFUServer {
-	testMode := os.Getenv("SFU_TEST_MODE") == "true"
-
-	var configuration webrtc.Configuration
-	if testMode {
-		configuration = webrtc.Configuration{
-			ICEServers: []webrtc.ICEServer{
-				{URLs: []string{"stun:stun.qq.com:3478"}},
-				{URLs: []string{"stun:stun.miwifi.com:3478"}},
-				{URLs: []string{"stun:stun.syncthing.net:3478"}},
+	configuration := webrtc.Configuration{
+		ICEServers: []webrtc.ICEServer{
+			{
+				URLs: []string{"stun:stun.l.google.com:19302"},
 			},
-		}
-	} else {
-		configuration = webrtc.Configuration{
-			ICEServers: []webrtc.ICEServer{
-				{
-					URLs: []string{"stun:stun.l.google.com:19302"},
-				},
-			},
-		}
+		},
 	}
 
 	settingEngine := webrtc.SettingEngine{}
@@ -122,32 +108,7 @@ func NewSFUServer(logger *zap.Logger) *SFUServer {
 		api:           api,
 		configuration: configuration,
 		logger:        logger,
-		testMode:      testMode,
 	}
-}
-
-// filterSDPCandidates 根据 testMode 过滤 SDP 中的 ICE candidate 行
-// testMode=true 时只保留 127.0.0.1 loopback 候选，强制本地回环
-// testMode=false 时过滤掉 loopback 候选，避免 WSL2 Mirrored 模式下的抖动
-func (s *SFUServer) filterSDPCandidates(sdp string) string {
-	lines := strings.Split(sdp, "\n")
-	var filtered []string
-	for _, line := range lines {
-		if !strings.Contains(line, "a=candidate:") {
-			filtered = append(filtered, line)
-			continue
-		}
-		if s.testMode {
-			if strings.Contains(line, "127.0.0.1") {
-				filtered = append(filtered, line)
-			}
-		} else {
-			if !(strings.Contains(line, "127.0.0.1") || strings.Contains(line, "::1")) {
-				filtered = append(filtered, line)
-			}
-		}
-	}
-	return strings.Join(filtered, "\n")
 }
 
 // onTrack 当 SFU 从某个浏览器收到 RTP 媒体轨道时触发
@@ -296,10 +257,9 @@ func (s *SFUServer) renegotiate(peer *Peer) {
 
 	// 通过 WebSocket 将新的 Offer 发送给浏览器
 	if peer.Conn != nil {
-		filteredSDP := s.filterSDPCandidates(offer.SDP)
 		peer.Conn.WriteJSON(SignalingMessage{
 			Type: "offer",
-			SDP:  filteredSDP,
+			SDP:  offer.SDP,
 		})
 		s.logger.Info("Sent renegotiation offer", zap.Uint("userID", peer.UserID))
 	}
@@ -589,10 +549,6 @@ func (s *SFUServer) handleOffer(peer *Peer, msg *SignalingMessage) error {
 	completeAnswer := peer.PC.CurrentLocalDescription()
 	if completeAnswer == nil {
 		completeAnswer = &answer
-	}
-
-	if completeAnswer != nil {
-		completeAnswer.SDP = s.filterSDPCandidates(completeAnswer.SDP)
 	}
 
 	// 发送包含完整 ICE 候选的 Answer 回前端
