@@ -3,6 +3,7 @@ package sfu
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -31,13 +32,16 @@ type TrackInfo struct {
 }
 
 type Peer struct {
-	UserID       uint
-	RoomID       uint
-	PC           *webrtc.PeerConnection
-	Conn         *websocket.Conn
-	Tracks       map[string]*TrackInfo // key: track kind + "-" + stream_id (e.g., "video-camera", "video-screen", "audio-main")
+	UserID        uint
+	RoomID        uint
+	PC            *webrtc.PeerConnection
+	Conn          *websocket.Conn
+	Tracks        map[string]*TrackInfo // key: track kind + "-" + stream_id (e.g., "video-camera", "video-screen", "audio-main")
 	Subscriptions map[uint][]*webrtc.RTPSender // key: fromUserID, value: list of senders (one per track)
-	mu           sync.Mutex
+	addedTracks   map[string]bool // key: fromUserID + "|" + trackKey，防止同一 track 被 AddTrack 多次
+	renegoCh      chan struct{}   // 容量 1 的合并 channel：触发 renegotiation goroutine
+	closeCh       chan struct{}   // 关闭信号，让 renegotiation goroutine 退出
+	mu            sync.Mutex
 }
 
 type SFUServer struct {
@@ -68,11 +72,14 @@ type SignalingMessage struct {
 }
 
 func NewSFUServer(logger *zap.Logger) *SFUServer {
+	// 国内访问 stun.l.google.com 经常超时，把 ICE gathering 拖到 8~15 秒，
+	// 拉长了 renegotiation 与 onTrack 的 race window。换成国内 STUN 后
+	// gathering 通常 < 1 秒。多个 server 互为备份，任一可达即可。
 	configuration := webrtc.Configuration{
 		ICEServers: []webrtc.ICEServer{
-			{
-				URLs: []string{"stun:stun.l.google.com:19302"},
-			},
+			{URLs: []string{"stun:stun.qq.com:3478"}},
+			{URLs: []string{"stun:stun.miwifi.com:3478"}},
+			{URLs: []string{"stun:stun.syncthing.net:3478"}},
 		},
 	}
 
@@ -203,24 +210,37 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 
 		// 给其他用户添加轨道订阅：将 localTrack 挂载到对方的 PeerConnection 上
 		if otherPeer.UserID != peer.UserID {
+			subKey := fmt.Sprintf("%d|%s", peer.UserID, trackKey)
+			otherPeer.mu.Lock()
+			if otherPeer.addedTracks[subKey] {
+				otherPeer.mu.Unlock()
+				s.logger.Debug("Skip AddTrack: already subscribed",
+					zap.Uint("fromUser", peer.UserID),
+					zap.Uint("toUser", otherPeer.UserID),
+					zap.String("subKey", subKey))
+				continue
+			}
 			sender, err := otherPeer.PC.AddTrack(localTrack)
 			if err != nil {
+				otherPeer.mu.Unlock()
 				s.logger.Error("Failed to add track to peer",
 					zap.Uint("fromUser", peer.UserID),
 					zap.Uint("toUser", otherPeer.UserID),
 					zap.Error(err))
 				continue
 			}
+			otherPeer.addedTracks[subKey] = true
 			otherPeer.Subscriptions[peer.UserID] = append(otherPeer.Subscriptions[peer.UserID], sender)
+			otherPeer.mu.Unlock()
+
 			s.logger.Debug("Track subscribed",
 				zap.Uint("from", peer.UserID),
 				zap.Uint("to", otherPeer.UserID),
 				zap.String("trackKey", trackKey))
 
-			// 【关键修复】为新加入的轨道触发重新协商
-			// 原因：otherPeer 的 PC 可能已经连接完成（answer 已交换），浏览器不知道有新轨道
-			// 做法：SFU 主动创建新 offer 发送给浏览器，浏览器回复 answer，完成二次协商
-			go s.renegotiate(otherPeer)
+			// 触发 otherPeer 的 renegotiation。worker 会自动合并多次触发，
+			// 例如 audio + video 在毫秒级先后到达时只产生一次实际 renegotiation。
+			s.triggerRenegotiation(otherPeer)
 		}
 	}
 }
@@ -231,31 +251,67 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 //   必须通过新的 Offer/Answer 交换让对端知道有新的 m-line 或 SSRC。
 //   这里SFU作为offerer创建新offer，通过WebSocket发送给浏览器，浏览器回复answer，
 //   SFU收到answer后调用SetRemoteDescription，新轨道才能开始传输RTP包。
-func (s *SFUServer) renegotiate(peer *Peer) {
-	// 短暂等待，避免与 SetLocalDescription 的 ICE 候选生成冲突
-	// Pion 中 SetLocalDescription 后需要一小段时间才能安全调用 CreateOffer
-	time.Sleep(100 * time.Millisecond)
+// renegotiationWorker 是每个 Peer 专属的串行 worker，负责处理 renegotiation 触发信号。
+// 通过 renegoCh 接收触发信号，buffer=1 保证多次触发被合并成一次执行。
+// 这从根本上消除了多个 goroutine 并发 CreateOffer/SetLocalDescription 的 race。
+func (s *SFUServer) renegotiationWorker(peer *Peer) {
+	for {
+		select {
+		case <-peer.closeCh:
+			s.logger.Debug("Renegotiation worker exiting", zap.Uint("userID", peer.UserID))
+			return
+		case <-peer.renegoCh:
+			s.doRenegotiate(peer)
+		}
+	}
+}
 
+// triggerRenegotiation 通知 worker 需要做一次 renegotiation。
+// 如果 worker 正在处理或已有 pending 信号，新信号会被丢弃（合并）。
+// 这是无阻塞的——调用方（如 onTrack）不会被阻塞。
+func (s *SFUServer) triggerRenegotiation(peer *Peer) {
+	select {
+	case peer.renegoCh <- struct{}{}:
+		// 信号已入队
+	default:
+		// 已有 pending 信号，本次触发被合并掉
+		s.logger.Debug("Renegotiation already pending, merging trigger", zap.Uint("userID", peer.UserID))
+	}
+}
+
+// doRenegotiate 真正执行一次 renegotiation。仅由 renegotiationWorker 调用，
+// 因此天然单线程，不会与自身并发；SignalingState 检查作为防御性兜底。
+func (s *SFUServer) doRenegotiate(peer *Peer) {
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
 
+	// 防御性检查：理论上 worker 串行，进入时应总是 stable；
+	// 若不是，说明 handleAnswer 还没回来（不太可能但留兜底）
+	if peer.PC.SignalingState() != webrtc.SignalingStateStable {
+		s.logger.Warn("doRenegotiate: not stable, re-queueing",
+			zap.Uint("userID", peer.UserID),
+			zap.String("state", peer.PC.SignalingState().String()))
+		// 把信号重新塞回去稍后重试
+		go func() {
+			time.Sleep(200 * time.Millisecond)
+			s.triggerRenegotiation(peer)
+		}()
+		return
+	}
+
 	s.logger.Info("Starting renegotiation", zap.Uint("userID", peer.UserID))
 
-	// 创建重新协商用的 Offer
 	offer, err := peer.PC.CreateOffer(nil)
 	if err != nil {
 		s.logger.Error("Failed to create renegotiation offer", zap.Uint("userID", peer.UserID), zap.Error(err))
 		return
 	}
 
-	// 设置本地描述：Pion 会根据本地轨道生成 SDP
-	err = peer.PC.SetLocalDescription(offer)
-	if err != nil {
+	if err := peer.PC.SetLocalDescription(offer); err != nil {
 		s.logger.Error("Failed to set local description for renegotiation", zap.Uint("userID", peer.UserID), zap.Error(err))
 		return
 	}
 
-	// 通过 WebSocket 将新的 Offer 发送给浏览器
 	if peer.Conn != nil {
 		peer.Conn.WriteJSON(SignalingMessage{
 			Type: "offer",
@@ -265,12 +321,25 @@ func (s *SFUServer) renegotiate(peer *Peer) {
 	}
 }
 
+// closePeer 安全地关闭 peer：关闭 renegotiation worker、关闭 PC。
+// 幂等：多次调用安全（基于 sync.Once 思路用 select 兜底）。
+func (s *SFUServer) closePeer(peer *Peer) {
+	// 关闭 worker，select+default 保证幂等
+	select {
+	case <-peer.closeCh:
+		// 已关闭
+	default:
+		close(peer.closeCh)
+	}
+	peer.PC.Close()
+}
+
 func (s *SFUServer) onConnectionStateChange(room *Room, peer *Peer, state webrtc.PeerConnectionState) {
 	if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
 		room.mu.Lock()
 		defer room.mu.Unlock()
 		delete(room.Peers, peer.UserID)
-		peer.PC.Close()
+		s.closePeer(peer)
 
 		if len(room.Peers) == 0 {
 			s.mu.Lock()
@@ -418,13 +487,20 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 	}
 
 	peer := &Peer{
-		UserID:       msg.UserID,
-		RoomID:       msg.RoomID,
-		PC:           pc,
-		Conn:         conn,
-		Tracks:       make(map[string]*TrackInfo),
+		UserID:        msg.UserID,
+		RoomID:        msg.RoomID,
+		PC:            pc,
+		Conn:          conn,
+		Tracks:        make(map[string]*TrackInfo),
 		Subscriptions: make(map[uint][]*webrtc.RTPSender),
+		addedTracks:   make(map[string]bool),
+		renegoCh:      make(chan struct{}, 1),
+		closeCh:       make(chan struct{}),
 	}
+
+	// 启动该 peer 专属的 renegotiation 串行 worker
+	// 任何地方需要触发 renegotiation 时，往 renegoCh 发个信号即可（buffer=1，多余信号自动合并）
+	go s.renegotiationWorker(peer)
 
 	// 监听轨道
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
@@ -467,8 +543,14 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 		if existingPeer.UserID != peer.UserID {
 			existingPeer.mu.Lock()
 			for trackKey, trackInfo := range existingPeer.Tracks {
+				subKey := fmt.Sprintf("%d|%s", existingPeer.UserID, trackKey)
+				// 注意：此时 peer 刚创建，外部不可能持有 peer.mu，所以这里直接写
+				if peer.addedTracks[subKey] {
+					continue
+				}
 				sender, err := peer.PC.AddTrack(trackInfo.Track)
 				if err == nil {
+					peer.addedTracks[subKey] = true
 					peer.Subscriptions[existingPeer.UserID] = append(peer.Subscriptions[existingPeer.UserID], sender)
 					allSSRCs = append(allSSRCs, SSRC{
 						SSRC:     trackInfo.SSRC,
@@ -630,7 +712,7 @@ func (s *SFUServer) removePeer(roomID, userID uint) {
 		return
 	}
 
-	peer.PC.Close()
+	s.closePeer(peer)
 	delete(room.Peers, userID)
 
 	if len(room.Peers) == 0 {
@@ -678,14 +760,8 @@ func (s *SFUServer) KickUser(roomID, userID uint, reason string) error {
 		return errors.New("peer not found in room")
 	}
 
-	// Close the peer connection
-	if err := peer.PC.Close(); err != nil {
-		s.logger.Error("Failed to close peer connection",
-			zap.Uint("roomID", roomID),
-			zap.Uint("userID", userID),
-			zap.Error(err))
-		return err
-	}
+	// Close the peer connection (also stops the renegotiation worker)
+	s.closePeer(peer)
 
 	// Remove peer from room
 	delete(room.Peers, userID)
