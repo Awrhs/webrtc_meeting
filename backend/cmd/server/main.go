@@ -50,7 +50,7 @@ func main() {
 		log.Info("Connected to SFU gRPC server successfully", zap.String("addr", cfg.SFUAddr))
 	}
 
-	hub := signaling.NewHub(roomService, chatService, log)
+	hub := signaling.NewHub(roomService, chatService, cfg.AllowedOrigins, log)
 	go hub.Run()
 
 	r := gin.Default()

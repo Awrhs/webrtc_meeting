@@ -46,6 +46,8 @@ export class SFUConnection {
   private reconnectDelay = 3000
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private isManualDisconnect = false
+  private negotiationPromise: Promise<void> = Promise.resolve()
+  private pendingRemoteTracks: { ssrc: number; track: MediaStreamTrack; stream: MediaStream }[] = []
 
   constructor(
     roomId: number,
@@ -120,17 +122,14 @@ export class SFUConnection {
 
       console.log('[WebRTC] Received remote track:', track.kind, 'SSRC:', ssrc, 'StreamID:', stream.id)
 
-      // 尝试从 SSRC 映射获取 UserID
       const mappedUserId = this.ssrcToUserId.get(ssrc)
-
       if (mappedUserId !== undefined) {
-        // 有 SSRC 映射，正确关联到用户
         this.onRemoteTrack(mappedUserId, track, stream)
-      } else {
-        // 暂未收到 SSRC 映射，暂存到 userId=0
-        // VideoGrid 会按成员顺序分配显示
-        this.onRemoteTrack(0, track, stream)
+        return
       }
+
+      this.pendingRemoteTracks.push({ ssrc, track, stream })
+      this.onRemoteTrack(0, track, stream)
     }
 
     this.pc.oniceconnectionstatechange = () => {
@@ -213,9 +212,13 @@ export class SFUConnection {
       console.log('[WebRTC] Attempting reconnect...')
       if (this.localStream) {
         this.refreshSFUToken()
-          .then(() => this.connect(this.localStream!))
+          .then(() => {
+            this.closeTransport()
+            return this.connect(this.localStream!)
+          })
           .catch((err) => {
             console.error('[WebRTC] Reconnect failed:', err)
+            this.onError('媒体重连失败，请刷新页面重试')
           })
       }
     }, this.reconnectDelay)
@@ -238,6 +241,12 @@ export class SFUConnection {
             sdp: message.sdp,
           })
           console.log('[WebRTC] Remote description set')
+        }
+        break
+      case 'offer':
+        console.log('[WebRTC] Received renegotiation offer from SFU')
+        if (message.sdp) {
+          await this.handleRemoteOffer(message.sdp)
         }
         break
       case 'ice-candidate':
@@ -276,21 +285,46 @@ export class SFUConnection {
   }
 
   private async createAndSendOffer() {
-    if (!this.pc) return
+    return this.queueNegotiation(async () => {
+      if (!this.pc) return
 
-    const offer = await this.pc.createOffer({
-      offerToReceiveAudio: true,
-      offerToReceiveVideo: true,
-    })
-    await this.pc.setLocalDescription(offer)
+      const offer = await this.pc.createOffer({
+        offerToReceiveAudio: true,
+        offerToReceiveVideo: true,
+      })
+      await this.pc.setLocalDescription(offer)
 
-    console.log('[WebRTC] Sending offer to SFU')
-    this.send({
-      type: 'offer',
-      room_id: this.roomId,
-      user_id: this.userId,
-      sdp: offer.sdp,
+      console.log('[WebRTC] Sending offer to SFU')
+      this.send({
+        type: 'offer',
+        room_id: this.roomId,
+        user_id: this.userId,
+        sdp: offer.sdp,
+      })
     })
+  }
+
+  private async handleRemoteOffer(sdp: string) {
+    return this.queueNegotiation(async () => {
+      if (!this.pc) return
+      await this.pc.setRemoteDescription({ type: 'offer', sdp })
+      const answer = await this.pc.createAnswer()
+      await this.pc.setLocalDescription(answer)
+      this.send({
+        type: 'answer',
+        room_id: this.roomId,
+        user_id: this.userId,
+        sdp: answer.sdp,
+      })
+    })
+  }
+
+  private queueNegotiation(operation: () => Promise<void>) {
+    this.negotiationPromise = this.negotiationPromise.then(operation).catch((error) => {
+      console.error('[WebRTC] Negotiation failed:', error)
+      this.onError('WebRTC negotiation failed')
+    })
+    return this.negotiationPromise
   }
 
   private sendIceCandidate(candidate: RTCIceCandidate) {
@@ -328,8 +362,12 @@ export class SFUConnection {
       this.reconnectTimer = null
     }
 
+    this.closeTransport()
+  }
+
+  private closeTransport() {
     if (this.ws) {
-      this.ws.close(1000, 'User disconnected')
+      this.ws.close(1000, 'Connection reset')
       this.ws = null
     }
 
@@ -338,7 +376,11 @@ export class SFUConnection {
       this.pc = null
     }
 
+    this.iceCandidates = []
     this.remoteStreams.clear()
+    this.ssrcToUserId.clear()
+    this.pendingRemoteTracks = []
+    this.negotiationPromise = Promise.resolve()
   }
 
   muteAudio(muted: boolean) {
@@ -371,6 +413,7 @@ export class SFUConnection {
     if (!this.pc) return
     this.pc.addTrack(newTrack, stream)
     this.screenStream = stream
+    await this.createAndSendOffer()
   }
 
   // 移除屏幕共享轨道
@@ -383,6 +426,7 @@ export class SFUConnection {
       }
     }
     this.screenStream = null
+    await this.createAndSendOffer()
   }
 
   // 设置 SSRC 到 UserID 的映射（由 SFU 信令调用）
@@ -395,6 +439,12 @@ export class SFUConnection {
   setSsrcMappings(mappings: { ssrc: number; userId: number }[]) {
     mappings.forEach(({ ssrc, userId }) => {
       this.ssrcToUserId.set(ssrc, userId)
+    })
+    this.pendingRemoteTracks = this.pendingRemoteTracks.filter(({ ssrc, track, stream }) => {
+      const userId = this.ssrcToUserId.get(ssrc)
+      if (userId === undefined) return true
+      this.onRemoteTrack(userId, track, stream)
+      return false
     })
     console.log(`[WebRTC] Bulk SSRC mappings set: ${mappings.length} entries`)
   }

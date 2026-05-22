@@ -50,7 +50,13 @@ const base64ToArrayBuffer = (base64: string): ArrayBuffer => {
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i)
   }
-  return bytes.buffer
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength)
+}
+
+const toArrayBuffer = (bytes: Uint8Array): ArrayBuffer => {
+  const buffer = new ArrayBuffer(bytes.byteLength)
+  new Uint8Array(buffer).set(bytes)
+  return buffer
 }
 
 const textEncode = (text: string): Uint8Array => new TextEncoder().encode(text)
@@ -65,7 +71,7 @@ export const pbkdf2Derive = async (
 ): Promise<CryptoKey> => {
   const passwordKey = await crypto.subtle.importKey(
     'raw',
-    textEncode(password),
+    toArrayBuffer(textEncode(password)),
     { name: 'PBKDF2' },
     false,
     ['deriveKey']
@@ -169,8 +175,8 @@ const ratchetStep = async (chainKey: string): Promise<{ nextChainKey: string; me
   const chainKeyBuffer = base64ToArrayBuffer(chainKey)
   const zeroSalt = new Uint8Array(32)
 
-  const messageKeyBuffer = await hkdfDerive(zeroSalt, chainKeyBuffer, 'message', 32)
-  const nextChainKeyBuffer = await hkdfDerive(zeroSalt, chainKeyBuffer, 'chain', 32)
+  const messageKeyBuffer = await hkdfDerive(toArrayBuffer(zeroSalt), chainKeyBuffer, 'message', 32)
+  const nextChainKeyBuffer = await hkdfDerive(toArrayBuffer(zeroSalt), chainKeyBuffer, 'chain', 32)
 
   return {
     nextChainKey: arrayBufferToBase64(nextChainKeyBuffer),
@@ -184,8 +190,8 @@ const aesEncrypt = async (plaintext: string, keyBase64: string): Promise<{ ciphe
   const keyBuffer = base64ToArrayBuffer(keyBase64)
   const key = await crypto.subtle.importKey('raw', keyBuffer, { name: 'AES-GCM' }, false, ['encrypt'])
   const iv = crypto.getRandomValues(new Uint8Array(12))
-  const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, textEncode(plaintext))
-  return { ciphertext: arrayBufferToBase64(encrypted), iv: arrayBufferToBase64(iv) }
+  const encrypted = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: toArrayBuffer(iv) }, key, toArrayBuffer(textEncode(plaintext)))
+  return { ciphertext: arrayBufferToBase64(encrypted), iv: arrayBufferToBase64(toArrayBuffer(iv)) }
 }
 
 const aesDecrypt = async (ciphertext: string, iv: string, keyBase64: string): Promise<string> => {
@@ -209,7 +215,7 @@ const getOrCreateSalt = (): ArrayBuffer => {
   let saltBase64 = localStorage.getItem(STORAGE_SALT)
   if (!saltBase64) {
     const salt = crypto.getRandomValues(new Uint8Array(16))
-    saltBase64 = arrayBufferToBase64(salt)
+    saltBase64 = arrayBufferToBase64(toArrayBuffer(salt))
     localStorage.setItem(STORAGE_SALT, saltBase64)
   }
   return base64ToArrayBuffer(saltBase64)
@@ -301,7 +307,7 @@ export class GroupE2EEManager {
     this.identityKeyPair = await generateKeyPair()
     console.log('[E2EE] New identity key pair generated')
 
-    const initialChainKey = arrayBufferToBase64(crypto.getRandomValues(new Uint8Array(32)))
+    const initialChainKey = arrayBufferToBase64(toArrayBuffer(crypto.getRandomValues(new Uint8Array(32))))
     this.mySenderChain = {
       chainKey: initialChainKey,
       messageNumber: 0,
@@ -534,7 +540,7 @@ export class GroupE2EEManager {
 
     // 尝试处理所有可以解密的消息
     const toProcess = [...pending]
-    for (const { msg, resolve, reject } of toProcess) {
+    for (const { msg, resolve } of toProcess) {
       try {
         await this.ratchetToTarget(senderId, msg.messageNumber)
         const { messageKey } = await ratchetStep(chain.chainKey)

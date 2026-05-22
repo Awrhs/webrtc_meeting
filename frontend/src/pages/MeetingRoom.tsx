@@ -14,7 +14,7 @@ import {
   LogoutOutlined,
 } from '@ant-design/icons'
 import { RootState, AppDispatch } from '@/store'
-import { joinRoom, getRoomMessages, addMessage, setConnected, clearCurrentRoom, updateMember, removeMember, kickMember, muteMember, setAdmin, transferOwner, lockRoom, deleteRoom } from '@/store/slices/roomSlice'
+import { joinRoom, getRoomMessages, addMessage, setConnected, clearCurrentRoom, updateMember, removeMember, lockRoom, deleteRoom } from '@/store/slices/roomSlice'
 import { api } from '@/utils/api'
 import { SignalingClient } from '@/utils/signaling'
 import { getMediaStream, SFUConnection } from '@/utils/webrtc'
@@ -49,17 +49,9 @@ export default function MeetingRoom() {
   const [, forceUpdate] = useState({})
 
   const currentUserId = user?.id || 0
-  const currentMember = members.find(m => m.user_id === currentUserId)
 
-  // 基于权限的功能检查
-  const canKick = myPermissions.includes('kick_member')
-  const canMute = myPermissions.includes('mute_member')
-  const canSetAdmin = myPermissions.includes('set_admin')
   const canLockRoom = myPermissions.includes('lock_room')
   const canDeleteRoom = myPermissions.includes('delete_room')
-  const canTransferOwner = myPermissions.includes('transfer_owner')
-  const isOwner = currentMember?.role === 'owner'
-  const isAdmin = currentMember?.role === 'admin' || isOwner
 
   useEffect(() => {
     const verifyCode = searchParams.get('verify') || ''
@@ -140,8 +132,8 @@ export default function MeetingRoom() {
           if (member) {
             dispatch(updateMember({
               ...member,
-              is_audio_on: msg.data.is_audio_on,
-              is_video_on: msg.data.is_video_on,
+              is_audio_on: msg.data.audio_enabled,
+              is_video_on: msg.data.video_enabled,
             }))
           }
         }
@@ -251,36 +243,28 @@ export default function MeetingRoom() {
         sfuConnectionRef.current.muteVideo(videoOn)
       }
     }
-    setVideoOn(!videoOn)
-
-    if (signalingRef.current && currentRoom) {
-      signalingRef.current.send({
-        type: 'media_state',
-        room_id: currentRoom.id,
-        user_id: currentUserId,
-        data: { video_on: !videoOn, audio_on: audioOn },
-      })
-    }
+    const nextVideoOn = !videoOn
+    setVideoOn(nextVideoOn)
 
     if (currentRoom) {
-      api.put(`/api/v1/rooms/${currentRoom.id}/media-state`, { video_on: !videoOn })
+      api.put(`/api/v1/rooms/${currentRoom.id}/media-state`, { video_enabled: nextVideoOn }).catch(() => {
+        message.error('视频状态同步失败')
+      })
     }
   }
 
-  const toggleAudio = () => {
+  const toggleAudio = async () => {
     if (!localStreamRef.current) return
     // 使用 SFUConnection.muteAudio
     if (sfuConnectionRef.current) {
       sfuConnectionRef.current.muteAudio(audioOn)
     }
-    setAudioOn(!audioOn)
+    const nextAudioOn = !audioOn
+    setAudioOn(nextAudioOn)
 
-    if (signalingRef.current && currentRoom) {
-      signalingRef.current.send({
-        type: 'media_state',
-        room_id: currentRoom.id,
-        user_id: currentUserId,
-        data: { video_on: videoOn, audio_on: !audioOn },
+    if (currentRoom) {
+      api.put(`/api/v1/rooms/${currentRoom.id}/media-state`, { audio_enabled: nextAudioOn }).catch(() => {
+        message.error('音频状态同步失败')
       })
     }
   }
@@ -296,7 +280,7 @@ export default function MeetingRoom() {
         setScreenStream(screenStream)
         const videoTrack = screenStream.getVideoTracks()[0]
         videoTrack.onended = () => {
-          stopScreenShare()
+          void stopScreenShare()
         }
 
         // 使用 SFUConnection.addVideoTrack 添加屏幕共享轨道
@@ -311,11 +295,11 @@ export default function MeetingRoom() {
         message.error('无法开启屏幕共享')
       }
     } else {
-      stopScreenShare()
+      await stopScreenShare()
     }
   }
 
-  const stopScreenShare = () => {
+  const stopScreenShare = async () => {
     if (screenStreamRef.current) {
       screenStreamRef.current.getTracks().forEach(track => track.stop())
       screenStreamRef.current = null
@@ -323,7 +307,7 @@ export default function MeetingRoom() {
 
     // 移除屏幕共享轨道
     if (sfuConnectionRef.current) {
-      sfuConnectionRef.current.removeScreenTrack()
+      await sfuConnectionRef.current.removeScreenTrack()
     }
 
     setScreenStream(null)

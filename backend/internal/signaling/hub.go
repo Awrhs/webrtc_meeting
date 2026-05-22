@@ -5,6 +5,7 @@ import (
 	"conference-sfu/backend/internal/service"
 	"encoding/json"
 	"net/http"
+	"sync"
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -13,27 +14,28 @@ import (
 type MessageType string
 
 const (
-	MessageTypeJoinRoom      MessageType = "join_room"
-	MessageTypeLeaveRoom     MessageType = "leave_room"
-	MessageTypeOffer         MessageType = "offer"
-	MessageTypeAnswer        MessageType = "answer"
-	MessageTypeIceCandidate  MessageType = "ice_candidate"
-	MessageTypeChatMessage   MessageType = "chat_message"
-	MessageTypeUserJoined    MessageType = "user_joined"
-	MessageTypeUserLeft      MessageType = "user_left"
-	MessageTypeKicked        MessageType = "kicked"
-	MessageTypeMuted         MessageType = "muted"
-	MessageTypeRoleChanged   MessageType = "role_changed"
-	MessageTypeMediaState    MessageType = "media_state"
+	MessageTypeJoinRoom         MessageType = "join_room"
+	MessageTypeLeaveRoom        MessageType = "leave_room"
+	MessageTypeOffer            MessageType = "offer"
+	MessageTypeAnswer           MessageType = "answer"
+	MessageTypeIceCandidate     MessageType = "ice_candidate"
+	MessageTypeChatMessage      MessageType = "chat_message"
+	MessageTypeUserJoined       MessageType = "user_joined"
+	MessageTypeUserLeft         MessageType = "user_left"
+	MessageTypeKicked           MessageType = "kicked"
+	MessageTypeMuted            MessageType = "muted"
+	MessageTypeRoleChanged      MessageType = "role_changed"
+	MessageTypeMediaState       MessageType = "media_state"
 	MessageTypeConnectionFailed MessageType = "connection_failed"
+	MessageTypePublicKey        MessageType = "public_key"
 )
 
 type Message struct {
-	Type       MessageType     `json:"type"`
-	RoomID     uint            `json:"room_id,omitempty"`
-	UserID     uint            `json:"user_id,omitempty"`
-	TargetID   uint            `json:"target_id,omitempty"`
-	Data       json.RawMessage `json:"data,omitempty"`
+	Type     MessageType     `json:"type"`
+	RoomID   uint            `json:"room_id,omitempty"`
+	UserID   uint            `json:"user_id,omitempty"`
+	TargetID uint            `json:"target_id,omitempty"`
+	Data     json.RawMessage `json:"data,omitempty"`
 }
 
 type Client struct {
@@ -42,6 +44,7 @@ type Client struct {
 	send    chan []byte
 	userID  uint
 	roomIDs map[uint]bool
+	mu      sync.RWMutex
 }
 
 type Hub struct {
@@ -51,27 +54,28 @@ type Hub struct {
 	rooms map[uint]map[uint]*Client
 
 	// Channel用于序列化所有操作（不需要互斥锁）
-	register   chan *Client
-	unregister chan *Client
-	broadcast  chan *BroadcastMessage
-	sendToUser chan *UserMessage
-	addToRoom  chan *RoomClientAction
+	register       chan *Client
+	unregister     chan *Client
+	broadcast      chan *BroadcastMessage
+	sendToUser     chan *UserMessage
+	addToRoom      chan *RoomClientAction
 	removeFromRoom chan *RoomClientAction
 
-	roomService service.RoomService
-	chatService service.ChatService
-	logger      *zap.Logger
+	roomService    service.RoomService
+	chatService    service.ChatService
+	allowedOrigins []string
+	logger         *zap.Logger
 }
 
 type RoomClientAction struct {
-	Client  *Client
-	RoomID  uint
+	Client *Client
+	RoomID uint
 }
 
 type BroadcastMessage struct {
-	RoomID         uint
-	Message        []byte
-	ExcludeUserID  uint
+	RoomID        uint
+	Message       []byte
+	ExcludeUserID uint
 }
 
 type UserMessage struct {
@@ -83,11 +87,11 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		return r.Header.Get("Origin") == ""
 	},
 }
 
-func NewHub(roomService service.RoomService, chatService service.ChatService, logger *zap.Logger) *Hub {
+func NewHub(roomService service.RoomService, chatService service.ChatService, allowedOrigins []string, logger *zap.Logger) *Hub {
 	return &Hub{
 		clients:        make(map[uint]*Client),
 		rooms:          make(map[uint]map[uint]*Client),
@@ -99,6 +103,7 @@ func NewHub(roomService service.RoomService, chatService service.ChatService, lo
 		removeFromRoom: make(chan *RoomClientAction),
 		roomService:    roomService,
 		chatService:    chatService,
+		allowedOrigins: allowedOrigins,
 		logger:         logger,
 	}
 }
@@ -113,8 +118,7 @@ func (h *Hub) Run() {
 
 		case client := <-h.unregister:
 			if _, ok := h.clients[client.userID]; ok {
-				// 从所有房间移除
-				for roomID := range client.roomIDs {
+				for _, roomID := range client.joinedRoomIDs() {
 					h.removeClientFromRoomNoLock(client, roomID)
 				}
 				delete(h.clients, client.userID)
@@ -152,7 +156,7 @@ func (h *Hub) Run() {
 				h.rooms[action.RoomID] = make(map[uint]*Client)
 			}
 			h.rooms[action.RoomID][action.Client.userID] = action.Client
-			action.Client.roomIDs[action.RoomID] = true
+			action.Client.setRoomJoined(action.RoomID, true)
 			h.logger.Info("Client added to room", zap.Uint("userID", action.Client.userID), zap.Uint("roomID", action.RoomID))
 
 		case action := <-h.removeFromRoom:
@@ -207,12 +211,61 @@ func (h *Hub) removeClientFromRoomNoLock(client *Client, roomID uint) {
 	if room, ok := h.rooms[roomID]; ok {
 		if _, ok := room[client.userID]; ok {
 			delete(room, client.userID)
-			client.roomIDs[roomID] = false
+			client.setRoomJoined(roomID, false)
 			if len(room) == 0 {
 				delete(h.rooms, roomID)
 			}
 		}
 	}
+}
+
+func (c *Client) setRoomJoined(roomID uint, joined bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if joined {
+		c.roomIDs[roomID] = true
+		return
+	}
+	delete(c.roomIDs, roomID)
+}
+
+func (c *Client) isRoomJoined(roomID uint) bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.roomIDs[roomID]
+}
+
+func (c *Client) joinedRoomIDs() []uint {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	roomIDs := make([]uint, 0, len(c.roomIDs))
+	for roomID := range c.roomIDs {
+		roomIDs = append(roomIDs, roomID)
+	}
+	return roomIDs
+}
+
+func (c *Client) isActiveRoomMember(roomID uint) bool {
+	_, err := c.hub.roomService.GetMemberRole(roomID, c.userID)
+	return err == nil
+}
+
+func (c *Client) isActiveTargetMember(roomID, targetID uint) bool {
+	_, err := c.hub.roomService.GetMemberRole(roomID, targetID)
+	return err == nil
+}
+
+func (h *Hub) originAllowed(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	for _, allowed := range h.allowedOrigins {
+		if allowed == origin {
+			return true
+		}
+	}
+	return false
 }
 
 // ==================== 业务方法 ====================
@@ -301,10 +354,10 @@ func (h *Hub) BroadcastMessage(roomID uint, message *models.Message, receiverID 
 	if receiverID != nil {
 		data, _ := json.Marshal(message)
 		msg := Message{
-			Type:     MessageTypeChatMessage,
-			RoomID:   roomID,
-			UserID:   message.SenderID,
-			Data:     json.RawMessage(data),
+			Type:   MessageTypeChatMessage,
+			RoomID: roomID,
+			UserID: message.SenderID,
+			Data:   json.RawMessage(data),
 		}
 		raw, _ := json.Marshal(msg)
 		h.SendToUser(message.SenderID, raw)
@@ -349,22 +402,36 @@ func (c *Client) ReadPump() {
 }
 
 func (c *Client) handleMessage(msg *Message) {
+	msg.UserID = c.userID
+
 	switch msg.Type {
 	case MessageTypeJoinRoom:
+		if msg.RoomID == 0 || !c.isActiveRoomMember(msg.RoomID) {
+			c.hub.logger.Warn("Unauthorized signaling room join", zap.Uint("userID", c.userID), zap.Uint("roomID", msg.RoomID))
+			return
+		}
 		c.hub.AddClientToRoom(c, msg.RoomID)
 		c.hub.BroadcastUserJoined(msg.RoomID, c.userID)
 	case MessageTypeLeaveRoom:
+		if !c.isRoomJoined(msg.RoomID) {
+			return
+		}
 		c.hub.RemoveClientFromRoom(c, msg.RoomID)
 		c.hub.BroadcastUserLeft(msg.RoomID, c.userID)
-	case MessageTypeOffer, MessageTypeAnswer, MessageTypeIceCandidate:
+	case MessageTypeOffer, MessageTypeAnswer, MessageTypeIceCandidate, MessageTypeMediaState, MessageTypePublicKey:
+		if msg.RoomID == 0 || !c.isRoomJoined(msg.RoomID) || !c.isActiveRoomMember(msg.RoomID) {
+			c.hub.logger.Warn("Unauthorized signaling message", zap.Uint("userID", c.userID), zap.Uint("roomID", msg.RoomID), zap.String("type", string(msg.Type)))
+			return
+		}
 		if msg.TargetID != 0 {
+			if !c.isActiveTargetMember(msg.RoomID, msg.TargetID) {
+				c.hub.logger.Warn("Unauthorized signaling target", zap.Uint("userID", c.userID), zap.Uint("roomID", msg.RoomID), zap.Uint("targetID", msg.TargetID), zap.String("type", string(msg.Type)))
+				return
+			}
 			data, _ := json.Marshal(msg)
 			c.hub.SendToUser(msg.TargetID, data)
-		} else {
-			data, _ := json.Marshal(msg)
-			c.hub.BroadcastToRoom(msg.RoomID, data, c.userID)
+			return
 		}
-	case MessageTypeMediaState:
 		data, _ := json.Marshal(msg)
 		c.hub.BroadcastToRoom(msg.RoomID, data, c.userID)
 	}
@@ -382,7 +449,14 @@ func (c *Client) WritePump() {
 }
 
 func HandleWebSocket(hub *Hub, w http.ResponseWriter, r *http.Request, userID uint, logger *zap.Logger) {
-	conn, err := upgrader.Upgrade(w, r, nil)
+	if !hub.originAllowed(r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+
+	wsUpgrader := upgrader
+	wsUpgrader.CheckOrigin = hub.originAllowed
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		logger.Error("Failed to upgrade websocket", zap.Error(err))
 		return

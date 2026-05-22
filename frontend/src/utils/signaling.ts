@@ -152,7 +152,7 @@ export class SignalingClient {
 
   // 检查是否与某用户有共享密钥
   hasE2EEKey(userId: number): boolean {
-    return groupE2EEManager.isReady()
+    return this.roomMembers.has(userId) && groupE2EEManager.isReady()
   }
 
   on(type: string, handler: (data: any) => void) {

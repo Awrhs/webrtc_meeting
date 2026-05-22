@@ -3,11 +3,12 @@ package service
 import (
 	"conference-sfu/backend/internal/models"
 	"conference-sfu/backend/internal/repository"
+	"errors"
 )
 
 type ChatService interface {
 	SendMessage(senderID uint, roomID uint, receiverID *uint, msgType models.MessageType, content string) (*models.Message, error)
-	GetMessages(roomID uint, limit, offset int) ([]*models.MessageResponse, error)
+	GetMessages(requesterID uint, roomID uint, limit, offset int) ([]*models.MessageResponse, error)
 	GetPrivateMessages(roomID uint, userID, otherID uint, limit, offset int) ([]*models.MessageResponse, error)
 	SavePublicKey(userID uint, publicKey, keyType string) error
 	GetPublicKey(userID uint) (*models.E2EEGetPublicKeyResponse, error)
@@ -15,7 +16,7 @@ type ChatService interface {
 }
 
 type chatService struct {
-	repo  repository.ChatRepository
+	repo     repository.ChatRepository
 	roomRepo repository.RoomRepository
 }
 
@@ -24,6 +25,13 @@ func NewChatService(repo repository.ChatRepository, roomRepo repository.RoomRepo
 }
 
 func (s *chatService) SendMessage(senderID uint, roomID uint, receiverID *uint, msgType models.MessageType, content string) (*models.Message, error) {
+	if !s.isActiveRoomMember(roomID, senderID) {
+		return nil, errors.New("permission denied")
+	}
+	if receiverID != nil && !s.isActiveRoomMember(roomID, *receiverID) {
+		return nil, errors.New("receiver is not in room")
+	}
+
 	message := &models.Message{
 		RoomID:     roomID,
 		SenderID:   senderID,
@@ -37,7 +45,11 @@ func (s *chatService) SendMessage(senderID uint, roomID uint, receiverID *uint, 
 	return message, err
 }
 
-func (s *chatService) GetMessages(roomID uint, limit, offset int) ([]*models.MessageResponse, error) {
+func (s *chatService) GetMessages(requesterID uint, roomID uint, limit, offset int) ([]*models.MessageResponse, error) {
+	if !s.isActiveRoomMember(roomID, requesterID) {
+		return nil, errors.New("permission denied")
+	}
+
 	messages, err := s.repo.GetMessages(roomID, limit, offset)
 	if err != nil {
 		return nil, err
@@ -47,12 +59,21 @@ func (s *chatService) GetMessages(roomID uint, limit, offset int) ([]*models.Mes
 }
 
 func (s *chatService) GetPrivateMessages(roomID uint, userID, otherID uint, limit, offset int) ([]*models.MessageResponse, error) {
+	if !s.isActiveRoomMember(roomID, userID) || !s.isActiveRoomMember(roomID, otherID) {
+		return nil, errors.New("permission denied")
+	}
+
 	messages, err := s.repo.GetPrivateMessages(roomID, userID, otherID, limit, offset)
 	if err != nil {
 		return nil, err
 	}
 
 	return s.convertToResponse(messages), nil
+}
+
+func (s *chatService) isActiveRoomMember(roomID uint, userID uint) bool {
+	_, err := s.roomRepo.GetMember(roomID, userID)
+	return err == nil
 }
 
 func (s *chatService) convertToResponse(messages []*models.Message) []*models.MessageResponse {

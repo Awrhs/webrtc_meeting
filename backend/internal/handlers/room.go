@@ -38,6 +38,7 @@ func (h *Handler) GetMyRooms(c *gin.Context) {
 }
 
 func (h *Handler) GetRoom(c *gin.Context) {
+	userID := GetUserID(c)
 	idStr := c.Param("id")
 	id, err := strconv.Atoi(idStr)
 	if err != nil {
@@ -48,6 +49,11 @@ func (h *Handler) GetRoom(c *gin.Context) {
 	room, err := h.roomService.GetRoomByID(uint(id))
 	if err != nil {
 		c.JSON(http.StatusNotFound, gin.H{"error": "room not found"})
+		return
+	}
+
+	if _, err := h.roomService.GetMemberRole(room.ID, userID); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "permission denied"})
 		return
 	}
 
@@ -72,7 +78,16 @@ func (h *Handler) GetRoomByNumber(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"room": room})
+	c.JSON(http.StatusOK, gin.H{"room": gin.H{
+		"id":           room.ID,
+		"room_id":      room.RoomID,
+		"name":         room.Name,
+		"topic":        room.Topic,
+		"max_members":  room.MaxMembers,
+		"current_size": room.CurrentSize,
+		"is_locked":    room.IsLocked,
+		"auth_type":    room.AuthType,
+	}})
 }
 
 func (h *Handler) JoinRoom(c *gin.Context) {
@@ -392,14 +407,42 @@ func (h *Handler) UpdateMediaState(c *gin.Context) {
 	}
 
 	var req struct {
-		VideoEnabled bool `json:"video_enabled"`
-		AudioEnabled bool `json:"audio_enabled"`
+		VideoEnabled *bool `json:"video_enabled"`
+		AudioEnabled *bool `json:"audio_enabled"`
 	}
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if req.VideoEnabled == nil && req.AudioEnabled == nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "missing media state"})
+		return
+	}
 
-	h.hub.BroadcastMediaState(uint(roomID), userID, req.VideoEnabled, req.AudioEnabled)
-	c.JSON(http.StatusOK, gin.H{"message": "media state updated"})
+	if _, err := h.roomService.GetMemberRole(uint(roomID), userID); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "permission denied"})
+		return
+	}
+	if err := h.roomService.UpdateMediaState(uint(roomID), userID, req.VideoEnabled, req.AudioEnabled); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	videoEnabled := false
+	audioEnabled := false
+	members, err := h.roomService.GetRoomMembersInfo(uint(roomID))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	for _, roomMember := range members {
+		if roomMember != nil && roomMember.UserID == userID {
+			videoEnabled = roomMember.IsVideoOn
+			audioEnabled = roomMember.IsAudioOn
+			break
+		}
+	}
+
+	h.hub.BroadcastMediaState(uint(roomID), userID, videoEnabled, audioEnabled)
+	c.JSON(http.StatusOK, gin.H{"message": "media state updated", "video_enabled": videoEnabled, "audio_enabled": audioEnabled})
 }

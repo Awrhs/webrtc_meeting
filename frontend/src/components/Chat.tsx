@@ -6,11 +6,10 @@ import {
   LockOutlined,
   InfoCircleOutlined,
   SafetyCertificateOutlined,
-  ReloadOutlined,
 } from '@ant-design/icons'
 import { RootState } from '@/store'
 import { Message } from '@/types'
-import { groupE2EEManager, EncryptedMessage, getPublicKeyFingerprint } from '@/utils/encryption'
+import { groupE2EEManager, EncryptedMessage } from '@/utils/encryption'
 
 interface ChatProps {
   roomId: number
@@ -232,7 +231,6 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
         </Space.Compact>
       </div>
 
-      {/* 指纹验证弹窗 */}
       <Modal
         title="安全指纹验证"
         open={fingerprintModalVisible}
@@ -267,9 +265,18 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
 
         <div style={{ marginTop: 24 }}>
           <h4 style={{ marginBottom: 12 }}>其他成员：</h4>
-          <div style={{ color: '#999', fontSize: 12 }}>
-            其他成员加入后，他们的指纹会显示在这里。
-          </div>
+          {memberFingerprints.filter(item => item.userId !== user?.id).length > 0 ? (
+            memberFingerprints.filter(item => item.userId !== user?.id).map(item => (
+              <div key={item.userId} style={{ marginBottom: 8 }}>
+                <span>{item.name}</span>
+                <Tag style={{ marginLeft: 8 }}>{item.fingerprint}</Tag>
+              </div>
+            ))
+          ) : (
+            <div style={{ color: '#999', fontSize: 12 }}>
+              其他成员加入后，他们的指纹会显示在这里。
+            </div>
+          )}
         </div>
       </Modal>
     </div>

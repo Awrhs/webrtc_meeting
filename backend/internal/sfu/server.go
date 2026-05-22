@@ -258,6 +258,7 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 			otherPeer.addedTracks[subKey] = true
 			otherPeer.Subscriptions[peer.UserID] = append(otherPeer.Subscriptions[peer.UserID], sender)
 			otherPeer.mu.Unlock()
+			s.startRTCPReadLoop(otherPeer, sender, peer.UserID, trackKey)
 
 			s.logger.Debug("Track subscribed",
 				zap.Uint("from", peer.UserID),
@@ -391,6 +392,54 @@ func (s *SFUServer) doRenegotiate(peer *Peer) {
 	s.logger.Info("Sent renegotiation offer", zap.Uint("userID", peer.UserID))
 }
 
+func (s *SFUServer) startRTCPReadLoop(peer *Peer, sender *webrtc.RTPSender, fromUserID uint, trackKey string) {
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			if _, _, err := sender.Read(buf); err != nil {
+				s.logger.Debug("RTCP read loop ended",
+					zap.Uint("toUser", peer.UserID),
+					zap.Uint("fromUser", fromUserID),
+					zap.String("trackKey", trackKey),
+					zap.Error(err))
+				return
+			}
+		}
+	}()
+}
+
+func (s *SFUServer) cleanupPeerSubscriptions(room *Room, leavingUserID uint) {
+	for _, peer := range room.Peers {
+		if peer.UserID == leavingUserID {
+			continue
+		}
+
+		removed := false
+		peer.mu.Lock()
+		for _, sender := range peer.Subscriptions[leavingUserID] {
+			if err := peer.PC.RemoveTrack(sender); err != nil {
+				s.logger.Warn("Failed to remove subscribed track",
+					zap.Uint("fromUser", leavingUserID),
+					zap.Uint("toUser", peer.UserID),
+					zap.Error(err))
+			}
+			removed = true
+		}
+		delete(peer.Subscriptions, leavingUserID)
+		prefix := fmt.Sprintf("%d|", leavingUserID)
+		for key := range peer.addedTracks {
+			if strings.HasPrefix(key, prefix) {
+				delete(peer.addedTracks, key)
+			}
+		}
+		peer.mu.Unlock()
+
+		if removed {
+			s.triggerRenegotiation(peer)
+		}
+	}
+}
+
 // closePeer 安全地关闭 peer：关闭 renegotiation worker、writer goroutine、PC。
 // 幂等：基于 closeOnce，多次调用安全。
 func (s *SFUServer) closePeer(peer *Peer) {
@@ -402,6 +451,10 @@ func (s *SFUServer) onConnectionStateChange(room *Room, peer *Peer, state webrtc
 	if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
 		room.mu.Lock()
 		defer room.mu.Unlock()
+		if _, ok := room.Peers[peer.UserID]; !ok {
+			return
+		}
+		s.cleanupPeerSubscriptions(room, peer.UserID)
 		delete(room.Peers, peer.UserID)
 		s.closePeer(peer)
 
@@ -493,7 +546,9 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := upgrader.Upgrade(w, r, nil)
+	wsUpgrader := upgrader
+	wsUpgrader.CheckOrigin = s.originAllowed
+	conn, err := wsUpgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.logger.Error("Failed to upgrade websocket", zap.Error(err))
 		return
@@ -681,6 +736,7 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 				if err == nil {
 					peer.addedTracks[subKey] = true
 					peer.Subscriptions[existingPeer.UserID] = append(peer.Subscriptions[existingPeer.UserID], sender)
+					s.startRTCPReadLoop(peer, sender, existingPeer.UserID, trackKey)
 					allSSRCs = append(allSSRCs, SSRC{
 						SSRC:     trackInfo.SSRC,
 						UserID:   existingPeer.UserID,
@@ -756,7 +812,12 @@ func (s *SFUServer) handleOffer(peer *Peer, msg *SignalingMessage) error {
 	}
 
 	// 关键修复：等待 ICE 收集完成，获取包含所有候选的完整 SDP
-	<-webrtc.GatheringCompletePromise(peer.PC)
+	gatheringDone := webrtc.GatheringCompletePromise(peer.PC)
+	select {
+	case <-gatheringDone:
+	case <-time.After(5 * time.Second):
+		s.logger.Warn("ICE gathering timed out, sending current local description", zap.Uint("user", peer.UserID))
+	}
 
 	completeAnswer := peer.PC.CurrentLocalDescription()
 	if completeAnswer == nil {
@@ -843,6 +904,7 @@ func (s *SFUServer) removePeer(roomID, userID uint) {
 		return
 	}
 
+	s.cleanupPeerSubscriptions(room, userID)
 	s.closePeer(peer)
 	delete(room.Peers, userID)
 
@@ -867,7 +929,7 @@ var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
 	CheckOrigin: func(r *http.Request) bool {
-		return true
+		return r.Header.Get("Origin") == ""
 	},
 }
 
@@ -943,10 +1005,8 @@ func (s *SFUServer) KickUser(roomID, userID uint, reason string) error {
 		return errors.New("peer not found in room")
 	}
 
-	// Close the peer connection (also stops the renegotiation worker)
+	s.cleanupPeerSubscriptions(room, userID)
 	s.closePeer(peer)
-
-	// Remove peer from room
 	delete(room.Peers, userID)
 
 	// Clean up empty room

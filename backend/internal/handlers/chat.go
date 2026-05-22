@@ -9,6 +9,7 @@ import (
 )
 
 func (h *Handler) GetMessages(c *gin.Context) {
+	userID := GetUserID(c)
 	idStr := c.Param("id")
 	roomID, err := strconv.Atoi(idStr)
 	if err != nil {
@@ -27,9 +28,9 @@ func (h *Handler) GetMessages(c *gin.Context) {
 		offset = 0
 	}
 
-	messages, err := h.chatService.GetMessages(uint(roomID), limit, offset)
+	messages, err := h.chatService.GetMessages(userID, uint(roomID), limit, offset)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
 
@@ -46,9 +47,9 @@ func (h *Handler) SendMessage(c *gin.Context) {
 	}
 
 	var req struct {
-		ReceiverID *uint               `json:"receiver_id"`
-		Type       models.MessageType  `json:"type"`
-		Content    string              `json:"content" binding:"required"`
+		ReceiverID *uint              `json:"receiver_id"`
+		Type       models.MessageType `json:"type"`
+		Content    string             `json:"content" binding:"required"`
 	}
 
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -58,7 +59,7 @@ func (h *Handler) SendMessage(c *gin.Context) {
 
 	message, err := h.chatService.SendMessage(senderID, uint(roomID), req.ReceiverID, req.Type, req.Content)
 	if err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
 
