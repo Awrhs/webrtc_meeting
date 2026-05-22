@@ -3,11 +3,17 @@ package main
 import (
 	"conference-sfu/backend/internal/config"
 	"conference-sfu/backend/internal/handlers"
+	"conference-sfu/backend/internal/middleware"
 	"conference-sfu/backend/internal/repository"
 	"conference-sfu/backend/internal/service"
-	"conference-sfu/backend/internal/signaling"
 	"conference-sfu/backend/internal/sfu"
+	"conference-sfu/backend/internal/signaling"
 	"conference-sfu/backend/pkg/logger"
+	"context"
+	"net/http"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
@@ -32,11 +38,11 @@ func main() {
 	chatRepo := repository.NewChatRepository(db)
 
 	userService := service.NewUserService(userRepo, redisClient, cfg.JWTSecret)
-	roomService := service.NewRoomService(roomRepo, userRepo, redisClient)
+	roomService := service.NewRoomService(roomRepo, userRepo, redisClient, cfg.SFUJWTSecret, cfg.SFUTokenExpiryMinutes)
 	chatService := service.NewChatService(chatRepo, roomRepo)
 
 	// Connect to SFU gRPC control server
-	sfuClient, err := sfu.NewControlClient(cfg.SFUAddr, log)
+	sfuClient, err := sfu.NewControlClient(cfg.SFUAddr, cfg.SFUControlToken, log)
 	if err != nil {
 		log.Warn("Failed to connect to SFU gRPC server, running without SFU control", zap.Error(err))
 	} else {
@@ -48,24 +54,27 @@ func main() {
 	go hub.Run()
 
 	r := gin.Default()
+	authLimiter := middleware.NewIPLimiter(cfg.RateLimitAuthPerMinute, time.Minute)
+	apiLimiter := middleware.NewIPLimiter(cfg.RateLimitAPIPerMinute, time.Minute)
+	wsLimiter := middleware.NewIPLimiter(cfg.RateLimitWSPerMinute, time.Minute)
 
 	r.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"*"},
+		AllowOrigins:     cfg.AllowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 	}))
 
-	handler := handlers.NewHandler(userService, roomService, chatService, hub, sfuClient, log)
+	handler := handlers.NewHandler(userService, roomService, chatService, hub, sfuClient, cfg.SFUCallbackToken, log)
 
 	api := r.Group("/api/v1")
 	{
-		api.POST("/auth/register", handler.Register)
-		api.POST("/auth/login", handler.Login)
+		api.POST("/auth/register", authLimiter.Gin(), handler.Register)
+		api.POST("/auth/login", authLimiter.Gin(), handler.Login)
 
 		auth := api.Group("/")
-		auth.Use(handlers.AuthMiddleware(cfg.JWTSecret))
+		auth.Use(apiLimiter.Gin(), handlers.AuthMiddleware(cfg.JWTSecret))
 		{
 			auth.GET("/user/me", handler.GetMe)
 			auth.PUT("/user/profile", handler.UpdateProfile)
@@ -76,6 +85,7 @@ func main() {
 			auth.GET("/rooms/:id", handler.GetRoom)
 			auth.GET("/rooms/number/:number", handler.GetRoomByNumber)
 			auth.POST("/rooms/:id/join", handler.JoinRoom)
+			auth.POST("/rooms/:id/sfu-token", handler.GetSFUToken)
 			auth.DELETE("/rooms/:id", handler.DeleteRoom)
 			auth.POST("/rooms/:id/lock", handler.LockRoom)
 			auth.POST("/rooms/:id/unlock", handler.UnlockRoom)
@@ -101,7 +111,26 @@ func main() {
 		api.POST("/sfu/callback/:roomId/:userId/connection-failed", handler.NotifyConnectionFailed)
 	}
 
-	r.GET("/ws", func(c *gin.Context) {
+	r.GET("/healthz", func(c *gin.Context) {
+		c.String(http.StatusOK, "ok")
+	})
+	r.GET("/readyz", func(c *gin.Context) {
+		sqlDB, err := db.DB()
+		if err != nil || sqlDB.Ping() != nil || redisClient.Ping() != nil {
+			c.JSON(http.StatusServiceUnavailable, gin.H{"ready": false})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"ready": true})
+	})
+	r.GET("/metrics.json", func(c *gin.Context) {
+		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+	})
+
+	r.GET("/ws", wsLimiter.Gin(), func(c *gin.Context) {
+		if !originAllowed(c.Request, cfg.AllowedOrigins) {
+			c.Writer.WriteHeader(http.StatusForbidden)
+			return
+		}
 		token := c.Query("token")
 		if token == "" {
 			c.Writer.WriteHeader(401)
@@ -117,8 +146,39 @@ func main() {
 		signaling.HandleWebSocket(hub, c.Writer, c.Request, userID, log)
 	})
 
+	server := &http.Server{
+		Addr:         ":" + cfg.ServerPort,
+		Handler:      r,
+		ReadTimeout:  time.Duration(cfg.HTTPReadTimeoutSeconds) * time.Second,
+		WriteTimeout: time.Duration(cfg.HTTPWriteTimeoutSeconds) * time.Second,
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.ShutdownTimeoutSeconds)*time.Second)
+		defer cancel()
+		if err := server.Shutdown(shutdownCtx); err != nil {
+			log.Error("Failed to shutdown API server", zap.Error(err))
+		}
+	}()
+
 	log.Info("Server starting on port " + cfg.ServerPort)
-	if err = r.Run(":" + cfg.ServerPort); err != nil {
+	if err = server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatal("Failed to start server", zap.Error(err))
 	}
+}
+
+func originAllowed(r *http.Request, allowedOrigins []string) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	for _, allowed := range allowedOrigins {
+		if allowed == origin {
+			return true
+		}
+	}
+	return false
 }

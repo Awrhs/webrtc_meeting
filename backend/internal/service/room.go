@@ -1,6 +1,7 @@
 package service
 
 import (
+	"conference-sfu/backend/internal/auth"
 	"conference-sfu/backend/internal/models"
 	"conference-sfu/backend/internal/repository"
 	"errors"
@@ -31,17 +32,26 @@ type RoomService interface {
 	GetMemberPermissions(roomID uint, userID uint) ([]models.Permission, error)
 	GetMemberRole(roomID uint, userID uint) (models.Role, error)
 	UpdateMediaState(roomID uint, userID uint, videoOn, audioOn *bool) error
+	GenerateSFUToken(roomID uint, userID uint) (string, error)
 	LogAudit(roomID, userID uint, targetID *uint, action, details, ipAddress, userAgent string) error
 }
 
 type roomService struct {
-	roomRepo repository.RoomRepository
-	userRepo repository.UserRepository
-	redis    *repository.RedisClient
+	roomRepo              repository.RoomRepository
+	userRepo              repository.UserRepository
+	redis                 *repository.RedisClient
+	sfuJWTSecret          string
+	sfuTokenExpiryMinutes int
 }
 
-func NewRoomService(roomRepo repository.RoomRepository, userRepo repository.UserRepository, redis *repository.RedisClient) RoomService {
-	return &roomService{roomRepo: roomRepo, userRepo: userRepo, redis: redis}
+func NewRoomService(roomRepo repository.RoomRepository, userRepo repository.UserRepository, redis *repository.RedisClient, sfuJWTSecret string, sfuTokenExpiryMinutes int) RoomService {
+	return &roomService{
+		roomRepo:              roomRepo,
+		userRepo:              userRepo,
+		redis:                 redis,
+		sfuJWTSecret:          sfuJWTSecret,
+		sfuTokenExpiryMinutes: sfuTokenExpiryMinutes,
+	}
 }
 
 func (s *roomService) CreateRoom(ownerID uint, req *models.CreateRoomRequest) (*models.Room, error) {
@@ -245,10 +255,16 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 		return nil, err
 	}
 
+	sfuToken, err := s.GenerateSFUToken(room.ID, userID)
+	if err != nil {
+		return nil, err
+	}
+
 	return &models.JoinRoomResponse{
 		Room:        room,
 		Members:     membersInfo,
 		Permissions: permissions,
+		SFUToken:    sfuToken,
 	}, nil
 }
 
@@ -557,6 +573,21 @@ func (s *roomService) UpdateMediaState(roomID uint, userID uint, videoOn, audioO
 		member.IsAudioOn = *audioOn
 	}
 	return s.roomRepo.UpdateMember(member)
+}
+
+func (s *roomService) GenerateSFUToken(roomID uint, userID uint) (string, error) {
+	if _, err := s.roomRepo.GetMember(roomID, userID); err != nil {
+		return "", errors.New("permission denied")
+	}
+	isKicked, err := s.roomRepo.IsKicked(roomID, userID)
+	if err == nil && isKicked {
+		return "", errors.New("you are kicked from this room, please try again later")
+	}
+	expiresIn := time.Duration(s.sfuTokenExpiryMinutes) * time.Minute
+	if expiresIn <= 0 {
+		expiresIn = 5 * time.Minute
+	}
+	return auth.GenerateSFUJoinToken(userID, roomID, s.sfuJWTSecret, expiresIn)
 }
 
 func (s *roomService) LogAudit(roomID, userID uint, targetID *uint, action, details, ipAddress, userAgent string) error {

@@ -68,9 +68,9 @@ export default function MeetingRoom() {
     setLoading(true)
     dispatch(joinRoom({ id: id!, data: { verify_code: verifyCode } }))
       .unwrap()
-      .then(async () => {
+      .then(async (result) => {
         dispatch(getRoomMessages(roomId))
-        await joinMeeting()
+        await joinMeeting(result.sfu_token)
       })
       .catch((error) => {
         message.error(error)
@@ -86,7 +86,7 @@ export default function MeetingRoom() {
     }
   }, [id, dispatch])
 
-  const joinMeeting = async () => {
+  const joinMeeting = async (sfuToken: string) => {
     const token = localStorage.getItem('token')
     if (!token) return
 
@@ -165,6 +165,7 @@ export default function MeetingRoom() {
       const sfuConnection = new SFUConnection(
         parseInt(id!),
         currentUserId,
+        sfuToken,
         // 处理远程媒体流回调
         (userId: number, track: MediaStreamTrack, stream: MediaStream) => {
           console.log('[Meeting] Received remote track:', track.kind, 'from user', userId)

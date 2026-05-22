@@ -1,12 +1,12 @@
 package service
 
 import (
+	"conference-sfu/backend/internal/auth"
 	"conference-sfu/backend/internal/models"
 	"conference-sfu/backend/internal/repository"
 	"errors"
 	"time"
 
-	"github.com/golang-jwt/jwt/v5"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -157,31 +157,11 @@ func (s *userService) UpdatePassword(userID uint, oldPassword, newPassword strin
 }
 
 func (s *userService) ValidateToken(tokenStr string) (uint, error) {
-	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-		return []byte(s.jwtSecret), nil
-	})
-
-	if err != nil || !token.Valid {
-		return 0, errors.New("invalid token")
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return 0, errors.New("invalid token claims")
-	}
-
-	userID := uint(claims["user_id"].(float64))
-	return userID, nil
+	return auth.ValidateUserToken(tokenStr, s.jwtSecret)
 }
 
 func (s *userService) generateToken(userID uint) (string, error) {
-	claims := jwt.MapClaims{
-		"user_id": float64(userID),
-		"exp":     time.Now().Add(168 * time.Hour).Unix(),
-	}
-
-	token := jwt.NewWithClaims(jwt.SigningMethodHS256, claims)
-	return token.SignedString([]byte(s.jwtSecret))
+	return auth.GenerateUserToken(userID, s.jwtSecret, 168*time.Hour)
 }
 
 func contains(s string, c rune) bool {

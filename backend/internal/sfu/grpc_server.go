@@ -3,12 +3,14 @@ package sfu
 import (
 	"context"
 	"net"
+	"strings"
 
 	sfupb "conference-sfu/backend/api/gen/go/sfu_control"
 
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 )
 
@@ -75,10 +77,10 @@ func (s *ControlServer) GetRoomStats(ctx context.Context, req *sfupb.GetRoomStat
 	peers := make([]*sfupb.PeerStats, 0, len(peerIDs))
 	for _, id := range peerIDs {
 		peers = append(peers, &sfupb.PeerStats{
-			UserId:           uint32(id),
-			AudioEnabled:     true,
-			VideoEnabled:     true,
-			ConnectionState:  "connected",
+			UserId:          uint32(id),
+			AudioEnabled:    true,
+			VideoEnabled:    true,
+			ConnectionState: "connected",
 		})
 	}
 
@@ -123,13 +125,13 @@ func (s *ControlServer) ClosePeerConnection(ctx context.Context, req *sfupb.Clos
 	}, nil
 }
 
-func StartGRPCServer(sfuServer *SFUServer, port string, logger *zap.Logger) (*grpc.Server, error) {
+func StartGRPCServer(sfuServer *SFUServer, port string, controlToken string, logger *zap.Logger) (*grpc.Server, error) {
 	lis, err := net.Listen("tcp", ":"+port)
 	if err != nil {
 		return nil, err
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(grpc.UnaryInterceptor(controlAuthInterceptor(controlToken)))
 	controlServer := NewControlServer(sfuServer, logger)
 	sfupb.RegisterSFUControlServer(grpcServer, controlServer)
 
@@ -141,4 +143,21 @@ func StartGRPCServer(sfuServer *SFUServer, port string, logger *zap.Logger) (*gr
 	}()
 
 	return grpcServer, nil
+}
+
+func controlAuthInterceptor(controlToken string) grpc.UnaryServerInterceptor {
+	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+		if controlToken == "" {
+			return nil, status.Error(codes.Unauthenticated, "missing control token")
+		}
+		md, ok := metadata.FromIncomingContext(ctx)
+		if !ok {
+			return nil, status.Error(codes.Unauthenticated, "missing metadata")
+		}
+		values := md.Get("authorization")
+		if len(values) == 0 || strings.TrimPrefix(values[0], "Bearer ") != controlToken {
+			return nil, status.Error(codes.Unauthenticated, "invalid control token")
+		}
+		return handler(ctx, req)
+	}
 }

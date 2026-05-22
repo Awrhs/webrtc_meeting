@@ -12,23 +12,25 @@ import (
 	"sync"
 	"time"
 
+	"conference-sfu/backend/internal/auth"
+
 	"github.com/gorilla/websocket"
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/zap"
 )
 
 type Room struct {
-	ID       uint
-	Peers    map[uint]*Peer
-	mu       sync.Mutex
+	ID    uint
+	Peers map[uint]*Peer
+	mu    sync.Mutex
 }
 
 type TrackInfo struct {
-	Track        *webrtc.TrackLocalStaticRTP
-	SSRC         uint32
-	Kind         string // "audio" or "video"
-	StreamID     string // e.g., "camera" or "screen"
-	IsEnabled    bool
+	Track     *webrtc.TrackLocalStaticRTP
+	SSRC      uint32
+	Kind      string // "audio" or "video"
+	StreamID  string // e.g., "camera" or "screen"
+	IsEnabled bool
 }
 
 type Peer struct {
@@ -36,42 +38,58 @@ type Peer struct {
 	RoomID        uint
 	PC            *webrtc.PeerConnection
 	Conn          *websocket.Conn
-	Tracks        map[string]*TrackInfo // key: track kind + "-" + stream_id (e.g., "video-camera", "video-screen", "audio-main")
+	Tracks        map[string]*TrackInfo        // key: track kind + "-" + stream_id (e.g., "video-camera", "video-screen", "audio-main")
 	Subscriptions map[uint][]*webrtc.RTPSender // key: fromUserID, value: list of senders (one per track)
-	addedTracks   map[string]bool // key: fromUserID + "|" + trackKey，防止同一 track 被 AddTrack 多次
-	renegoCh      chan struct{}   // 容量 1 的合并 channel：触发 renegotiation goroutine
-	closeCh       chan struct{}   // 关闭信号，让 renegotiation goroutine 退出
+	addedTracks   map[string]bool              // key: fromUserID + "|" + trackKey，防止同一 track 被 AddTrack 多次
+	renegoCh      chan struct{}                // 容量 1 的合并 channel：触发 renegotiation goroutine
+	sendCh        chan SignalingMessage        // 容量 64：所有发往 Conn 的写都走这里，由 writerLoop 单 goroutine 消费
+	closeCh       chan struct{}                // 关闭信号，让 renegotiation/writer goroutine 退出
+	closeOnce     sync.Once                    // 保证 closeCh 只被 close 一次（writerLoop 写失败 / closePeer 都会触发）
 	mu            sync.Mutex
 }
 
 type SFUServer struct {
-	rooms         map[uint]*Room
-	api           *webrtc.API
-	configuration webrtc.Configuration
-	logger        *zap.Logger
-	mu            sync.Mutex
+	rooms                   map[uint]*Room
+	api                     *webrtc.API
+	configuration           webrtc.Configuration
+	logger                  *zap.Logger
+	sfuJWTSecret            string
+	allowUnauthenticatedDev bool
+	allowedOrigins          []string
+	callbackToken           string
+	messageRateLimit        int
+	mu                      sync.Mutex
 }
 
 type SSRC struct {
 	SSRC     uint32 `json:"ssrc"`
 	UserID   uint   `json:"user_id"`
-	Kind     string `json:"kind"`     // "audio" or "video"
+	Kind     string `json:"kind"`      // "audio" or "video"
 	StreamID string `json:"stream_id"` // "camera" or "screen"
 }
 
 type SignalingMessage struct {
-	Type          string          `json:"type"` // join, leave, offer, answer, ice-candidate, muted, ssrc_mapping
-	RoomID        uint            `json:"room_id,omitempty"`
-	UserID        uint            `json:"user_id,omitempty"`
-	SDP           string          `json:"sdp,omitempty"`
-	Candidate     string          `json:"candidate,omitempty"`
-	SDPMLineIndex *int            `json:"sdp_m_line_index,omitempty"`
-	SDPMid        *string         `json:"sdp_mid,omitempty"`
-	Data          interface{}     `json:"data,omitempty"`
-	SSRCs         []SSRC          `json:"ssrcs,omitempty"` // for ssrc_mapping message
+	Type          string      `json:"type"` // join, leave, offer, answer, ice-candidate, muted, ssrc_mapping
+	RoomID        uint        `json:"room_id,omitempty"`
+	UserID        uint        `json:"user_id,omitempty"`
+	SDP           string      `json:"sdp,omitempty"`
+	Candidate     string      `json:"candidate,omitempty"`
+	SDPMLineIndex *int        `json:"sdp_m_line_index,omitempty"`
+	SDPMid        *string     `json:"sdp_mid,omitempty"`
+	Error         string      `json:"error,omitempty"`
+	Data          interface{} `json:"data,omitempty"`
+	SSRCs         []SSRC      `json:"ssrcs,omitempty"` // for ssrc_mapping message
 }
 
-func NewSFUServer(logger *zap.Logger) *SFUServer {
+type ServerOptions struct {
+	SFUJWTSecret            string
+	AllowUnauthenticatedDev bool
+	AllowedOrigins          []string
+	CallbackToken           string
+	MessageRateLimit        int
+}
+
+func NewSFUServer(logger *zap.Logger, opts ServerOptions) *SFUServer {
 	// 国内访问 stun.l.google.com 经常超时，把 ICE gathering 拖到 8~15 秒，
 	// 拉长了 renegotiation 与 onTrack 的 race window。换成国内 STUN 后
 	// gathering 通常 < 1 秒。多个 server 互为备份，任一可达即可。
@@ -110,25 +128,35 @@ func NewSFUServer(logger *zap.Logger) *SFUServer {
 		webrtc.WithSettingEngine(settingEngine),
 	)
 
+	if opts.MessageRateLimit <= 0 {
+		opts.MessageRateLimit = 120
+	}
+
 	return &SFUServer{
-		rooms:         make(map[uint]*Room),
-		api:           api,
-		configuration: configuration,
-		logger:        logger,
+		rooms:                   make(map[uint]*Room),
+		api:                     api,
+		configuration:           configuration,
+		logger:                  logger,
+		sfuJWTSecret:            opts.SFUJWTSecret,
+		allowUnauthenticatedDev: opts.AllowUnauthenticatedDev,
+		allowedOrigins:          opts.AllowedOrigins,
+		callbackToken:           opts.CallbackToken,
+		messageRateLimit:        opts.MessageRateLimit,
 	}
 }
 
 // onTrack 当 SFU 从某个浏览器收到 RTP 媒体轨道时触发
 // 核心职责：1) 将收到的远程轨道包装为本地可转发轨道；2) 启动 RTP 包转发 goroutine；
-//          3) 将新书目推送给房间内所有其他用户；4) 触发重新协商让已连接用户接收新轨道
+//  3. 将新书目推送给房间内所有其他用户；4) 触发重新协商让已连接用户接收新轨道
 //
 // 预期正确逻辑：
-//   当用户A先连接、用户B后加入时，用户B的handleJoin会为其PC添加用户A的现有轨道（用户B能看到A）。
-//   但用户A的PC已经连接完成，如果不重新协商，用户A的浏览器不会知道有新的接收轨道，就看不到B。
-//   因此，在 onTrack 中给已连接用户的PC AddTrack 后，必须调用 renegotiate() 创建新offer并发送给浏览器，
-//   浏览器收到offer后创建answer回传，SFU设置远程描述，新轨道才能正式传输。
+//
+//	当用户A先连接、用户B后加入时，用户B的handleJoin会为其PC添加用户A的现有轨道（用户B能看到A）。
+//	但用户A的PC已经连接完成，如果不重新协商，用户A的浏览器不会知道有新的接收轨道，就看不到B。
+//	因此，在 onTrack 中给已连接用户的PC AddTrack 后，必须调用 renegotiate() 创建新offer并发送给浏览器，
+//	浏览器收到offer后创建answer回传，SFU设置远程描述，新轨道才能正式传输。
 func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
-	trackKind := string(track.Kind())
+	trackKind := track.Kind().String()
 	streamID := track.StreamID()
 	trackKey := trackKind + "-" + streamID
 
@@ -204,9 +232,7 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 
 	for _, otherPeer := range room.Peers {
 		// 给所有用户（包括发布者自己）发送 SSRC 映射，方便前端做流归属
-		if otherPeer.Conn != nil {
-			otherPeer.Conn.WriteJSON(ssrcMapping)
-		}
+		s.sendToPeer(otherPeer, ssrcMapping)
 
 		// 给其他用户添加轨道订阅：将 localTrack 挂载到对方的 PeerConnection 上
 		if otherPeer.UserID != peer.UserID {
@@ -247,10 +273,12 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 
 // renegotiate 当已连接的 PeerConnection 需要增加新接收轨道时触发重新协商
 // 预期正确逻辑：
-//   WebRTC 连接建立后，如果一方需要增加新的发送轨道（如SFU要转发新用户的书目），
-//   必须通过新的 Offer/Answer 交换让对端知道有新的 m-line 或 SSRC。
-//   这里SFU作为offerer创建新offer，通过WebSocket发送给浏览器，浏览器回复answer，
-//   SFU收到answer后调用SetRemoteDescription，新轨道才能开始传输RTP包。
+//
+//	WebRTC 连接建立后，如果一方需要增加新的发送轨道（如SFU要转发新用户的书目），
+//	必须通过新的 Offer/Answer 交换让对端知道有新的 m-line 或 SSRC。
+//	这里SFU作为offerer创建新offer，通过WebSocket发送给浏览器，浏览器回复answer，
+//	SFU收到answer后调用SetRemoteDescription，新轨道才能开始传输RTP包。
+//
 // renegotiationWorker 是每个 Peer 专属的串行 worker，负责处理 renegotiation 触发信号。
 // 通过 renegoCh 接收触发信号，buffer=1 保证多次触发被合并成一次执行。
 // 这从根本上消除了多个 goroutine 并发 CreateOffer/SetLocalDescription 的 race。
@@ -276,6 +304,50 @@ func (s *SFUServer) triggerRenegotiation(peer *Peer) {
 	default:
 		// 已有 pending 信号，本次触发被合并掉
 		s.logger.Debug("Renegotiation already pending, merging trigger", zap.Uint("userID", peer.UserID))
+	}
+}
+
+// writerLoop 是每个 Peer 专属的 WS 写 goroutine。所有发往 peer.Conn 的写
+// 都必须经由 peer.sendCh 投递，由本 loop 串行消费——这从结构上杜绝了
+// gorilla/websocket 的 "concurrent write to websocket connection" panic。
+func (s *SFUServer) writerLoop(peer *Peer) {
+	for {
+		select {
+		case <-peer.closeCh:
+			s.logger.Debug("Writer loop exiting", zap.Uint("userID", peer.UserID))
+			return
+		case msg := <-peer.sendCh:
+			peer.Conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			if err := peer.Conn.WriteJSON(msg); err != nil {
+				s.logger.Warn("ws write failed, closing peer",
+					zap.Uint("userID", peer.UserID),
+					zap.String("type", msg.Type),
+					zap.Error(err))
+				// 写失败 → 触发关闭信号；PC 的清理交给 onConnectionStateChange / removePeer
+				peer.closeOnce.Do(func() { close(peer.closeCh) })
+				return
+			}
+		}
+	}
+}
+
+// sendToPeer 非阻塞地把消息投到 peer 的写队列。
+// - peer 已关闭：静默忽略。
+// - 队列满：记日志丢弃（buffer=64 设计上不应该发生，出现即报警）。
+// 调用方不需要持有任何锁。
+func (s *SFUServer) sendToPeer(peer *Peer, msg SignalingMessage) {
+	select {
+	case <-peer.closeCh:
+		return
+	default:
+	}
+	select {
+	case peer.sendCh <- msg:
+	case <-peer.closeCh:
+	default:
+		s.logger.Warn("peer sendCh full, message dropped",
+			zap.Uint("userID", peer.UserID),
+			zap.String("type", msg.Type))
 	}
 }
 
@@ -312,25 +384,17 @@ func (s *SFUServer) doRenegotiate(peer *Peer) {
 		return
 	}
 
-	if peer.Conn != nil {
-		peer.Conn.WriteJSON(SignalingMessage{
-			Type: "offer",
-			SDP:  offer.SDP,
-		})
-		s.logger.Info("Sent renegotiation offer", zap.Uint("userID", peer.UserID))
-	}
+	s.sendToPeer(peer, SignalingMessage{
+		Type: "offer",
+		SDP:  offer.SDP,
+	})
+	s.logger.Info("Sent renegotiation offer", zap.Uint("userID", peer.UserID))
 }
 
-// closePeer 安全地关闭 peer：关闭 renegotiation worker、关闭 PC。
-// 幂等：多次调用安全（基于 sync.Once 思路用 select 兜底）。
+// closePeer 安全地关闭 peer：关闭 renegotiation worker、writer goroutine、PC。
+// 幂等：基于 closeOnce，多次调用安全。
 func (s *SFUServer) closePeer(peer *Peer) {
-	// 关闭 worker，select+default 保证幂等
-	select {
-	case <-peer.closeCh:
-		// 已关闭
-	default:
-		close(peer.closeCh)
-	}
+	peer.closeOnce.Do(func() { close(peer.closeCh) })
 	peer.PC.Close()
 }
 
@@ -348,8 +412,8 @@ func (s *SFUServer) onConnectionStateChange(room *Room, peer *Peer, state webrtc
 		}
 
 		if state == webrtc.PeerConnectionStateFailed {
-			s.logger.Warn("Peer connection failed (ICE negotiation failed)", 
-				zap.Uint("roomID", room.ID), 
+			s.logger.Warn("Peer connection failed (ICE negotiation failed)",
+				zap.Uint("roomID", room.ID),
 				zap.Uint("userID", peer.UserID))
 			s.notifyConnectionFailed(room.ID, peer.UserID)
 		}
@@ -370,6 +434,9 @@ func (s *SFUServer) notifyConnectionFailed(roomID uint, userID uint) {
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if s.callbackToken != "" {
+		req.Header.Set("X-SFU-Callback-Token", s.callbackToken)
+	}
 
 	_, err = client.Do(req)
 	if err != nil {
@@ -391,14 +458,50 @@ func getAPIHost() string {
 	return apiHost
 }
 
+func (s *SFUServer) validateAdmission(r *http.Request) (*auth.SFUClaims, error) {
+	if s.allowUnauthenticatedDev {
+		return nil, nil
+	}
+	token := r.URL.Query().Get("token")
+	if token == "" {
+		return nil, errors.New("missing sfu token")
+	}
+	return auth.ValidateSFUJoinToken(token, s.sfuJWTSecret)
+}
+
+func (s *SFUServer) originAllowed(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	for _, allowed := range s.allowedOrigins {
+		if allowed == origin {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
+	claims, err := s.validateAdmission(r)
+	if err != nil {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !s.originAllowed(r) {
+		http.Error(w, "origin not allowed", http.StatusForbidden)
+		return
+	}
+
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
 		s.logger.Error("Failed to upgrade websocket", zap.Error(err))
 		return
 	}
+	conn.SetReadLimit(1 << 20)
 
 	var peer *Peer
+	limiter := newRateLimiter(s.messageRateLimit, time.Minute)
 
 	defer func() {
 		if peer != nil {
@@ -408,6 +511,15 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	for {
+		if !limiter.Allow() {
+			if peer != nil {
+				s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "rate_limited"})
+			} else {
+				sendError(conn, "rate_limited", "too many messages")
+			}
+			break
+		}
+
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			if err != io.EOF {
@@ -424,6 +536,18 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 		switch msg.Type {
 		case "join":
+			if peer != nil {
+				s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "already_joined"})
+				continue
+			}
+			if claims != nil {
+				if msg.RoomID != 0 && msg.RoomID != claims.RoomID || msg.UserID != 0 && msg.UserID != claims.UserID {
+					sendError(conn, "join_failed", "token claims do not match join request")
+					return
+				}
+				msg.RoomID = claims.RoomID
+				msg.UserID = claims.UserID
+			}
 			peer, err = s.handleJoin(conn, &msg)
 			if err != nil {
 				s.logger.Error("Join failed", zap.Error(err))
@@ -437,7 +561,7 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			err = s.handleOffer(peer, &msg)
 			if err != nil {
 				s.logger.Error("Offer failed", zap.Error(err))
-				sendError(conn, "offer_failed", err.Error())
+				s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "offer_failed: " + err.Error()})
 			}
 		case "answer":
 			// 处理浏览器回复的 Answer（用于重新协商场景）
@@ -450,6 +574,7 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			err = s.handleAnswer(peer, &msg)
 			if err != nil {
 				s.logger.Error("Answer handling failed", zap.Uint("userID", peer.UserID), zap.Error(err))
+				s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "answer_failed: " + err.Error()})
 			}
 		case "ice-candidate":
 			if peer == nil {
@@ -459,6 +584,7 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			err = s.handleIceCandidate(peer, &msg)
 			if err != nil {
 				s.logger.Error("ICE candidate failed", zap.Error(err))
+				s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "ice_candidate_failed: " + err.Error()})
 			}
 		}
 	}
@@ -495,12 +621,15 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 		Subscriptions: make(map[uint][]*webrtc.RTPSender),
 		addedTracks:   make(map[string]bool),
 		renegoCh:      make(chan struct{}, 1),
+		sendCh:        make(chan SignalingMessage, 64),
 		closeCh:       make(chan struct{}),
 	}
 
 	// 启动该 peer 专属的 renegotiation 串行 worker
 	// 任何地方需要触发 renegotiation 时，往 renegoCh 发个信号即可（buffer=1，多余信号自动合并）
 	go s.renegotiationWorker(peer)
+	// 启动该 peer 专属的 WS writer goroutine。必须在任何 sendToPeer 之前启动。
+	go s.writerLoop(peer)
 
 	// 监听轨道
 	pc.OnTrack(func(track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
@@ -530,7 +659,7 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 	room.Peers[msg.UserID] = peer
 
 	// 发送joined确认
-	conn.WriteJSON(SignalingMessage{
+	s.sendToPeer(peer, SignalingMessage{
 		Type:   "joined",
 		RoomID: msg.RoomID,
 		UserID: msg.UserID,
@@ -576,7 +705,7 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 
 	// 如果有现有流，发送批量SSRC映射给新用户
 	if len(allSSRCs) > 0 {
-		peer.Conn.WriteJSON(SignalingMessage{
+		s.sendToPeer(peer, SignalingMessage{
 			Type:   "ssrc_mapping",
 			RoomID: msg.RoomID,
 			SSRCs:  allSSRCs,
@@ -596,11 +725,12 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 
 // handleOffer 处理浏览器发来的初始 SDP Offer（初次协商）
 // 预期正确逻辑：
-//   浏览器是 offerer，SFU 是 answerer。
-//   1) SFU 将浏览器的 offer 设为远程描述（声明浏览器要发送的轨道）
-//   2) SFU 创建 answer（包含 SFU 要发送给浏览器的轨道，如现有用户的流）
-//   3) SFU 将 answer 设为本地描述，启动 ICE 收集
-//   4) 通过 WebSocket 将 answer 发送回浏览器
+//
+//	浏览器是 offerer，SFU 是 answerer。
+//	1) SFU 将浏览器的 offer 设为远程描述（声明浏览器要发送的轨道）
+//	2) SFU 创建 answer（包含 SFU 要发送给浏览器的轨道，如现有用户的流）
+//	3) SFU 将 answer 设为本地描述，启动 ICE 收集
+//	4) 通过 WebSocket 将 answer 发送回浏览器
 func (s *SFUServer) handleOffer(peer *Peer, msg *SignalingMessage) error {
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
@@ -634,7 +764,7 @@ func (s *SFUServer) handleOffer(peer *Peer, msg *SignalingMessage) error {
 	}
 
 	// 发送包含完整 ICE 候选的 Answer 回前端
-	peer.Conn.WriteJSON(SignalingMessage{
+	s.sendToPeer(peer, SignalingMessage{
 		Type: "answer",
 		SDP:  completeAnswer.SDP,
 	})
@@ -645,9 +775,10 @@ func (s *SFUServer) handleOffer(peer *Peer, msg *SignalingMessage) error {
 
 // handleAnswer 处理浏览器回复的 SDP Answer（重新协商场景）
 // 预期正确逻辑：
-//   重新协商时 SFU 是 offerer，浏览器是 answerer。
-//   浏览器收到 renegotiate() 发来的 offer 后，创建 answer 并发回。
-//   SFU 收到 answer 后设为远程描述，新添加的轨道即可开始传输。
+//
+//	重新协商时 SFU 是 offerer，浏览器是 answerer。
+//	浏览器收到 renegotiate() 发来的 offer 后，创建 answer 并发回。
+//	SFU 收到 answer 后设为远程描述，新添加的轨道即可开始传输。
 func (s *SFUServer) handleAnswer(peer *Peer, msg *SignalingMessage) error {
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
@@ -740,6 +871,58 @@ var upgrader = websocket.Upgrader{
 	},
 }
 
+type rateLimiter struct {
+	limit       int
+	window      time.Duration
+	windowStart time.Time
+	count       int
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	return &rateLimiter{limit: limit, window: window, windowStart: time.Now()}
+}
+
+func (l *rateLimiter) Allow() bool {
+	if l.limit <= 0 {
+		return true
+	}
+	now := time.Now()
+	if now.Sub(l.windowStart) >= l.window {
+		l.windowStart = now
+		l.count = 0
+	}
+	if l.count >= l.limit {
+		return false
+	}
+	l.count++
+	return true
+}
+
+func (s *SFUServer) HandleMetrics(w http.ResponseWriter, r *http.Request) {
+	s.mu.Lock()
+	rooms := len(s.rooms)
+	peers := 0
+	tracks := 0
+	for _, room := range s.rooms {
+		room.mu.Lock()
+		peers += len(room.Peers)
+		for _, peer := range room.Peers {
+			peer.mu.Lock()
+			tracks += len(peer.Tracks)
+			peer.mu.Unlock()
+		}
+		room.mu.Unlock()
+	}
+	s.mu.Unlock()
+
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]int{
+		"rooms":  rooms,
+		"peers":  peers,
+		"tracks": tracks,
+	})
+}
+
 // ==================== SFU Control Methods ====================
 
 // KickUser force disconnects a user from the room
@@ -815,19 +998,16 @@ func (s *SFUServer) MuteUser(roomID, userID uint, isMuted bool) error {
 	}
 
 	// 发送静音通知给用户（通过信令WebSocket通知客户端）
-	if peer.Conn != nil {
-		muteMsg := SignalingMessage{
-			Type:   "muted",
-			UserID: userID,
-			Data:   map[string]bool{"is_muted": isMuted},
-		}
-		peer.Conn.WriteJSON(muteMsg)
-	}
+	s.sendToPeer(peer, SignalingMessage{
+		Type:   "muted",
+		UserID: userID,
+		Data:   map[string]bool{"is_muted": isMuted},
+	})
 
 	// 广播静音状态给房间内所有用户
 	for _, otherPeer := range room.Peers {
-		if otherPeer.Conn != nil && otherPeer.UserID != userID {
-			otherPeer.Conn.WriteJSON(SignalingMessage{
+		if otherPeer.UserID != userID {
+			s.sendToPeer(otherPeer, SignalingMessage{
 				Type:   "muted",
 				UserID: userID,
 				Data:   map[string]bool{"is_muted": isMuted},

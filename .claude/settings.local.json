@@ -16,7 +16,13 @@
       "Bash(sudo -n apt-get update)",
       "Bash(sudo -n apt-get install -y coturn)",
       "Bash(sudo -l)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "Bash(go vet *)",
+      "Bash(gofmt *)",
+      "Bash(npm run *)",
+      "Bash(npm *)",
+      "Bash(npx *)",
+      "Bash(go test *)"
     ],
     "additionalDirectories": [
       "C:\\Users\\My_PC\\myproject\\conference_based_on_the-SFU model\\frontend"

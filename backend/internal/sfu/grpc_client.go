@@ -10,15 +10,17 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 type ControlClient struct {
-	client sfupb.SFUControlClient
-	conn   *grpc.ClientConn
-	logger *zap.Logger
+	client       sfupb.SFUControlClient
+	conn         *grpc.ClientConn
+	logger       *zap.Logger
+	controlToken string
 }
 
-func NewControlClient(sfuAddr string, logger *zap.Logger) (*ControlClient, error) {
+func NewControlClient(sfuAddr string, controlToken string, logger *zap.Logger) (*ControlClient, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -31,9 +33,10 @@ func NewControlClient(sfuAddr string, logger *zap.Logger) (*ControlClient, error
 	}
 
 	return &ControlClient{
-		client: sfupb.NewSFUControlClient(conn),
-		conn:   conn,
-		logger: logger,
+		client:       sfupb.NewSFUControlClient(conn),
+		conn:         conn,
+		logger:       logger,
+		controlToken: controlToken,
 	}, nil
 }
 
@@ -41,8 +44,16 @@ func (c *ControlClient) Close() error {
 	return c.conn.Close()
 }
 
+func (c *ControlClient) controlContext(timeout time.Duration) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	if c.controlToken == "" {
+		return ctx, cancel
+	}
+	return metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+c.controlToken), cancel
+}
+
 func (c *ControlClient) KickUser(roomID, userID uint, reason string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := c.controlContext(5 * time.Second)
 	defer cancel()
 
 	_, err := c.client.KickUser(ctx, &sfupb.KickUserRequest{
@@ -59,7 +70,7 @@ func (c *ControlClient) KickUser(roomID, userID uint, reason string) error {
 }
 
 func (c *ControlClient) MuteUser(roomID, userID uint, isMuted bool) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := c.controlContext(5 * time.Second)
 	defer cancel()
 
 	_, err := c.client.MuteUser(ctx, &sfupb.MuteUserRequest{
@@ -76,7 +87,7 @@ func (c *ControlClient) MuteUser(roomID, userID uint, isMuted bool) error {
 }
 
 func (c *ControlClient) ClosePeerConnection(roomID, userID uint) error {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := c.controlContext(5 * time.Second)
 	defer cancel()
 
 	_, err := c.client.ClosePeerConnection(ctx, &sfupb.ClosePeerConnectionRequest{
@@ -92,7 +103,7 @@ func (c *ControlClient) ClosePeerConnection(roomID, userID uint) error {
 }
 
 func (c *ControlClient) GetRoomStats(roomID uint) (*sfupb.GetRoomStatsResponse, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := c.controlContext(5 * time.Second)
 	defer cancel()
 
 	return c.client.GetRoomStats(ctx, &sfupb.GetRoomStatsRequest{
@@ -101,7 +112,7 @@ func (c *ControlClient) GetRoomStats(roomID uint) (*sfupb.GetRoomStatsResponse, 
 }
 
 func (c *ControlClient) ListRooms() (*sfupb.ListRoomsResponse, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ctx, cancel := c.controlContext(5 * time.Second)
 	defer cancel()
 
 	return c.client.ListRooms(ctx, &sfupb.ListRoomsRequest{})

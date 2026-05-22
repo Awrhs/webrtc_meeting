@@ -1,35 +1,37 @@
 package handlers
 
 import (
+	"conference-sfu/backend/internal/auth"
 	"conference-sfu/backend/internal/models"
 	"conference-sfu/backend/internal/service"
-	"conference-sfu/backend/internal/signaling"
 	"conference-sfu/backend/internal/sfu"
+	"conference-sfu/backend/internal/signaling"
 	"net/http"
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/golang-jwt/jwt/v5"
 	"go.uber.org/zap"
 )
 
 type Handler struct {
-	userService  service.UserService
-	roomService  service.RoomService
-	chatService  service.ChatService
-	hub          *signaling.Hub
-	sfuClient    *sfu.ControlClient
-	logger       *zap.Logger
+	userService      service.UserService
+	roomService      service.RoomService
+	chatService      service.ChatService
+	hub              *signaling.Hub
+	sfuClient        *sfu.ControlClient
+	logger           *zap.Logger
+	sfuCallbackToken string
 }
 
-func NewHandler(userService service.UserService, roomService service.RoomService, chatService service.ChatService, hub *signaling.Hub, sfuClient *sfu.ControlClient, logger *zap.Logger) *Handler {
+func NewHandler(userService service.UserService, roomService service.RoomService, chatService service.ChatService, hub *signaling.Hub, sfuClient *sfu.ControlClient, sfuCallbackToken string, logger *zap.Logger) *Handler {
 	return &Handler{
-		userService: userService,
-		roomService: roomService,
-		chatService: chatService,
-		hub:         hub,
-		sfuClient:   sfuClient,
-		logger:      logger,
+		userService:      userService,
+		roomService:      roomService,
+		chatService:      chatService,
+		hub:              hub,
+		sfuClient:        sfuClient,
+		logger:           logger,
+		sfuCallbackToken: sfuCallbackToken,
 	}
 }
 
@@ -170,21 +172,7 @@ func AuthMiddleware(jwtSecret string) gin.HandlerFunc {
 }
 
 func ValidateToken(tokenStr string, jwtSecret string) (uint, error) {
-	token, err := jwt.Parse(tokenStr, func(token *jwt.Token) (interface{}, error) {
-		return []byte(jwtSecret), nil
-	})
-
-	if err != nil || !token.Valid {
-		return 0, err
-	}
-
-	claims, ok := token.Claims.(jwt.MapClaims)
-	if !ok {
-		return 0, jwt.ErrTokenInvalidClaims
-	}
-
-	userID := uint(claims["user_id"].(float64))
-	return userID, nil
+	return auth.ValidateUserToken(tokenStr, jwtSecret)
 }
 
 func GetUserID(c *gin.Context) uint {

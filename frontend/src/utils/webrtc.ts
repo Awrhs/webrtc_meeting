@@ -1,3 +1,5 @@
+import { api } from './api'
+
 const SFU_HOST = import.meta.env.VITE_SFU_HOST || 'http://localhost:8081'
 console.log('[WebRTC] SFU host:', SFU_HOST)
 
@@ -26,6 +28,7 @@ export class SFUConnection {
   private pc: RTCPeerConnection | null = null
   private roomId: number
   private userId: number
+  private sfuToken: string
   private localStream: MediaStream | null = null
   private screenStream: MediaStream | null = null
   private remoteStreams: Map<number, MediaStream> = new Map()
@@ -47,6 +50,7 @@ export class SFUConnection {
   constructor(
     roomId: number,
     userId: number,
+    sfuToken: string,
     onRemoteTrack: (userId: number, track: MediaStreamTrack, stream: MediaStream) => void,
     onConnected: () => void,
     onDisconnected: () => void,
@@ -54,6 +58,7 @@ export class SFUConnection {
   ) {
     this.roomId = roomId
     this.userId = userId
+    this.sfuToken = sfuToken
     this.onRemoteTrack = onRemoteTrack
     this.onConnected = onConnected
     this.onDisconnected = onDisconnected
@@ -63,7 +68,7 @@ export class SFUConnection {
   private getWsUrl(): string {
     const wsProtocol = SFU_HOST.startsWith('https') ? 'wss:' : 'ws:'
     const wsHost = SFU_HOST.replace(/^https?:\/\//, '')
-    return `${wsProtocol}//${wsHost}/ws`
+    return `${wsProtocol}//${wsHost}/ws?token=${encodeURIComponent(this.sfuToken)}`
   }
 
   async connect(localStream: MediaStream): Promise<void> {
@@ -207,9 +212,11 @@ export class SFUConnection {
     this.reconnectTimer = setTimeout(() => {
       console.log('[WebRTC] Attempting reconnect...')
       if (this.localStream) {
-        this.connect(this.localStream).catch((err) => {
-          console.error('[WebRTC] Reconnect failed:', err)
-        })
+        this.refreshSFUToken()
+          .then(() => this.connect(this.localStream!))
+          .catch((err) => {
+            console.error('[WebRTC] Reconnect failed:', err)
+          })
       }
     }, this.reconnectDelay)
   }
@@ -298,6 +305,11 @@ export class SFUConnection {
       sdp_m_line_index: candidate.sdpMLineIndex ?? undefined,
       sdp_mid: candidate.sdpMid ?? undefined,
     })
+  }
+
+  private async refreshSFUToken() {
+    const response = await api.post(`/api/v1/rooms/${this.roomId}/sfu-token`)
+    this.sfuToken = response.data.sfu_token
   }
 
   private send(message: SFUMessage) {

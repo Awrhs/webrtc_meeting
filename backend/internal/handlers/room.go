@@ -96,7 +96,26 @@ func (h *Handler) JoinRoom(c *gin.Context) {
 		"room":           result.Room,
 		"members":        result.Members,
 		"my_permissions": result.Permissions,
+		"sfu_token":      result.SFUToken,
 	})
+}
+
+func (h *Handler) GetSFUToken(c *gin.Context) {
+	userID := GetUserID(c)
+	idStr := c.Param("id")
+	roomID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+
+	token, err := h.roomService.GenerateSFUToken(uint(roomID), userID)
+	if err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"sfu_token": token})
 }
 
 func (h *Handler) DeleteRoom(c *gin.Context) {
@@ -341,6 +360,11 @@ func (h *Handler) TransferOwner(c *gin.Context) {
 }
 
 func (h *Handler) NotifyConnectionFailed(c *gin.Context) {
+	if h.sfuCallbackToken != "" && c.GetHeader("X-SFU-Callback-Token") != h.sfuCallbackToken {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
+		return
+	}
+
 	idStr := c.Param("roomId")
 	roomID, err := strconv.Atoi(idStr)
 	if err != nil {

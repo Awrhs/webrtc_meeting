@@ -80,4 +80,5 @@ export interface JoinRoomResponse {
   room: Room
   members: RoomMember[]
   my_permissions: Permission[]
+  sfu_token: string
 }

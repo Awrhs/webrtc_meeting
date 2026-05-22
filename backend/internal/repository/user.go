@@ -143,15 +143,20 @@ func (r *RedisClient) Close() error {
 	return r.client.Close()
 }
 
+func (r *RedisClient) Ping() error {
+	ctx := context.Background()
+	return r.client.Ping(ctx).Err()
+}
+
 // ==================== User Cache Methods ====================
 
 const (
-	userCacheKeyPrefix    = "user:"
-	userCacheTTL          = 15 * time.Minute
-	roomCacheKeyPrefix    = "room:info:"
-	roomCacheTTL          = 10 * time.Minute
-	userRoomsCachePrefix  = "user:rooms:"
-	userRoomsCacheTTL     = 5 * time.Minute
+	userCacheKeyPrefix   = "user:"
+	userCacheTTL         = 15 * time.Minute
+	roomCacheKeyPrefix   = "room:info:"
+	roomCacheTTL         = 10 * time.Minute
+	userRoomsCachePrefix = "user:rooms:"
+	userRoomsCacheTTL    = 5 * time.Minute
 )
 
 func (r *RedisClient) SetUser(user *models.User) error {
