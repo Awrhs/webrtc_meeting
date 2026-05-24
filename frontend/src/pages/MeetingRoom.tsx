@@ -18,9 +18,11 @@ import { joinRoom, getRoomMessages, addMessage, setConnected, clearCurrentRoom, 
 import { api } from '@/utils/api'
 import { SignalingClient } from '@/utils/signaling'
 import { getMediaStream, SFUConnection } from '@/utils/webrtc'
+import { MediaE2EEManager, MediaE2EEState } from '@/utils/mediaE2EE'
 import VideoGrid from '@/components/VideoGrid'
 import Chat from '@/components/Chat'
 import MemberList from '@/components/MemberList'
+import { JoinRoomResponse, RoomMember } from '@/types'
 
 const { Header, Content } = Layout
 
@@ -38,13 +40,17 @@ export default function MeetingRoom() {
   const [loading, setLoading] = useState(false)
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null)
+  const [mediaE2EEState, setMediaE2EEState] = useState<MediaE2EEState>('disabled')
 
   const signalingRef = useRef<SignalingClient | null>(null)
+  const mediaE2EEManagerRef = useRef<MediaE2EEManager | null>(null)
   const sfuConnectionRef = useRef<SFUConnection | null>(null)
   const localStreamRef = useRef<MediaStream | null>(null)
   const screenStreamRef = useRef<MediaStream | null>(null)
   // 每个 user_id 对应一个 MediaStream 数组（可能有多个音视频轨道）
   const remoteStreamsRef = useRef<Map<number, MediaStream[]>>(new Map())
+  const membersRef = useRef<RoomMember[]>([])
+  const currentUserIdRef = useRef(0)
   // 强制刷新渲染的 trigger
   const [, forceUpdate] = useState({})
 
@@ -52,6 +58,20 @@ export default function MeetingRoom() {
 
   const canLockRoom = myPermissions.includes('lock_room')
   const canDeleteRoom = myPermissions.includes('delete_room')
+
+  useEffect(() => {
+    membersRef.current = members
+  }, [members])
+
+  useEffect(() => {
+    currentUserIdRef.current = currentUserId
+  }, [currentUserId])
+
+  const getActiveMemberIds = (excludeUserId?: number) => {
+    const ids = membersRef.current.map(member => member.user_id)
+    if (excludeUserId === undefined || ids.includes(excludeUserId)) return ids
+    return [...ids, excludeUserId]
+  }
 
   useEffect(() => {
     const verifyCode = searchParams.get('verify') || ''
@@ -62,7 +82,7 @@ export default function MeetingRoom() {
       .unwrap()
       .then(async (result) => {
         dispatch(getRoomMessages(roomId))
-        await joinMeeting(result.sfu_token)
+        await joinMeeting(result)
       })
       .catch((error) => {
         message.error(error)
@@ -78,57 +98,87 @@ export default function MeetingRoom() {
     }
   }, [id, dispatch])
 
-  const joinMeeting = async (sfuToken: string) => {
+  const joinMeeting = async (joinResult: JoinRoomResponse) => {
     const token = localStorage.getItem('token')
     if (!token) return
 
     const signaling = new SignalingClient()
+    const mediaE2EEManager = new MediaE2EEManager(true)
+    mediaE2EEManagerRef.current = mediaE2EEManager
+    signaling.setMediaE2EEManager(mediaE2EEManager)
     signalingRef.current = signaling
 
     signaling.connect().then(() => {
       dispatch(setConnected(true))
+      mediaE2EEManager.init(
+        (targetUserId, encryptedMediaKey) => {
+          void signaling.sendMediaSenderKeyTo(targetUserId, encryptedMediaKey)
+        },
+        setMediaE2EEState
+      )
 
       signaling.on('user_joined', (msg) => {
         message.info(`${msg.data?.user_name || '用户'}加入了房间`)
+        if (msg.user_id !== currentUserIdRef.current) {
+          void signaling.rotateForMembershipChange('join', msg.user_id, getActiveMemberIds(msg.user_id))
+        }
       })
 
       signaling.on('user_left', (msg) => {
+        signaling.removeRoomMember(msg.user_id)
         dispatch(removeMember(msg.user_id))
         remoteStreamsRef.current.delete(msg.user_id)
         message.info(`${msg.data?.user_name || '用户'}离开了房间`)
+        if (msg.user_id !== currentUserIdRef.current) {
+          void signaling.rotateForMembershipChange('leave', msg.user_id, getActiveMemberIds().filter(userId => userId !== msg.user_id))
+        }
       })
 
       signaling.on('chat_message', (msg) => {
         dispatch(addMessage(msg.data))
       })
 
-      signaling.on('kicked', () => {
-        message.error('你已被踢出房间')
-        leaveMeeting()
-        navigate('/')
+      signaling.on('kicked', (msg) => {
+        if (msg.target_id === currentUserIdRef.current) {
+          message.error('你已被踢出房间')
+          leaveMeeting()
+          navigate('/')
+          return
+        }
+
+        signaling.removeRoomMember(msg.target_id)
+        dispatch(removeMember(msg.target_id))
+        remoteStreamsRef.current.delete(msg.target_id)
+        void signaling.rotateForMembershipChange('kick', msg.target_id, getActiveMemberIds().filter(userId => userId !== msg.target_id))
       })
 
       signaling.on('muted', (msg) => {
-        dispatch(updateMember({
-          ...members.find(m => m.user_id === msg.user_id)!,
-          is_muted: msg.data.is_muted,
-        }))
-        if (msg.user_id === currentUserId && msg.data.is_muted) {
+        const member = membersRef.current.find(m => m.user_id === msg.user_id)
+        if (member) {
+          dispatch(updateMember({
+            ...member,
+            is_muted: msg.data.is_muted,
+          }))
+        }
+        if (msg.user_id === currentUserIdRef.current && msg.data.is_muted) {
           message.info('你已被禁言')
         }
       })
 
       signaling.on('role_changed', (msg) => {
-        dispatch(updateMember({
-          ...members.find(m => m.user_id === msg.user_id)!,
-          role: msg.data.role,
-        }))
+        const member = membersRef.current.find(m => m.user_id === msg.user_id)
+        if (member) {
+          dispatch(updateMember({
+            ...member,
+            role: msg.data.role,
+          }))
+        }
       })
 
       // 监听其他人的媒体状态变更
       signaling.on('media_state', (msg) => {
-        if (msg.user_id !== currentUserId) {
-          const member = members.find(m => m.user_id === msg.user_id)
+        if (msg.user_id !== currentUserIdRef.current) {
+          const member = membersRef.current.find(m => m.user_id === msg.user_id)
           if (member) {
             dispatch(updateMember({
               ...member,
@@ -139,7 +189,7 @@ export default function MeetingRoom() {
         }
       })
 
-      signaling.joinRoom(parseInt(id!), currentUserId)
+      void signaling.joinRoom(parseInt(id!), currentUserIdRef.current, joinResult.members)
     })
 
     try {
@@ -157,7 +207,7 @@ export default function MeetingRoom() {
       const sfuConnection = new SFUConnection(
         parseInt(id!),
         currentUserId,
-        sfuToken,
+        joinResult.sfu_token,
         // 处理远程媒体流回调
         (userId: number, track: MediaStreamTrack, stream: MediaStream) => {
           console.log('[Meeting] Received remote track:', track.kind, 'from user', userId)
@@ -181,7 +231,8 @@ export default function MeetingRoom() {
         (error: string) => {
           console.error('[Meeting] SFU error:', error)
           message.error(error)
-        }
+        },
+        mediaE2EEManager
       )
 
       sfuConnectionRef.current = sfuConnection
@@ -211,11 +262,16 @@ export default function MeetingRoom() {
       signalingRef.current.disconnect()
       signalingRef.current = null
     }
+    if (mediaE2EEManagerRef.current) {
+      mediaE2EEManagerRef.current.clear()
+      mediaE2EEManagerRef.current = null
+    }
     remoteStreamsRef.current.clear()
     setLocalStream(null)
     setVideoOn(false)
     setAudioOn(false)
     setScreenShare(false)
+    setMediaE2EEState('disabled')
     forceUpdate({})
   }
 
@@ -402,6 +458,21 @@ export default function MeetingRoom() {
 
   const items = buildMenuItems()
 
+  const mediaE2EETag = () => {
+    switch (mediaE2EEState) {
+      case 'enabled':
+        return <Tag color="green">媒体 E2EE 已启用</Tag>
+      case 'negotiating':
+        return <Tag color="orange">媒体 E2EE 协商中</Tag>
+      case 'unsupported':
+        return <Tag color="default">媒体 E2EE 不支持，已回退 DTLS-SRTP</Tag>
+      case 'warning':
+        return <Tag color="red">媒体 E2EE 需检查</Tag>
+      default:
+        return <Tag color="blue">媒体传输加密 DTLS-SRTP</Tag>
+    }
+  }
+
   if (loading) {
     return <div>加载中...</div>
   }
@@ -426,6 +497,7 @@ export default function MeetingRoom() {
           <Tag color={currentRoom?.is_locked ? 'red' : 'green'} style={{ marginLeft: 16 }}>
             {currentRoom?.is_locked ? '已锁定' : '开放中'}
           </Tag>
+          {mediaE2EETag()}
           <span style={{ marginLeft: 16, color: '#888' }}>
             {currentRoom?.current_size}/{currentRoom?.max_members} 人
           </span>

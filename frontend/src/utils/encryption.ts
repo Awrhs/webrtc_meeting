@@ -19,11 +19,13 @@ export interface SenderChain {
   chainKey: string
   messageNumber: number
   publicKey: string
+  epoch: number
 }
 
 export interface EncryptedMessage {
   version: number
   senderId: number
+  epoch?: number
   messageNumber: number
   ciphertext: string
   iv: string
@@ -35,7 +37,7 @@ export interface EncryptedMessage {
 
 // ==================== 基础工具 ====================
 
-const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
+export const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
   const bytes = new Uint8Array(buffer)
   let binary = ''
   for (let i = 0; i < bytes.byteLength; i++) {
@@ -44,7 +46,7 @@ const arrayBufferToBase64 = (buffer: ArrayBuffer): string => {
   return btoa(binary)
 }
 
-const base64ToArrayBuffer = (base64: string): ArrayBuffer => {
+export const base64ToArrayBuffer = (base64: string): ArrayBuffer => {
   const binary = atob(base64)
   const bytes = new Uint8Array(binary.length)
   for (let i = 0; i < binary.length; i++) {
@@ -228,6 +230,7 @@ const getOrCreateSalt = (): ArrayBuffer => {
 export const saveKeyStore = async (
   password: string,
   data: {
+    myIdentityPublicKey: string
     myIdentityPrivateKey: string
     mySenderChain: SenderChain | null
     peerSenderChains: Array<{ userId: number; chain: SenderChain }>
@@ -247,6 +250,7 @@ export const saveKeyStore = async (
 export const loadKeyStore = async (
   password: string
 ): Promise<{
+  myIdentityPublicKey?: string
   myIdentityPrivateKey: string
   mySenderChain: SenderChain | null
   peerSenderChains: Array<{ userId: number; chain: SenderChain }>
@@ -274,21 +278,26 @@ export const hasSavedKeyStore = (): boolean => {
   return localStorage.getItem(STORAGE_KEY) !== null
 }
 
-// ==================== 群聊 E2EE 管理器 (Sender Keys / MLS) ====================
+// ==================== 群聊 E2EE 管理器 (Sender Keys) ====================
 
 export class GroupE2EEManager {
   private identityKeyPair: KeyPair | null = null
   private pairwiseSharedKeys: Map<number, CryptoKey> = new Map()
   private mySenderChain: SenderChain | null = null
-  private peerSenderChains: Map<number, SenderChain> = new Map()
+  private peerSenderChains: Map<string, SenderChain> = new Map()
   private currentRoomMembers: Set<number> = new Set()
+  private currentEpoch = 0
 
   // 消息缓存：用于处理序号跳跃/丢包
-  private pendingMessages: Map<number, Array<{ msg: EncryptedMessage; resolve: (s: string) => void; reject: (e: Error) => void }>> = new Map()
+  private pendingMessages: Map<string, Array<{ msg: EncryptedMessage; resolve: (s: string) => void; reject: (e: Error) => void }>> = new Map()
 
   private onNeedSendKey?: (targetUserId: number, encryptedChainKey: string) => void
   private onStateChange?: (ready: boolean) => void
   private onFingerprintReady?: (fingerprint: string) => void
+
+  private senderChainKey(senderId: number, epoch: number): string {
+    return `${senderId}:${epoch}`
+  }
 
   // ============= 初始化 =============
 
@@ -312,6 +321,7 @@ export class GroupE2EEManager {
       chainKey: initialChainKey,
       messageNumber: 0,
       publicKey: this.identityKeyPair.publicKey,
+      epoch: this.currentEpoch,
     }
 
     this.onStateChange?.(true)
@@ -340,18 +350,22 @@ export class GroupE2EEManager {
         ['deriveKey']
       )
 
-      const publicKeyRaw = await crypto.subtle.exportKey('raw', privateKey)
+      if (!stored.myIdentityPublicKey) return false
       this.identityKeyPair = {
-        publicKey: arrayBufferToBase64(publicKeyRaw),
+        publicKey: stored.myIdentityPublicKey,
         privateKey,
       }
 
       // 恢复 Sender Chain
       this.mySenderChain = stored.mySenderChain
+      this.currentEpoch = stored.mySenderChain?.epoch ?? 0
 
       // 恢复其他用户的 Sender Chain
       stored.peerSenderChains.forEach(({ userId, chain }) => {
-        this.peerSenderChains.set(userId, chain)
+        this.peerSenderChains.set(this.senderChainKey(userId, chain.epoch ?? 0), {
+          ...chain,
+          epoch: chain.epoch ?? 0,
+        })
       })
 
       return true
@@ -369,11 +383,13 @@ export class GroupE2EEManager {
     const privateKeyRaw = await crypto.subtle.exportKey('pkcs8', this.identityKeyPair.privateKey)
 
     const peerChains: Array<{ userId: number; chain: SenderChain }> = []
-    this.peerSenderChains.forEach((chain, userId) => {
+    this.peerSenderChains.forEach((chain, key) => {
+      const userId = Number(key.split(':')[0])
       peerChains.push({ userId, chain })
     })
 
     await saveKeyStore(`user_${userId}_key`, {
+      myIdentityPublicKey: this.identityKeyPair.publicKey,
       myIdentityPrivateKey: arrayBufferToBase64(privateKeyRaw),
       mySenderChain: this.mySenderChain,
       peerSenderChains: peerChains,
@@ -406,7 +422,6 @@ export class GroupE2EEManager {
 
   async addMember(userId: number, peerPublicKey: string): Promise<void> {
     if (!this.identityKeyPair) throw new Error('E2EE not initialized')
-    if (this.pairwiseSharedKeys.has(userId)) return
 
     const sharedKey = await deriveSharedKey(this.identityKeyPair.privateKey, peerPublicKey)
     this.pairwiseSharedKeys.set(userId, sharedKey)
@@ -418,7 +433,11 @@ export class GroupE2EEManager {
 
   removeMember(userId: number): void {
     this.pairwiseSharedKeys.delete(userId)
-    this.peerSenderChains.delete(userId)
+    for (const key of this.peerSenderChains.keys()) {
+      if (key.startsWith(`${userId}:`)) {
+        this.peerSenderChains.delete(key)
+      }
+    }
     this.currentRoomMembers.delete(userId)
     this.checkReadyState()
   }
@@ -433,19 +452,56 @@ export class GroupE2EEManager {
   }
 
   getMemberFingerprint(userId: number): string | null {
-    const chain = this.peerSenderChains.get(userId)
+    const chain = this.peerSenderChains.get(this.senderChainKey(userId, this.currentEpoch))
     if (!chain) return null
     return 'pending' // 需要对方公钥才能计算
   }
 
+  hasSharedKey(userId: number): boolean {
+    return this.pairwiseSharedKeys.has(userId)
+  }
+
+  async encryptForMember(userId: number, plaintext: string): Promise<{ ciphertext: string; iv: string }> {
+    const sharedKey = this.pairwiseSharedKeys.get(userId)
+    if (!sharedKey) throw new Error(`No shared key with user ${userId}`)
+
+    const sharedKeyRaw = await crypto.subtle.exportKey('raw', sharedKey)
+    return aesEncrypt(plaintext, arrayBufferToBase64(sharedKeyRaw))
+  }
+
+  async decryptFromMember(userId: number, ciphertext: string, iv: string): Promise<string> {
+    const sharedKey = this.pairwiseSharedKeys.get(userId)
+    if (!sharedKey) throw new Error(`No shared key with user ${userId}`)
+
+    const sharedKeyRaw = await crypto.subtle.exportKey('raw', sharedKey)
+    return aesDecrypt(ciphertext, iv, arrayBufferToBase64(sharedKeyRaw))
+  }
+
   // ============= Sender Key 分发 =============
 
-  private async distributeSenderKey(): Promise<Map<number, string>> {
+  async rotateSenderChain(): Promise<number> {
+    if (!this.identityKeyPair) throw new Error('E2EE not initialized')
+
+    this.currentEpoch++
+    this.mySenderChain = {
+      chainKey: arrayBufferToBase64(toArrayBuffer(crypto.getRandomValues(new Uint8Array(32)))),
+      messageNumber: 0,
+      publicKey: this.identityKeyPair.publicKey,
+      epoch: this.currentEpoch,
+    }
+    this.onStateChange?.(this.isReady())
+    return this.currentEpoch
+  }
+
+  async distributeCurrentSenderKey(targetUserIds?: number[]): Promise<Map<number, string>> {
     if (!this.mySenderChain) throw new Error('Sender chain not initialized')
 
     const encryptedKeys = new Map<number, string>()
+    const targets = targetUserIds ? new Set(targetUserIds) : null
 
     for (const [userId, sharedKey] of this.pairwiseSharedKeys.entries()) {
+      if (targets && !targets.has(userId)) continue
+
       const sharedKeyRaw = await crypto.subtle.exportKey('raw', sharedKey)
       const { ciphertext, iv } = await aesEncrypt(
         this.mySenderChain.chainKey,
@@ -456,6 +512,7 @@ export class GroupE2EEManager {
         chainKey: ciphertext,
         chainKeyIv: iv,
         publicKey: this.identityKeyPair!.publicKey,
+        epoch: this.mySenderChain.epoch,
       })
 
       encryptedKeys.set(userId, distributionPackage)
@@ -464,11 +521,15 @@ export class GroupE2EEManager {
     return encryptedKeys
   }
 
+  private distributeSenderKey(): Promise<Map<number, string>> {
+    return this.distributeCurrentSenderKey()
+  }
+
   async receiveSenderKey(senderId: number, encryptedPackage: string): Promise<void> {
     const sharedKey = this.pairwiseSharedKeys.get(senderId)
     if (!sharedKey) throw new Error(`No shared key with user ${senderId}`)
 
-    const { chainKey: encryptedChainKey, chainKeyIv, publicKey } = JSON.parse(encryptedPackage)
+    const { chainKey: encryptedChainKey, chainKeyIv, publicKey, epoch = 0 } = JSON.parse(encryptedPackage)
     const sharedKeyRaw = await crypto.subtle.exportKey('raw', sharedKey)
     const chainKey = await aesDecrypt(
       encryptedChainKey,
@@ -476,14 +537,15 @@ export class GroupE2EEManager {
       arrayBufferToBase64(sharedKeyRaw)
     )
 
-    this.peerSenderChains.set(senderId, {
+    this.peerSenderChains.set(this.senderChainKey(senderId, epoch), {
       chainKey,
       messageNumber: 0,
       publicKey,
+      epoch,
     })
 
     // 尝试解密之前缓存的消息
-    this.tryProcessPendingMessages(senderId)
+    this.tryProcessPendingMessages(senderId, epoch)
 
     console.log(`[E2EE] Installed sender key from user ${senderId}`)
   }
@@ -493,11 +555,11 @@ export class GroupE2EEManager {
   /**
    * 棘轮到目标序号（处理丢包/乱序）
    */
-  private async ratchetToTarget(senderId: number, targetNumber: number): Promise<void> {
-    const chain = this.peerSenderChains.get(senderId)
+  private async ratchetToTarget(senderId: number, epoch: number, targetNumber: number): Promise<void> {
+    const chain = this.peerSenderChains.get(this.senderChainKey(senderId, epoch))
     if (!chain) return
 
-    while (chain.messageNumber <= targetNumber) {
+    while (chain.messageNumber < targetNumber) {
       const { nextChainKey } = await ratchetStep(chain.chainKey)
       chain.chainKey = nextChainKey
       chain.messageNumber++
@@ -513,14 +575,15 @@ export class GroupE2EEManager {
     resolve: (s: string) => void,
     reject: (e: Error) => void
   ): void {
-    if (!this.pendingMessages.has(senderId)) {
-      this.pendingMessages.set(senderId, [])
+    const key = this.senderChainKey(senderId, msg.epoch ?? 0)
+    if (!this.pendingMessages.has(key)) {
+      this.pendingMessages.set(key, [])
     }
-    this.pendingMessages.get(senderId)!.push({ msg, resolve, reject })
+    this.pendingMessages.get(key)!.push({ msg, resolve, reject })
 
     // 缓存最多保留 50 条，超时自动清理
-    if (this.pendingMessages.get(senderId)!.length > 50) {
-      const oldest = this.pendingMessages.get(senderId)!.shift()
+    if (this.pendingMessages.get(key)!.length > 50) {
+      const oldest = this.pendingMessages.get(key)!.shift()
       oldest?.reject(new Error('Message expired in cache'))
     }
   }
@@ -528,11 +591,12 @@ export class GroupE2EEManager {
   /**
    * 尝试处理缓存中的消息
    */
-  private async tryProcessPendingMessages(senderId: number): Promise<void> {
-    const pending = this.pendingMessages.get(senderId)
+  private async tryProcessPendingMessages(senderId: number, epoch: number): Promise<void> {
+    const key = this.senderChainKey(senderId, epoch)
+    const pending = this.pendingMessages.get(key)
     if (!pending || pending.length === 0) return
 
-    const chain = this.peerSenderChains.get(senderId)
+    const chain = this.peerSenderChains.get(key)
     if (!chain) return
 
     // 按序号排序
@@ -542,7 +606,7 @@ export class GroupE2EEManager {
     const toProcess = [...pending]
     for (const { msg, resolve } of toProcess) {
       try {
-        await this.ratchetToTarget(senderId, msg.messageNumber)
+        await this.ratchetToTarget(senderId, msg.epoch ?? 0, msg.messageNumber)
         const { messageKey } = await ratchetStep(chain.chainKey)
         const plaintext = await aesDecrypt(msg.ciphertext, msg.iv, messageKey)
         chain.chainKey = (await ratchetStep(chain.chainKey)).nextChainKey
@@ -550,9 +614,9 @@ export class GroupE2EEManager {
         resolve(plaintext)
 
         // 从缓存移除
-        const index = this.pendingMessages.get(senderId)!.findIndex(p => p.msg === msg)
+        const index = this.pendingMessages.get(key)!.findIndex(p => p.msg === msg)
         if (index > -1) {
-          this.pendingMessages.get(senderId)!.splice(index, 1)
+          this.pendingMessages.get(key)!.splice(index, 1)
         }
       } catch {
         // 还不能解密，继续留在缓存
@@ -577,6 +641,7 @@ export class GroupE2EEManager {
     const message: EncryptedMessage = {
       version: 1,
       senderId: myUserId,
+      epoch: this.mySenderChain.epoch,
       messageNumber: currentMessageNumber,
       ciphertext,
       iv,
@@ -594,7 +659,8 @@ export class GroupE2EEManager {
   }
 
   async decryptMessage(message: EncryptedMessage): Promise<string> {
-    let senderChain = this.peerSenderChains.get(message.senderId)
+    const epoch = message.epoch ?? 0
+    let senderChain = this.peerSenderChains.get(this.senderChainKey(message.senderId, epoch))
 
     // 如果没有 Sender Chain，先缓存这条消息
     if (!senderChain) {
@@ -604,7 +670,7 @@ export class GroupE2EEManager {
       })
     }
 
-    await this.ratchetToTarget(message.senderId, message.messageNumber)
+    await this.ratchetToTarget(message.senderId, epoch, message.messageNumber)
     const { nextChainKey, messageKey } = await ratchetStep(senderChain.chainKey)
     const plaintext = await aesDecrypt(message.ciphertext, message.iv, messageKey)
 
@@ -622,6 +688,7 @@ export class GroupE2EEManager {
     this.mySenderChain = null
     this.peerSenderChains.clear()
     this.currentRoomMembers.clear()
+    this.currentEpoch = 0
     this.pendingMessages.clear()
   }
 }

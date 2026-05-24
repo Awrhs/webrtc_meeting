@@ -1,15 +1,18 @@
-FROM node:18-alpine AS builder
+FROM node:20-alpine AS builder
 
-# 换npm为淘宝镜像（大陆网络加速）
-RUN npm config set registry https://registry.npmmirror.com
+ARG NPM_REGISTRY=
+ARG VITE_API_HOST=http://localhost:8080
+ARG VITE_SFU_HOST=http://localhost:8081
+
+ENV VITE_API_HOST=${VITE_API_HOST}
+ENV VITE_SFU_HOST=${VITE_SFU_HOST}
 
 WORKDIR /app
 
-# copy package*.json (context已经是frontend目录了)
-COPY package*.json ./
+RUN if [ -n "$NPM_REGISTRY" ]; then npm config set registry "$NPM_REGISTRY"; fi
 
-# 使用npm install代替npm ci，因为package-lock不存在
-RUN npm install
+COPY package*.json ./
+RUN npm ci
 
 COPY . .
 RUN npm run build

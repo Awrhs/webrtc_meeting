@@ -5,9 +5,9 @@ services:
     image: postgres:15-alpine
     container_name: conference-postgres
     environment:
-      POSTGRES_DB: conference
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${DB_NAME:-conference}
+      POSTGRES_USER: ${DB_USER:-postgres}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ../backend/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql
@@ -32,20 +32,17 @@ services:
     ports:
       - "3478:3478"
       - "3478:3478/udp"
-      # 注意：在桥接模式下，过大的端口范围会导致Docker启动缓慢
-      # 开发环境只映射必要端口即可，如需完整端口范围请使用host网络模式（仅Linux原生环境）
       - "49152-49200:49152-49200/udp"
     command:
       - turnserver
       - --log-file=stdout
-      - --external-ip=$(detect-external-ip)
       - --realm=conference
-      - --user=username:password
+      - --user=${COTURN_USER:-username}:${COTURN_PASSWORD:-password}
       - --lt-cred-mech
     environment:
-      - TURN_STATIC_AUTH_SECRET=your-turn-secret-change-in-production
-      - TURN_USER=username
-      - TURN_PWD=password
+      TURN_STATIC_AUTH_SECRET: ${TURN_STATIC_AUTH_SECRET:-dev-turn-secret-change-in-production}
+      TURN_USER: ${COTURN_USER:-username}
+      TURN_PWD: ${COTURN_PASSWORD:-password}
     networks:
       - conference-net
     restart: unless-stopped
@@ -54,29 +51,47 @@ services:
     build:
       context: ..
       dockerfile: deployment/docker/Dockerfile.server
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
     container_name: conference-api
-    dns:
-      - 114.114.114.114
-      - 8.8.8.8
     environment:
+      GO_ENV: ${GO_ENV:-production}
       SERVER_PORT: 8080
       SFU_PORT: 8081
+      SFU_GRPC_PORT: 50051
+      SFU_ADDR: sfu-server:50051
       DB_HOST: postgres
       DB_PORT: 5432
-      DB_USER: postgres
-      DB_PASSWORD: postgres
-      DB_NAME: conference
+      DB_USER: ${DB_USER:-postgres}
+      DB_PASSWORD: ${DB_PASSWORD:-postgres}
+      DB_NAME: ${DB_NAME:-conference}
       REDIS_ADDR: redis:6379
-      REDIS_PASSWORD: ""
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
       JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
-      COTURN_URL: turn:localhost:3478
-      COTURN_USER: username
-      COTURN_PASSWORD: password
+      SFU_JWT_SECRET: ${SFU_JWT_SECRET:-your-sfu-secret-key-change-in-production}
+      SFU_CONTROL_TOKEN: ${SFU_CONTROL_TOKEN:-dev-sfu-control-token}
+      SFU_CALLBACK_TOKEN: ${SFU_CALLBACK_TOKEN:-dev-sfu-callback-token}
+      JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-168}
+      SFU_TOKEN_EXPIRY_MINUTES: ${SFU_TOKEN_EXPIRY_MINUTES:-5}
+      COTURN_URL: ${COTURN_URL:-turn:coturn:3478}
+      COTURN_USER: ${COTURN_USER:-username}
+      COTURN_PASSWORD: ${COTURN_PASSWORD:-password}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080}
+      SFU_ALLOW_UNAUTHENTICATED_DEV: ${SFU_ALLOW_UNAUTHENTICATED_DEV:-false}
+      HTTP_READ_TIMEOUT_SECONDS: ${HTTP_READ_TIMEOUT_SECONDS:-10}
+      HTTP_WRITE_TIMEOUT_SECONDS: ${HTTP_WRITE_TIMEOUT_SECONDS:-10}
+      SHUTDOWN_TIMEOUT_SECONDS: ${SHUTDOWN_TIMEOUT_SECONDS:-15}
+      RATE_LIMIT_AUTH_PER_MINUTE: ${RATE_LIMIT_AUTH_PER_MINUTE:-5}
+      RATE_LIMIT_API_PER_MINUTE: ${RATE_LIMIT_API_PER_MINUTE:-120}
+      RATE_LIMIT_WS_PER_MINUTE: ${RATE_LIMIT_WS_PER_MINUTE:-20}
+      RATE_LIMIT_SFU_WS_PER_MINUTE: ${RATE_LIMIT_SFU_WS_PER_MINUTE:-20}
+      RATE_LIMIT_SFU_MSG_PER_MINUTE: ${RATE_LIMIT_SFU_MSG_PER_MINUTE:-120}
     ports:
       - "8080:8080"
     depends_on:
       - postgres
       - redis
+      - sfu-server
     networks:
       - conference-net
     restart: unless-stopped
@@ -85,17 +100,32 @@ services:
     build:
       context: ..
       dockerfile: deployment/docker/Dockerfile.sfu
+      args:
+        GOPROXY: ${GOPROXY:-https://proxy.golang.org,direct}
     container_name: conference-sfu
-    dns:
-      - 114.114.114.114
-      - 8.8.8.8
     environment:
+      GO_ENV: ${GO_ENV:-production}
       SFU_PORT: 8081
+      SFU_GRPC_PORT: 50051
       API_SERVER_HOST: ${API_SERVER_HOST:-http://api-server:8080}
+      REDIS_ADDR: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+      JWT_SECRET: ${JWT_SECRET:-your-secret-key-change-in-production}
+      SFU_JWT_SECRET: ${SFU_JWT_SECRET:-your-sfu-secret-key-change-in-production}
+      SFU_CONTROL_TOKEN: ${SFU_CONTROL_TOKEN:-dev-sfu-control-token}
+      SFU_CALLBACK_TOKEN: ${SFU_CALLBACK_TOKEN:-dev-sfu-callback-token}
+      COTURN_URL: ${COTURN_URL:-turn:coturn:3478}
+      COTURN_USER: ${COTURN_USER:-username}
+      COTURN_PASSWORD: ${COTURN_PASSWORD:-password}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080}
+      SFU_ALLOW_UNAUTHENTICATED_DEV: ${SFU_ALLOW_UNAUTHENTICATED_DEV:-false}
+      RATE_LIMIT_SFU_WS_PER_MINUTE: ${RATE_LIMIT_SFU_WS_PER_MINUTE:-20}
+      RATE_LIMIT_SFU_MSG_PER_MINUTE: ${RATE_LIMIT_SFU_MSG_PER_MINUTE:-120}
     ports:
       - "8081:8081"
     depends_on:
-      - api-server
+      - postgres
+      - redis
     networks:
       - conference-net
     restart: unless-stopped
@@ -104,15 +134,18 @@ services:
     build:
       context: ../frontend
       dockerfile: ../deployment/docker/Dockerfile.frontend
+      args:
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
+        VITE_API_HOST: ${VITE_API_HOST:-http://localhost:8080}
+        VITE_SFU_HOST: ${VITE_SFU_HOST:-http://localhost:8081}
     container_name: conference-frontend
-    dns:
-      - 114.114.114.114
-      - 8.8.8.8
     ports:
       - "3000:80"
     depends_on:
       - api-server
       - sfu-server
+    networks:
+      - conference-net
     restart: unless-stopped
 
   nginx:
@@ -120,11 +153,8 @@ services:
     container_name: conference-nginx
     ports:
       - "80:80"
-      - "443:443"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf
-      - ./certbot/conf:/etc/letsencrypt
-      - ./certbot/www:/var/www/certbot
     depends_on:
       - frontend
       - api-server

@@ -28,6 +28,8 @@ const (
 	MessageTypeMediaState       MessageType = "media_state"
 	MessageTypeConnectionFailed MessageType = "connection_failed"
 	MessageTypePublicKey        MessageType = "public_key"
+	MessageTypeSenderKey        MessageType = "sender_key"
+	MessageTypeKeyRotation      MessageType = "key_rotation"
 )
 
 type Message struct {
@@ -418,7 +420,7 @@ func (c *Client) handleMessage(msg *Message) {
 		}
 		c.hub.RemoveClientFromRoom(c, msg.RoomID)
 		c.hub.BroadcastUserLeft(msg.RoomID, c.userID)
-	case MessageTypeOffer, MessageTypeAnswer, MessageTypeIceCandidate, MessageTypeMediaState, MessageTypePublicKey:
+	case MessageTypeOffer, MessageTypeAnswer, MessageTypeIceCandidate, MessageTypeMediaState, MessageTypePublicKey, MessageTypeSenderKey, MessageTypeKeyRotation:
 		if msg.RoomID == 0 || !c.isRoomJoined(msg.RoomID) || !c.isActiveRoomMember(msg.RoomID) {
 			c.hub.logger.Warn("Unauthorized signaling message", zap.Uint("userID", c.userID), zap.Uint("roomID", msg.RoomID), zap.String("type", string(msg.Type)))
 			return

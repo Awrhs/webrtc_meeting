@@ -46,18 +46,13 @@ func (h *Handler) SendMessage(c *gin.Context) {
 		return
 	}
 
-	var req struct {
-		ReceiverID *uint              `json:"receiver_id"`
-		Type       models.MessageType `json:"type"`
-		Content    string             `json:"content" binding:"required"`
-	}
-
+	var req models.SendMessageRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
-	message, err := h.chatService.SendMessage(senderID, uint(roomID), req.ReceiverID, req.Type, req.Content)
+	message, err := h.chatService.SendMessage(senderID, uint(roomID), req.ReceiverID, req.Type, req.Content, req.Encrypted)
 	if err != nil {
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return

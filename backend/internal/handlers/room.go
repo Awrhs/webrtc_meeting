@@ -423,24 +423,10 @@ func (h *Handler) UpdateMediaState(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": "permission denied"})
 		return
 	}
-	if err := h.roomService.UpdateMediaState(uint(roomID), userID, req.VideoEnabled, req.AudioEnabled); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-		return
-	}
-
-	videoEnabled := false
-	audioEnabled := false
-	members, err := h.roomService.GetRoomMembersInfo(uint(roomID))
+	videoEnabled, audioEnabled, err := h.roomService.UpdateMediaState(uint(roomID), userID, req.VideoEnabled, req.AudioEnabled)
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
-	}
-	for _, roomMember := range members {
-		if roomMember != nil && roomMember.UserID == userID {
-			videoEnabled = roomMember.IsVideoOn
-			audioEnabled = roomMember.IsAudioOn
-			break
-		}
 	}
 
 	h.hub.BroadcastMediaState(uint(roomID), userID, videoEnabled, audioEnabled)

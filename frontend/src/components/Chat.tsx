@@ -24,6 +24,7 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
   const [e2eeReady, setE2eeReady] = useState(false)
   const [myFingerprint, setMyFingerprint] = useState('')
   const [debugInfo, setDebugInfo] = useState('')
+  const [decryptedMessages, setDecryptedMessages] = useState<Record<number, string>>({})
   const [fingerprintModalVisible, setFingerprintModalVisible] = useState(false)
   const [memberFingerprints, setMemberFingerprints] = useState<Array<{ userId: number; name: string; fingerprint: string }>>([])
 
@@ -37,7 +38,8 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
           signaling.send({
             type: 'sender_key',
             room_id: roomId,
-            user_id: targetUserId,
+            user_id: user?.id,
+            target_id: targetUserId,
             data: {
               from_user: user?.id,
               encrypted_chain_key: encryptedChainKey,
@@ -57,21 +59,23 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
       }
     )
 
-    groupE2EEManager.init(user?.id).catch(console.error)
+    if (!signaling) {
+      groupE2EEManager.init(user?.id).catch(console.error)
+    }
 
     // 监听 Sender Key 分发消息
     if (signaling) {
       signaling.on('sender_key', async (msg: any) => {
-        if (msg.user_id === user?.id) {
-          try {
-            await groupE2EEManager.receiveSenderKey(
-              msg.data.from_user,
-              msg.data.encrypted_chain_key
-            )
-            console.log(`[Chat] Received sender key from user ${msg.data.from_user}`)
-          } catch (err) {
-            console.error('[Chat] Failed to receive sender key:', err)
-          }
+        if (msg.data?.key_type === 'media') return
+        if (msg.target_id && msg.target_id !== user?.id) return
+        try {
+          await groupE2EEManager.receiveSenderKey(
+            msg.data.from_user,
+            msg.data.encrypted_chain_key
+          )
+          console.log(`[Chat] Received sender key from user ${msg.data.from_user}`)
+        } catch (err) {
+          console.error('[Chat] Failed to receive sender key:', err)
         }
       })
     }
@@ -86,6 +90,22 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
   useEffect(() => {
     scrollToBottom()
   }, [messages])
+
+  useEffect(() => {
+    messages.forEach(message => {
+      if (!message.encrypted || decryptedMessages[message.id]) return
+      try {
+        const encryptedData = JSON.parse(message.content) as EncryptedMessage
+        groupE2EEManager.decryptMessage(encryptedData)
+          .then(plaintext => {
+            setDecryptedMessages(prev => ({ ...prev, [message.id]: plaintext }))
+          })
+          .catch(() => {})
+      } catch {
+        setDecryptedMessages(prev => ({ ...prev, [message.id]: '[消息格式错误]' }))
+      }
+    })
+  }, [messages, decryptedMessages])
 
   const showFingerprintModal = async () => {
     const fingerprints: Array<{ userId: number; name: string; fingerprint: string }> = [
@@ -113,7 +133,7 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
         await groupE2EEManager.saveToStorage(user.id)
       }
 
-      await fetch(`/api/v1/rooms/${roomId}/messages`, {
+      const response = await fetch(`/api/v1/rooms/${roomId}/messages`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -125,6 +145,9 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
           encrypted,
         }),
       })
+      if (!response.ok) {
+        throw new Error('message send failed')
+      }
 
       setInput('')
     } catch (error) {
@@ -139,16 +162,7 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
     if (!message.encrypted) {
       return message.content
     }
-
-    try {
-      const encryptedData = JSON.parse(message.content) as EncryptedMessage
-      groupE2EEManager.decryptMessage(encryptedData).catch(() => {
-        // 解密失败会被缓存，等收到 Sender Key 后自动重试
-      })
-      return '[已加密消息 - 正在解密...]'
-    } catch {
-      return '[消息格式错误]'
-    }
+    return decryptedMessages[message.id] || '[已加密消息 - 正在解密...]'
   }
 
   const isSelf = (message: Message) => message.sender_id === user?.id
@@ -159,7 +173,7 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
         <Space>
           {e2eeReady ? (
             <Tag color="green" icon={<LockOutlined />}>
-              端到端加密 (Sender Keys / MLS)
+              端到端加密 (Sender Keys)
             </Tag>
           ) : (
             <Tag color="orange">正在协商加密密钥...</Tag>

@@ -50,6 +50,7 @@ func main() {
 
 	mux := http.NewServeMux()
 	wsLimiter := middleware.NewIPLimiter(cfg.RateLimitSFUWSPerMinute, time.Minute)
+	defer wsLimiter.Stop()
 	// 注册 WebSocket 处理器：前端测试页面通过此端点与 SFU 建立信令连接
 	mux.Handle("/ws", wsLimiter.HTTP(http.HandlerFunc(sfuServer.HandleWebSocket)))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {

@@ -45,9 +45,9 @@ frontend/src/
 │   └── roomSlice.ts       # 房间/成员/消息状态 + async thunks
 └── utils/
     ├── webrtc.ts          # ✅ SFUConnection 核心类（WebSocket+WebRTC）
-    ├── signaling.ts       # 信令WebSocket客户端（聊天/控制）
+    ├── signaling.ts       # 信令WebSocket客户端（聊天/控制/E2EE密钥分发）
     ├── api.ts             # Axios实例 + 拦截器
-    └── encryption.ts      # AES加密工具（待整合）
+    └── encryption.ts      # 文本消息 E2EE 工具
 ```
 
 ### 双 WebSocket 架构设计
@@ -101,13 +101,14 @@ SFU 媒体连接默认不再接受裸连。用户必须先通过 API 登录并�
 - **gRPC SFU控制通道** - 踢人/静音等管理操作通过gRPC调用，并使用共享控制 token 鉴权
 - **SFU 入会鉴权** - API 签发短期 `sfu_token`，SFU 校验 `purpose=sfu_join`、`room_id`、`user_id` 后才允许媒体连接
 - **安全与运维基础** - 支持 Allowed Origins、WebSocket Origin 校验、基础限流、`/healthz`、`/readyz`、`/metrics.json` 和优雅关闭
-- **SFU音视频通信核心** - 完整的WebRTC实现（前端 `SFUConnection` 类封装）
-  - ✅ ICE候选处理 - 双向WebSocket交换，支持NAT穿透，含断线自动重连
-  - ✅ SDP Offer/Answer协商 - 连接SFU专用WebSocket端口完成握手
-  - ✅ 媒体流转发 - Pion WebRTC SFU转发音视频流，onTrack回调正确触发
-  - ✅ 多轨支持 - 摄像头/屏幕共享通过 replaceTrack 无缝切换
-  - ✅ 自动重连 - WebSocket/ICE连接失败自动重试5次，间隔3秒
-- **SFU管理功能** - 通过gRPC强制静音，通过信令广播通知所有客户端
+- **SFU音视频通信核心** - WebRTC 音视频会议主链路（前端 `SFUConnection` 类封装）
+  - ✅ ICE候选处理 - 通过 SFU WebSocket 交换候选，支持NAT穿透，含有限自动重连
+  - ✅ SDP Offer/Answer协商 - 支持初次协商和 SFU 发起的 renegotiation
+  - ✅ 媒体流转发 - Pion WebRTC SFU转发音视频流，onTrack回调触发远端渲染
+  - ✅ 多轨支持 - 摄像头和屏幕共享可作为独立视频轨道同时发布
+  - ✅ 订阅清理 - 用户离开或被踢后清理其他 PeerConnection 中的旧 sender 并重新协商
+- **文本消息 E2EE 基础链路** - 群聊文本支持前端加密、密钥信令分发、后端密文持久化和接收端解密显示
+- **SFU管理功能** - 通过gRPC强制踢人/静音，通过信令广播通知所有客户端
 
 
 ## 🏗️ 项目架构
@@ -235,7 +236,7 @@ conference-sfu/
 | 文件 | 职责 | 应实现的具体逻辑 |
 |------|------|-----------------|
 | `auth.go` | 用户认证 HTTP API | ① `Register`：解析请求 → 调用 `userService.Register` → 返回用户信息；② `Login`：解析账号密码 → 调用 `userService.Login` → 返回 JWT Token + 用户信息；③ `GetMe`/`UpdateProfile`/`UpdatePassword`：CRUD 当前用户；④ `AuthMiddleware`：提取 Bearer Token → 解析 JWT → 将 `user_id` 写入 Gin Context；⑤ `ValidateToken`：JWT 签名验证与 claims 解析 |
-| `room.go` | 房间管理 HTTP API | ① `CreateRoom`/`GetRoom`/`GetMyRooms`：房间 CRUD；② `JoinRoom`：加入逻辑 + 广播 `user_joined` 事件 + 返回成员列表和权限；③ `DeleteRoom`/`LockRoom`/`UnlockRoom`：房主操作（权限检查）；④ `KickMember`/`MuteMember`/`UnmuteMember`：管理员操作 + 调用 SFU gRPC `KickUser`/`MuteUser` + 广播信令事件；⑤ `SetAdmin`/`RemoveAdmin`/`TransferOwner`：权限变更 + 广播 `role_changed`；⑥ `UpdateMediaState`：广播媒体状态变更；⑦ `NotifyConnectionFailed`：SFU 回调接口，通知某用户 ICE 连接失败 |
+| `room.go` | 房间管理 HTTP API | ① `CreateRoom`/`GetRoom`/`GetMyRooms`：房间 CRUD；② `JoinRoom`：加入逻辑 + 广播 `user_joined` 事件 + 返回成员列表、权限和短期 `sfu_token`；③ `DeleteRoom`/`LockRoom`/`UnlockRoom`：房主操作（权限检查）；④ `KickMember`/`MuteMember`/`UnmuteMember`：管理员操作 + 调用 SFU gRPC `KickUser`/`MuteUser` + 广播信令事件；⑤ `SetAdmin`/`RemoveAdmin`/`TransferOwner`：权限变更 + 广播 `role_changed`；⑥ `UpdateMediaState`：校验成员身份、持久化媒体状态并广播 `video_enabled/audio_enabled`；⑦ `NotifyConnectionFailed`：SFU 回调接口，通知某用户 ICE 连接失败 |
 | `chat.go` | 聊天消息 HTTP API | ① `GetMessages`：分页查询房间历史消息；② `SendMessage`：持久化消息 + 通过 Hub 广播（私聊则单播）；③ `UploadPublicKey`/`GetPublicKey`/`DeletePublicKey`：E2EE 公钥管理 |
 
 #### 5. 服务层 `internal/service/`
@@ -244,7 +245,7 @@ conference-sfu/
 |------|------|-----------------|
 | `user.go` | 用户业务逻辑 | ① `Register`：唯一性检查（email/phone/username）→ bcrypt 密码哈希 → 创建用户；② `Login`：账号类型自动识别（手机号/邮箱/用户名）→ bcrypt 密码比对 → 生成 JWT → Redis 标记在线；③ `GetUserByID`：先查 Redis 缓存，miss 再查 DB 并回写缓存；④ `UpdateProfile`/`UpdatePassword`：更新后清除 Redis 缓存 |
 | `room.go` | 房间业务逻辑（核心） | ① `CreateRoom`：生成 6 位 `room_id` 和 8 位邀请码 → 密码 bcrypt 哈希 → 事务创建房间 + 添加房主成员 → Redis 缓存；② `JoinRoom`：按 `room_id` 或主键查找 → 检查房间锁定/踢出封禁/人数上限/密码或邀请码验证 → 软删除恢复或新成员记录 → 更新房间人数 → 清除缓存；③ `KickMember`：权限检查（不能踢房主/同级管理员）→ 软删除成员 → 创建 `KickBan`（10 分钟有效期）→ 事务提交 → 清除缓存；④ `MuteMember`：权限检查 → 更新 `RoomMember.IsMuted`；⑤ `SetAdmin`/`TransferOwner`：仅房主可操作 → 事务更新角色；⑥ `CheckPermission`/`HasPermission`：基于 `RolePermissions` 矩阵的细粒度权限检查；⑦ `UpdateMediaState`：更新 `IsVideoOn`/`IsAudioOn`；⑧ 所有写操作后联动 Redis 缓存失效 |
-| `chat.go` | 聊天业务逻辑 | ① `SendMessage`：组装 `Message` 实体（私聊设置 `Encrypted=true`）→ 调用 Repository 持久化；② `GetMessages`：分页查询并转换为 `MessageResponse`；③ `SavePublicKey`/`GetPublicKey`/`DeletePublicKey`：E2EE 公钥的 CRUD |
+| `chat.go` | 聊天业务逻辑 | ① `SendMessage`：校验发送者是 active room member，私聊时校验 receiver 同房间，保存前端传入的 `Encrypted` 标记并持久化；② `GetMessages`：校验成员身份后分页查询并转换为 `MessageResponse`；③ `SavePublicKey`/`GetPublicKey`/`DeletePublicKey`：E2EE 公钥的 CRUD |
 
 #### 6. 数据访问层 `internal/repository/`
 
@@ -258,7 +259,7 @@ conference-sfu/
 
 | 文件 | 职责 | 应实现的具体逻辑 |
 |------|------|-----------------|
-| `server.go` | SFU 媒体引擎（最核心） | ① **数据结构**：`Room`（房间，含 `Peers` 映射）、`Peer`（用户，含 `PC` PeerConnection、`Conn` WebSocket、`Tracks` 本地轨道映射、`Subscriptions` RTPSender 列表）、`TrackInfo`（轨道元数据：SSRC/Kind/StreamID/启用状态）；② **生命周期**：`HandleWebSocket`（WebSocket 升级 → 消息循环：`join`→`handleJoin`、`offer`→`handleOffer`、`ice-candidate`→`handleIceCandidate`）；③ **WebRTC 协商**：`handleJoin` 创建 `PeerConnection`（Pion API + 标准 ICE 配置）→ 注册 `OnTrack`/`OnICECandidate`/`OnConnectionStateChange` → 发送 `joined` → 为新用户订阅房间内已有轨道 → 发送 `ssrc_mapping`；④ **媒体转发**：`onTrack` 收到远程轨道 → 创建 `TrackLocalStaticRTP` → 启动 goroutine `Read/Write` 转发 RTP 包 → 为房间内所有其他用户 `AddTrack` → 广播 `ssrc_mapping`；⑤ **ICE 交换**：双向通过 WebSocket 透传 `ice-candidate` 消息；⑥ **控制方法**：`KickUser`（关闭 PC + 清理房间）、`MuteUser`（设置 `TrackInfo.IsEnabled` + 广播 `muted` 信令）、`GetRoomStats`/`ListRooms` |
+| `server.go` | SFU 媒体引擎（最核心） | ① **数据结构**：`Room`、`Peer`、`TrackInfo`、订阅 sender 和 `addedTracks` 去重表；② **接入鉴权**：`HandleWebSocket` 校验 Origin 和短期 `sfu_token`，join 时以 token claims 为准；③ **WebRTC 协商**：创建 `PeerConnection`，处理初次 offer/answer、SFU renegotiation、ICE candidate 和 `ssrc_mapping`；④ **媒体转发**：`onTrack` 创建 `TrackLocalStaticRTP` 并转发 RTP，向其他 peer AddTrack 后触发 renegotiation；⑤ **清理**：用户离开/被踢/连接失败时移除其他 peer 的订阅 sender、清理 addedTracks 并重新协商；⑥ **控制方法**：`KickUser`、`MuteUser`、`GetRoomStats`/`ListRooms` |
 | `grpc_server.go` | gRPC 控制服务端 | ① `ControlServer` 实现 protobuf 生成的 `SFUControlServer` 接口；② 将 gRPC 请求参数转换为 `SFUServer` 方法调用：`KickUser`/`MuteUser`/`SetVideoEnabled`（占位）/`GetRoomStats`/`ListRooms`/`ClosePeerConnection`；③ `StartGRPCServer`：创建 TCP Listener → 注册 gRPC 服务 → 后台 goroutine 启动 |
 | `grpc_client.go` | gRPC 控制客户端 | ① `ControlClient`：维护到 SFU gRPC 服务的 `grpc.ClientConn`；② 提供 `KickUser`/`MuteUser`/`ClosePeerConnection`/`GetRoomStats`/`ListRooms` 的同步调用封装（5 秒超时 + 错误日志） |
 
@@ -308,11 +309,14 @@ conference-sfu/
 ### 使用 Docker Compose 启动
 
 ```bash
-# 复制环境变量（如需要）
+# 复制环境变量并按需修改 secret、数据库密码、TURN 凭据和 ALLOWED_ORIGINS
 cp .env.example .env
 
+# 检查 Compose 配置是否能正确展开
+docker compose -f deployment/docker-compose.yml config
+
 # 启动所有服务（包括数据库、Redis、Coturn、API、SFU、前端）
-docker-compose -f deployment/docker-compose.yml up -d --build
+docker compose -f deployment/docker-compose.yml up -d --build
 ```
 
 访问：
@@ -320,13 +324,14 @@ docker-compose -f deployment/docker-compose.yml up -d --build
 - API: http://localhost:8080
 - SFU: http://localhost:8081
 
+> 当前 Docker Compose 默认只提供 HTTP，本地开发可用；生产环境需要在外层配置 HTTPS/WSS 反向代理和正式证书。
+
 ### 本地开发
 
 #### 方式一：Docker 方式（推荐，最简单）
 ```bash
-cd deployment
-docker-compose up -d postgres redis coturn
-docker-compose up --build api-server sfu-server frontend
+docker compose -f deployment/docker-compose.yml up -d postgres redis coturn
+docker compose -f deployment/docker-compose.yml up --build api-server sfu-server frontend
 ```
 
 访问 http://localhost:3000
@@ -337,8 +342,7 @@ docker-compose up --build api-server sfu-server frontend
 
 ##### 1. 启动基础设施
 ```bash
-cd deployment
-docker-compose up -d postgres redis coturn
+docker compose -f deployment/docker-compose.yml up -d postgres redis coturn
 ```
 
 ##### 2. 编译 gRPC 代码（首次运行）
@@ -504,9 +508,9 @@ SFU_ALLOW_UNAUTHENTICATED_DEV=true
 
 ---
 
-## 🔍 已知问题
+## 🔍 当前状态与后续改进
 
-> 📌 **所有之前列出的 Bug 均已全部修复完成**
+核心会议链路、房间权限、SFU 入会鉴权、普通信令成员校验、聊天成员校验和文本消息 E2EE 基础链路已经实现。文本 E2EE 已支持成员变更后的 Sender Chain epoch 轮换；媒体 E2EE 已提供基于浏览器 Encoded Transform 的可选高安全模式。仍建议继续补充自动化权限测试、消息重放防护、设备身份验证和跨浏览器兼容验证。
 
 ---
 
@@ -514,15 +518,16 @@ SFU_ALLOW_UNAUTHENTICATED_DEV=true
 
 | 优先级 | 功能 | 实现说明 |
 |-------|------|---------|
-| 🟢 中 | **群聊端到端加密 (Sender Keys)** | 基于 Signal Sender Keys 架构，支持多用户群聊加密<br>• ECDH P-256 两两密钥协商<br>• HKDF 棘轮算法派生消息密钥<br>• Sender Key 通过加密信令分发<br>• 消息序号追赶 + 缓存自动解密 |
+| 🟡 中 | **群聊端到端加密基础链路 (Sender Keys)** | 支持多用户群聊文本加密的基础流程<br>• ECDH P-256 两两密钥协商<br>• HKDF 棘轮算法派生消息密钥<br>• Sender Key 通过成员校验后的信令分发<br>• 成员加入/离开/被踢后轮换 per-sender epoch<br>• 后端只持久化密文和 `encrypted` 标记<br>• 仍需补齐消息重放防护和设备身份验证 |
+| 🔴 高 | **媒体流端到端加密高安全模式** | 基于 WebRTC Encoded Transform / `RTCRtpScriptTransform` 在浏览器端加密 encoded audio/video frame，SFU 只转发密文 payload；不支持的浏览器回退到 DTLS-SRTP 并显示状态提示 |
 | 🟢 中 | **公钥指纹验证** | SHA-256 指纹，8位可读格式，UI 弹窗支持线下比对 |
 | 🟢 低 | **密钥持久化** | PBKDF2 加密存储到 localStorage，刷新页面恢复密钥状态 |
 | 🟡 中 | **屏幕共享大屏模式** | 开启屏幕共享自动切换布局，大屏显示共享内容，侧边栏显示摄像头 |
 | 🟡 中 | **全局错误边界** | React ErrorBoundary 捕获渲染错误，友好提示用户 |
 | 🟡 中 | **TURN 服务器支持** | 支持环境变量配置 STUN/TURN 服务器，用于 NAT 穿透 |
 | 🟡 中 | **消息发送错误处理** | 发送失败时显示用户友好的错误提示 |
-| 🔴 高 | **SSRC 流映射** | SFU 精确按 userId 匹配远程流，解决流归属问题 |
-| 🔴 高 | **多路流支持** | 同一用户可同时发送摄像头和屏幕共享流，SFU 独立转发 |
+| 🟢 高 | **SSRC 流映射** | SFU 下发 SSRC mapping，前端将远端流归属到对应 userId |
+| 🟢 高 | **多路流支持** | 同一用户可同时发送摄像头和屏幕共享流，SFU 独立转发 |
 | 🟡 中 | **管理员强制静音** | 音频轨道转发实际控制，静音状态广播给所有客户端 |
 
 ### ✨ 待实现的高级功能
@@ -530,8 +535,6 @@ SFU_ALLOW_UNAUTHENTICATED_DEV=true
 
 | 优先级 | 功能 | 技术方案 | 预期收益 |
 |-------|------|---------|---------|
-| 🔴 高 | **媒体流端到端加密** | WebRTC Insertable Streams / Frame Encryption | 真正的全流程 E2EE |
-| 🔴 高 | **成员变更密钥轮换** | MLS 协议 TreeKEM 组密钥管理 | 加入/退出后向保密 |
 | 🟡 中 | **消息重放防护** | 消息序号验证 + 滑动窗口 | 防止消息重放攻击 |
 | 🟡 中 | 选择性订阅 | 前端通知 SFU 只订阅特定用户的流 | 降低带宽占用，支持大型会议 |
 | 🟢 低 | Simulcast 多层编码 | 发送方编码多分辨率，SFU 按需转发 | 适应不同网络环境 |
@@ -555,14 +558,14 @@ SFU_ALLOW_UNAUTHENTICATED_DEV=true
 2. **音频互通** - 验证能听到对方声音
 3. **屏幕共享** - 验证摄像头和屏幕共享能同时显示（需 SFU 支持多路流）
 4. **成员列表同步** - 静音/角色变更能实时广播
-5. **SSRC 映射** - SFU 实现流与用户的正确关联
+5. **SSRC 映射** - 验证远端流能正确归属到对应用户
 
 > **注**：文本 E2EE 已在前端实现，无需 SFU 参与
 
 ### 后端服务启动顺序
 ```bash
 # 1. 启动基础设施（PostgreSQL + Redis）
-docker-compose -f deployment/docker-compose.yml up -d postgres redis
+docker compose -f deployment/docker-compose.yml up -d postgres redis
 
 # 2. 启动API Server (端口8080)
 cd backend && go run cmd/server/main.go
@@ -570,7 +573,7 @@ cd backend && go run cmd/server/main.go
 # 3. 启动SFU Server (端口8081 + gRPC 50051)
 cd backend && go run cmd/sfu/main.go
 
-# 4. 启动前端 (端口5173)
+# 4. 启动前端 (端口3000)
 cd frontend && npm install && npm run dev
 ```
 
@@ -583,10 +586,11 @@ cd frontend && npm install && npm run dev
 
 > **关于 E2EE 和媒体加密的特别说明**：
 >
-> - 文本消息侧包含 E2EE 相关模型和前端加密工具，但仍需要结合实际产品流程验证密钥交换、指纹校验、成员变更密钥轮换等完整安全语义。
+> - 文本消息侧包含 E2EE 相关模型和前端加密工具，已支持 Sender Keys 基础链路和成员变更后的 per-sender epoch 轮换；仍需要结合实际产品流程继续补齐重放防护、设备身份验证和完整审计。
 > - 音视频媒体使用 WebRTC 标准的 DTLS-SRTP 传输加密：浏览器到 SFU、SFU 到浏览器每一段链路都是加密传输。
-> - 这不等同于真正的参会者到参会者媒体 E2EE。当前 SFU 需要接收并转发 RTP 载荷，理论上 SFU 侧仍可访问媒体内容。
-> - 如果要实现真正的媒体 E2EE，需要在浏览器端引入 WebRTC Insertable Streams / Encoded Transform，对 encoded audio/video frame 做端侧加密，SFU 只转发密文。
+> - 项目提供可选媒体 E2EE 高安全模式：支持 `RTCRtpScriptTransform` 的浏览器会在端侧加密 encoded audio/video frame，SFU 只转发密文 RTP payload。
+> - 媒体 E2EE 受浏览器支持限制；不支持的浏览器会回退到 DTLS-SRTP 传输加密并在 UI 中显示状态。
+> - 媒体 E2EE 开启后，服务端录制、转码、转写和智能摘要等依赖明文媒体的能力不可用，除非引入持钥客户端/录制机器人并改变信任模型。
 
 ## 📄 许可证
 

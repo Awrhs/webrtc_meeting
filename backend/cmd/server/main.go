@@ -57,6 +57,9 @@ func main() {
 	authLimiter := middleware.NewIPLimiter(cfg.RateLimitAuthPerMinute, time.Minute)
 	apiLimiter := middleware.NewIPLimiter(cfg.RateLimitAPIPerMinute, time.Minute)
 	wsLimiter := middleware.NewIPLimiter(cfg.RateLimitWSPerMinute, time.Minute)
+	defer authLimiter.Stop()
+	defer apiLimiter.Stop()
+	defer wsLimiter.Stop()
 
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     cfg.AllowedOrigins,

@@ -31,7 +31,7 @@ type RoomService interface {
 	HasPermission(roomID uint, userID uint, permission models.Permission) (bool, error)
 	GetMemberPermissions(roomID uint, userID uint) ([]models.Permission, error)
 	GetMemberRole(roomID uint, userID uint) (models.Role, error)
-	UpdateMediaState(roomID uint, userID uint, videoOn, audioOn *bool) error
+	UpdateMediaState(roomID uint, userID uint, videoOn, audioOn *bool) (bool, bool, error)
 	GenerateSFUToken(roomID uint, userID uint) (string, error)
 	LogAudit(roomID, userID uint, targetID *uint, action, details, ipAddress, userAgent string) error
 }
@@ -492,14 +492,31 @@ func (s *roomService) GetRoomMembersInfo(roomID uint) ([]*models.RoomMemberInfo,
 	if err != nil {
 		return nil, err
 	}
+	if len(members) == 0 {
+		return []*models.RoomMemberInfo{}, nil
+	}
 
-	result := make([]*models.RoomMemberInfo, len(members))
-	for i, member := range members {
-		user, err := s.userRepo.FindByID(member.UserID)
-		if err != nil {
+	userIDs := make([]uint, 0, len(members))
+	for _, member := range members {
+		userIDs = append(userIDs, member.UserID)
+	}
+
+	users, err := s.userRepo.FindByIDs(userIDs)
+	if err != nil {
+		return nil, err
+	}
+	usersByID := make(map[uint]*models.User, len(users))
+	for _, user := range users {
+		usersByID[user.ID] = user
+	}
+
+	result := make([]*models.RoomMemberInfo, 0, len(members))
+	for _, member := range members {
+		user, ok := usersByID[member.UserID]
+		if !ok {
 			continue
 		}
-		result[i] = &models.RoomMemberInfo{
+		result = append(result, &models.RoomMemberInfo{
 			ID:        member.ID,
 			UserID:    member.UserID,
 			Nickname:  user.Nickname,
@@ -508,7 +525,7 @@ func (s *roomService) GetRoomMembersInfo(roomID uint) ([]*models.RoomMemberInfo,
 			IsMuted:   member.IsMuted,
 			IsVideoOn: member.IsVideoOn,
 			IsAudioOn: member.IsAudioOn,
-		}
+		})
 	}
 	return result, nil
 }
@@ -561,10 +578,10 @@ func (s *roomService) GetMemberRole(roomID uint, userID uint) (models.Role, erro
 	return member.Role, nil
 }
 
-func (s *roomService) UpdateMediaState(roomID uint, userID uint, videoOn, audioOn *bool) error {
+func (s *roomService) UpdateMediaState(roomID uint, userID uint, videoOn, audioOn *bool) (bool, bool, error) {
 	member, err := s.roomRepo.GetMember(roomID, userID)
 	if err != nil {
-		return err
+		return false, false, err
 	}
 	if videoOn != nil {
 		member.IsVideoOn = *videoOn
@@ -572,7 +589,10 @@ func (s *roomService) UpdateMediaState(roomID uint, userID uint, videoOn, audioO
 	if audioOn != nil {
 		member.IsAudioOn = *audioOn
 	}
-	return s.roomRepo.UpdateMember(member)
+	if err := s.roomRepo.UpdateMember(member); err != nil {
+		return false, false, err
+	}
+	return member.IsVideoOn, member.IsAudioOn, nil
 }
 
 func (s *roomService) GenerateSFUToken(roomID uint, userID uint) (string, error) {

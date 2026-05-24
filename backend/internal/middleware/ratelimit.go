@@ -19,14 +19,24 @@ type IPLimiter struct {
 	window   time.Duration
 	visitors map[string]*visitor
 	mu       sync.Mutex
+	stopCh   chan struct{}
+	once     sync.Once
 }
 
 func NewIPLimiter(limit int, window time.Duration) *IPLimiter {
-	return &IPLimiter{
+	if window <= 0 {
+		window = time.Minute
+	}
+	limiter := &IPLimiter{
 		limit:    limit,
 		window:   window,
 		visitors: make(map[string]*visitor),
+		stopCh:   make(chan struct{}),
 	}
+	if limit > 0 {
+		go limiter.cleanupLoop()
+	}
+	return limiter
 }
 
 func (l *IPLimiter) Allow(ip string) bool {
@@ -47,6 +57,38 @@ func (l *IPLimiter) Allow(ip string) bool {
 	}
 	v.count++
 	return true
+}
+
+func (l *IPLimiter) Stop() {
+	l.once.Do(func() {
+		close(l.stopCh)
+	})
+}
+
+func (l *IPLimiter) cleanupLoop() {
+	ticker := time.NewTicker(l.window)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			l.cleanupStaleVisitors(time.Now())
+		case <-l.stopCh:
+			return
+		}
+	}
+}
+
+func (l *IPLimiter) cleanupStaleVisitors(now time.Time) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	maxAge := l.window * 2
+	for ip, visitor := range l.visitors {
+		if now.Sub(visitor.windowStart) >= maxAge {
+			delete(l.visitors, ip)
+		}
+	}
 }
 
 func (l *IPLimiter) Gin() gin.HandlerFunc {

@@ -1,0 +1,13 @@
+.git
+.github
+.claude
+node_modules
+frontend/node_modules
+frontend/dist
+frontend/.vite
+backend/server
+*.log
+.env
+.env.*
+coverage
+.DS_Store

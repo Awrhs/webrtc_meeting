@@ -1,4 +1,5 @@
 import { api } from './api'
+import { MediaE2EEManager } from './mediaE2EE'
 
 const SFU_HOST = import.meta.env.VITE_SFU_HOST || 'http://localhost:8081'
 console.log('[WebRTC] SFU host:', SFU_HOST)
@@ -48,6 +49,7 @@ export class SFUConnection {
   private isManualDisconnect = false
   private negotiationPromise: Promise<void> = Promise.resolve()
   private pendingRemoteTracks: { ssrc: number; track: MediaStreamTrack; stream: MediaStream }[] = []
+  private mediaE2EEManager: MediaE2EEManager | null = null
 
   constructor(
     roomId: number,
@@ -56,7 +58,8 @@ export class SFUConnection {
     onRemoteTrack: (userId: number, track: MediaStreamTrack, stream: MediaStream) => void,
     onConnected: () => void,
     onDisconnected: () => void,
-    onError: (error: string) => void
+    onError: (error: string) => void,
+    mediaE2EEManager?: MediaE2EEManager | null
   ) {
     this.roomId = roomId
     this.userId = userId
@@ -65,6 +68,7 @@ export class SFUConnection {
     this.onConnected = onConnected
     this.onDisconnected = onDisconnected
     this.onError = onError
+    this.mediaE2EEManager = mediaE2EEManager ?? null
   }
 
   private getWsUrl(): string {
@@ -96,12 +100,14 @@ export class SFUConnection {
 
     const configuration: RTCConfiguration = {
       iceServers,
+      encodedInsertableStreams: this.mediaE2EEManager?.isEnabled() || undefined,
     }
 
     this.pc = new RTCPeerConnection(configuration)
 
     localStream.getTracks().forEach((track) => {
-      this.pc!.addTrack(track, localStream)
+      const sender = this.pc!.addTrack(track, localStream)
+      this.mediaE2EEManager?.attachSender(sender, track)
     })
 
     this.pc.onicecandidate = (event) => {
@@ -123,6 +129,7 @@ export class SFUConnection {
       console.log('[WebRTC] Received remote track:', track.kind, 'SSRC:', ssrc, 'StreamID:', stream.id)
 
       const mappedUserId = this.ssrcToUserId.get(ssrc)
+      this.mediaE2EEManager?.attachReceiver(receiver, track, mappedUserId)
       if (mappedUserId !== undefined) {
         this.onRemoteTrack(mappedUserId, track, stream)
         return
@@ -381,6 +388,7 @@ export class SFUConnection {
     this.ssrcToUserId.clear()
     this.pendingRemoteTracks = []
     this.negotiationPromise = Promise.resolve()
+    this.mediaE2EEManager?.clearTransforms()
   }
 
   muteAudio(muted: boolean) {
@@ -411,7 +419,8 @@ export class SFUConnection {
   // 添加新的视频轨道（用于屏幕共享，不替换摄像头）
   async addVideoTrack(newTrack: MediaStreamTrack, stream: MediaStream) {
     if (!this.pc) return
-    this.pc.addTrack(newTrack, stream)
+    const sender = this.pc.addTrack(newTrack, stream)
+    this.mediaE2EEManager?.attachSender(sender, newTrack)
     this.screenStream = stream
     await this.createAndSendOffer()
   }
@@ -443,6 +452,7 @@ export class SFUConnection {
     this.pendingRemoteTracks = this.pendingRemoteTracks.filter(({ ssrc, track, stream }) => {
       const userId = this.ssrcToUserId.get(ssrc)
       if (userId === undefined) return true
+      this.mediaE2EEManager?.bindReceiverTrack(track.id, userId)
       this.onRemoteTrack(userId, track, stream)
       return false
     })

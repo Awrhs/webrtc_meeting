@@ -7,7 +7,7 @@ import (
 )
 
 type ChatService interface {
-	SendMessage(senderID uint, roomID uint, receiverID *uint, msgType models.MessageType, content string) (*models.Message, error)
+	SendMessage(senderID uint, roomID uint, receiverID *uint, msgType models.MessageType, content string, encrypted bool) (*models.Message, error)
 	GetMessages(requesterID uint, roomID uint, limit, offset int) ([]*models.MessageResponse, error)
 	GetPrivateMessages(roomID uint, userID, otherID uint, limit, offset int) ([]*models.MessageResponse, error)
 	SavePublicKey(userID uint, publicKey, keyType string) error
@@ -24,7 +24,7 @@ func NewChatService(repo repository.ChatRepository, roomRepo repository.RoomRepo
 	return &chatService{repo: repo, roomRepo: roomRepo}
 }
 
-func (s *chatService) SendMessage(senderID uint, roomID uint, receiverID *uint, msgType models.MessageType, content string) (*models.Message, error) {
+func (s *chatService) SendMessage(senderID uint, roomID uint, receiverID *uint, msgType models.MessageType, content string, encrypted bool) (*models.Message, error) {
 	if !s.isActiveRoomMember(roomID, senderID) {
 		return nil, errors.New("permission denied")
 	}
@@ -38,7 +38,7 @@ func (s *chatService) SendMessage(senderID uint, roomID uint, receiverID *uint, 
 		ReceiverID: receiverID,
 		Type:       msgType,
 		Content:    content,
-		Encrypted:  receiverID != nil,
+		Encrypted:  encrypted,
 	}
 
 	err := s.repo.CreateMessage(message)
