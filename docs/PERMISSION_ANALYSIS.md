@@ -64,7 +64,7 @@ SFU 入口是 SFU Server `/ws?token=<sfu_token>`。
 
 音视频媒体使用 WebRTC 标准 DTLS-SRTP 传输加密。浏览器到 SFU、SFU 到浏览器每一跳都是加密传输。
 
-项目已提供可选媒体 E2EE 高安全模式：支持 `RTCRtpScriptTransform` 的浏览器会在端侧加密 encoded audio/video frame，SFU 只按 RTP header/SSRC 转发密文 payload，不持有媒体密钥。浏览器不支持该 API 时会回退到 DTLS-SRTP 传输加密。开启媒体 E2EE 后，服务端录制、转码、转写和智能摘要等依赖明文媒体的能力不可用。
+项目已提供可选媒体 E2EE 高安全模式：支持 `RTCRtpScriptTransform` 的浏览器会在端侧加密 encoded audio/video frame，SFU 只按 RTP header/SSRC 转发密文 payload，不持有媒体密钥。Worker 线程收集加密/解密帧计数和失败计数等诊断指标，主线程据此更新 UI 状态。浏览器不支持该 API 时会回退到 DTLS-SRTP 传输加密。开启媒体 E2EE 后，服务端录制、转码、转写和智能摘要等依赖明文媒体的能力不可用。详见 `docs/E2EE_LIMITATIONS.md`。
 
 ### 群聊文本
 

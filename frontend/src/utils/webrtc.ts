@@ -12,9 +12,13 @@ interface SSRCInfo {
 }
 
 interface SFUMessage {
-  type: 'join' | 'offer' | 'answer' | 'ice-candidate' | 'joined' | 'error' | 'ssrc_mapping' | 'muted'
+  type: 'join' | 'offer' | 'answer' | 'ice-candidate' | 'joined' | 'error'
+    | 'ssrc_mapping' | 'muted' | 'subscribe' | 'unsubscribe'
   room_id?: number
   user_id?: number
+  target_user_id?: number
+  kind?: string
+  stream_id?: string
   sdp?: string
   candidate?: string
   sdp_m_line_index?: number
@@ -50,6 +54,7 @@ export class SFUConnection {
   private negotiationPromise: Promise<void> = Promise.resolve()
   private pendingRemoteTracks: { ssrc: number; track: MediaStreamTrack; stream: MediaStream }[] = []
   private mediaE2EEManager: MediaE2EEManager | null = null
+  private subscribedVideos: Set<number> = new Set()
 
   constructor(
     roomId: number,
@@ -361,6 +366,41 @@ export class SFUConnection {
     }
   }
 
+  subscribeToUser(targetUserId: number, kind: string, streamId?: string) {
+    this.send({
+      type: 'subscribe',
+      target_user_id: targetUserId,
+      kind,
+      stream_id: streamId,
+    })
+    console.log('[WebRTC] Subscribed to', targetUserId, kind, streamId || '')
+  }
+
+  unsubscribeFromUser(targetUserId: number, kind: string, streamId?: string) {
+    this.send({
+      type: 'unsubscribe',
+      target_user_id: targetUserId,
+      kind,
+      stream_id: streamId,
+    })
+    console.log('[WebRTC] Unsubscribed from', targetUserId, kind, streamId || '')
+  }
+
+  setVideoSubscriptions(userIds: number[]) {
+    const newSet = new Set(userIds)
+    for (const id of newSet) {
+      if (!this.subscribedVideos.has(id)) {
+        this.subscribeToUser(id, 'video')
+      }
+    }
+    for (const id of this.subscribedVideos) {
+      if (!newSet.has(id)) {
+        this.unsubscribeFromUser(id, 'video')
+      }
+    }
+    this.subscribedVideos = newSet
+  }
+
   disconnect() {
     this.isManualDisconnect = true
 
@@ -387,6 +427,7 @@ export class SFUConnection {
     this.remoteStreams.clear()
     this.ssrcToUserId.clear()
     this.pendingRemoteTracks = []
+    this.subscribedVideos.clear()
     this.negotiationPromise = Promise.resolve()
     this.mediaE2EEManager?.clearTransforms()
   }

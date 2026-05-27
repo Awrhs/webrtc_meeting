@@ -591,6 +591,8 @@ cd frontend && npm install && npm run dev
 > - 项目提供可选媒体 E2EE 高安全模式：支持 `RTCRtpScriptTransform` 的浏览器会在端侧加密 encoded audio/video frame，SFU 只转发密文 RTP payload。
 > - 媒体 E2EE 受浏览器支持限制；不支持的浏览器会回退到 DTLS-SRTP 传输加密并在 UI 中显示状态。
 > - 媒体 E2EE 开启后，服务端录制、转码、转写和智能摘要等依赖明文媒体的能力不可用，除非引入持钥客户端/录制机器人并改变信任模型。
+> - 媒体 E2EE Worker 线程会收集加密/解密帧计数、失败计数等诊断指标并通过 `postMessage` 回传主线程，UI 据此显示加密状态（enabled/negotiating/warning/unsupported/disabled）。
+> - 详细的浏览器支持矩阵、功能限制、诊断信息和手动验证步骤见 `docs/E2EE_LIMITATIONS.md`。
 
 ## 📄 许可证
 

@@ -99,7 +99,7 @@ frontend/src/
 6. 处理 SFU 发起的 renegotiation offer。
 7. 收到远端 track 后按 SSRC mapping 归属到用户。
 8. 支持断线后刷新 `sfu_token` 并重建旧 WebSocket/PeerConnection。
-9. 支持可选媒体 E2EE：在支持 `RTCRtpScriptTransform` 的浏览器中为 sender/receiver 安装 encoded frame transform。
+9. 支持可选媒体 E2EE：在支持 `RTCRtpScriptTransform` 的浏览器中为 sender/receiver 安装 encoded frame transform，Worker 线程收集加密/解密帧计数、失败计数等诊断指标并通过 `postMessage` 回传主线程，主线程据此更新 UI 加密状态（enabled/negotiating/warning/unsupported/disabled）。
 
 已支持的媒体能力：
 
@@ -120,3 +120,4 @@ frontend/src/
 - `MeetingRoom.tsx` 仍然承担较多职责，可后续拆为 `useMeetingRoom`、`useMediaConnection`、`useRoomSignaling` 等 hooks。
 - E2EE 文本消息已具备基本密钥交换、成员变更 Sender Chain 轮换和加解密链路，但还缺少消息重放防护、设备身份验证和完整安全审计。
 - 生产构建存在 Vite chunk size 警告，可通过路由懒加载或 manual chunks 优化。
+- 媒体 E2EE 的浏览器支持限制、功能影响和验证步骤详见 `docs/E2EE_LIMITATIONS.md`。

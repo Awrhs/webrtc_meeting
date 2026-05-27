@@ -69,9 +69,12 @@ type SSRC struct {
 }
 
 type SignalingMessage struct {
-	Type          string      `json:"type"` // join, leave, offer, answer, ice-candidate, muted, ssrc_mapping
+	Type          string      `json:"type"` // join, offer, answer, ice-candidate, muted, ssrc_mapping, subscribe, unsubscribe
 	RoomID        uint        `json:"room_id,omitempty"`
 	UserID        uint        `json:"user_id,omitempty"`
+	TargetUserID  uint        `json:"target_user_id,omitempty"` // subscribe/unsubscribe 目标用户
+	Kind          string      `json:"kind,omitempty"`           // "audio" | "video"
+	StreamID      string      `json:"stream_id,omitempty"`      // "camera" | "screen"
 	SDP           string      `json:"sdp,omitempty"`
 	Candidate     string      `json:"candidate,omitempty"`
 	SDPMLineIndex *int        `json:"sdp_m_line_index,omitempty"`
@@ -234,41 +237,47 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 		// 给所有用户（包括发布者自己）发送 SSRC 映射，方便前端做流归属
 		s.sendToPeer(otherPeer, ssrcMapping)
 
-		// 给其他用户添加轨道订阅：将 localTrack 挂载到对方的 PeerConnection 上
-		if otherPeer.UserID != peer.UserID {
-			subKey := fmt.Sprintf("%d|%s", peer.UserID, trackKey)
-			otherPeer.mu.Lock()
-			if otherPeer.addedTracks[subKey] {
-				otherPeer.mu.Unlock()
-				s.logger.Debug("Skip AddTrack: already subscribed",
-					zap.Uint("fromUser", peer.UserID),
-					zap.Uint("toUser", otherPeer.UserID),
-					zap.String("subKey", subKey))
-				continue
-			}
-			sender, err := otherPeer.PC.AddTrack(localTrack)
-			if err != nil {
-				otherPeer.mu.Unlock()
-				s.logger.Error("Failed to add track to peer",
-					zap.Uint("fromUser", peer.UserID),
-					zap.Uint("toUser", otherPeer.UserID),
-					zap.Error(err))
-				continue
-			}
-			otherPeer.addedTracks[subKey] = true
-			otherPeer.Subscriptions[peer.UserID] = append(otherPeer.Subscriptions[peer.UserID], sender)
-			otherPeer.mu.Unlock()
-			s.startRTCPReadLoop(otherPeer, sender, peer.UserID, trackKey)
-
-			s.logger.Debug("Track subscribed",
-				zap.Uint("from", peer.UserID),
-				zap.Uint("to", otherPeer.UserID),
-				zap.String("trackKey", trackKey))
-
-			// 触发 otherPeer 的 renegotiation。worker 会自动合并多次触发，
-			// 例如 audio + video 在毫秒级先后到达时只产生一次实际 renegotiation。
-			s.triggerRenegotiation(otherPeer)
+		// 给其他用户添加轨道订阅：音频和屏幕共享自动扇出，普通视频由前端按需 subscribe
+		if otherPeer.UserID == peer.UserID {
+			continue
 		}
+
+		if trackKind == "video" && streamID != "screen" {
+			continue
+		}
+
+		subKey := fmt.Sprintf("%d|%s", peer.UserID, trackKey)
+		otherPeer.mu.Lock()
+		if otherPeer.addedTracks[subKey] {
+			otherPeer.mu.Unlock()
+			s.logger.Debug("Skip AddTrack: already subscribed",
+				zap.Uint("fromUser", peer.UserID),
+				zap.Uint("toUser", otherPeer.UserID),
+				zap.String("subKey", subKey))
+			continue
+		}
+		sender, err := otherPeer.PC.AddTrack(localTrack)
+		if err != nil {
+			otherPeer.mu.Unlock()
+			s.logger.Error("Failed to add track to peer",
+				zap.Uint("fromUser", peer.UserID),
+				zap.Uint("toUser", otherPeer.UserID),
+				zap.Error(err))
+			continue
+		}
+		otherPeer.addedTracks[subKey] = true
+		otherPeer.Subscriptions[peer.UserID] = append(otherPeer.Subscriptions[peer.UserID], sender)
+		otherPeer.mu.Unlock()
+		s.startRTCPReadLoop(otherPeer, sender, peer.UserID, trackKey)
+
+		s.logger.Debug("Track subscribed",
+			zap.Uint("from", peer.UserID),
+			zap.Uint("to", otherPeer.UserID),
+			zap.String("trackKey", trackKey))
+
+		// 触发 otherPeer 的 renegotiation。worker 会自动合并多次触发，
+		// 例如 audio + video 在毫秒级先后到达时只产生一次实际 renegotiation。
+		s.triggerRenegotiation(otherPeer)
 	}
 }
 
@@ -437,6 +446,142 @@ func (s *SFUServer) cleanupPeerSubscriptions(room *Room, leavingUserID uint) {
 		if removed {
 			s.triggerRenegotiation(peer)
 		}
+	}
+}
+
+// handleSubscribe 处理前端发来的选择性订阅请求。
+func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessage) {
+	if msg.TargetUserID == 0 || msg.Kind == "" {
+		s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "subscribe requires target_user_id and kind"})
+		return
+	}
+
+	publisher := room.Peers[msg.TargetUserID]
+	if publisher == nil {
+		s.logger.Debug("Subscribe target not found",
+			zap.Uint("subscriber", peer.UserID),
+			zap.Uint("target", msg.TargetUserID))
+		return
+	}
+
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+
+	added := false
+	for trackKey, trackInfo := range publisher.Tracks {
+		if trackInfo.Kind != msg.Kind {
+			continue
+		}
+		if msg.StreamID != "" && trackInfo.StreamID != msg.StreamID {
+			continue
+		}
+
+		subKey := fmt.Sprintf("%d|%s", msg.TargetUserID, trackKey)
+		if peer.addedTracks[subKey] {
+			continue
+		}
+
+		sender, err := peer.PC.AddTrack(trackInfo.Track)
+		if err != nil {
+			s.logger.Error("Failed to add track in handleSubscribe",
+				zap.Uint("from", msg.TargetUserID),
+				zap.Uint("to", peer.UserID),
+				zap.String("trackKey", trackKey),
+				zap.Error(err))
+			continue
+		}
+		peer.addedTracks[subKey] = true
+		peer.Subscriptions[msg.TargetUserID] = append(peer.Subscriptions[msg.TargetUserID], sender)
+		s.startRTCPReadLoop(peer, sender, msg.TargetUserID, trackKey)
+		added = true
+
+		s.logger.Info("Subscribed to track",
+			zap.Uint("subscriber", peer.UserID),
+			zap.Uint("publisher", msg.TargetUserID),
+			zap.String("trackKey", trackKey))
+	}
+
+	if added {
+		s.triggerRenegotiation(peer)
+
+		var ssrcs []SSRC
+		for _, trackInfo := range publisher.Tracks {
+			if trackInfo.Kind == msg.Kind {
+				if msg.StreamID != "" && trackInfo.StreamID != msg.StreamID {
+					continue
+				}
+				ssrcs = append(ssrcs, SSRC{
+					SSRC:     trackInfo.SSRC,
+					UserID:   msg.TargetUserID,
+					Kind:     trackInfo.Kind,
+					StreamID: trackInfo.StreamID,
+				})
+			}
+		}
+		if len(ssrcs) > 0 {
+			s.sendToPeer(peer, SignalingMessage{
+				Type:   "ssrc_mapping",
+				RoomID: room.ID,
+				SSRCs:  ssrcs,
+			})
+		}
+	}
+}
+
+// handleUnsubscribe 处理前端发来的取消订阅请求。
+func (s *SFUServer) handleUnsubscribe(room *Room, peer *Peer, msg *SignalingMessage) {
+	if msg.TargetUserID == 0 || msg.Kind == "" {
+		s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "unsubscribe requires target_user_id and kind"})
+		return
+	}
+
+	peer.mu.Lock()
+	defer peer.mu.Unlock()
+
+	senders := peer.Subscriptions[msg.TargetUserID]
+	if len(senders) == 0 {
+		return
+	}
+
+	removed := false
+	remaining := make([]*webrtc.RTPSender, 0, len(senders))
+	for _, sender := range senders {
+		shouldRemove := false
+		for key := range peer.addedTracks {
+			if strings.HasPrefix(key, fmt.Sprintf("%d|%s-", msg.TargetUserID, msg.Kind)) {
+				if msg.StreamID == "" || strings.Contains(key, "-"+msg.StreamID) {
+					shouldRemove = true
+					delete(peer.addedTracks, key)
+					break
+				}
+			}
+		}
+		if shouldRemove {
+			if err := peer.PC.RemoveTrack(sender); err != nil {
+				s.logger.Warn("Failed to remove track in handleUnsubscribe",
+					zap.Uint("from", msg.TargetUserID),
+					zap.Uint("to", peer.UserID),
+					zap.Error(err))
+			}
+			removed = true
+			s.logger.Info("Unsubscribed from track",
+				zap.Uint("subscriber", peer.UserID),
+				zap.Uint("publisher", msg.TargetUserID),
+				zap.String("kind", msg.Kind))
+		} else {
+			remaining = append(remaining, sender)
+		}
+	}
+
+	if removed {
+		if len(remaining) == 0 {
+			delete(peer.Subscriptions, msg.TargetUserID)
+		} else {
+			peer.Subscriptions[msg.TargetUserID] = remaining
+		}
+		s.triggerRenegotiation(peer)
 	}
 }
 
@@ -641,6 +786,28 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 				s.logger.Error("ICE candidate failed", zap.Error(err))
 				s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "ice_candidate_failed: " + err.Error()})
 			}
+		case "subscribe":
+			if peer == nil {
+				sendError(conn, "not_joined", "Please join first")
+				continue
+			}
+			s.mu.Lock()
+			room := s.rooms[peer.RoomID]
+			s.mu.Unlock()
+			if room != nil {
+				s.handleSubscribe(room, peer, &msg)
+			}
+		case "unsubscribe":
+			if peer == nil {
+				sendError(conn, "not_joined", "Please join first")
+				continue
+			}
+			s.mu.Lock()
+			room := s.rooms[peer.RoomID]
+			s.mu.Unlock()
+			if room != nil {
+				s.handleUnsubscribe(room, peer, &msg)
+			}
 		}
 	}
 }
@@ -720,7 +887,8 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 		UserID: msg.UserID,
 	})
 
-	// 重要：订阅房间内已存在的其他用户的所有流
+	// 订阅房间内已存在的其他用户的流
+	// 音频：自动全量订阅；视频：仅收集 SSRC 信息，由前端按需 subscribe
 	// 注意：room.mu 已在函数开头通过 defer 持有，此处无需再次加锁
 	var allSSRCs []SSRC
 	for _, existingPeer := range room.Peers {
@@ -728,7 +896,17 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 			existingPeer.mu.Lock()
 			for trackKey, trackInfo := range existingPeer.Tracks {
 				subKey := fmt.Sprintf("%d|%s", existingPeer.UserID, trackKey)
-				// 注意：此时 peer 刚创建，外部不可能持有 peer.mu，所以这里直接写
+				allSSRCs = append(allSSRCs, SSRC{
+					SSRC:     trackInfo.SSRC,
+					UserID:   existingPeer.UserID,
+					Kind:     trackInfo.Kind,
+					StreamID: trackInfo.StreamID,
+				})
+
+				if trackInfo.Kind == "video" {
+					continue
+				}
+
 				if peer.addedTracks[subKey] {
 					continue
 				}
@@ -737,12 +915,6 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 					peer.addedTracks[subKey] = true
 					peer.Subscriptions[existingPeer.UserID] = append(peer.Subscriptions[existingPeer.UserID], sender)
 					s.startRTCPReadLoop(peer, sender, existingPeer.UserID, trackKey)
-					allSSRCs = append(allSSRCs, SSRC{
-						SSRC:     trackInfo.SSRC,
-						UserID:   existingPeer.UserID,
-						Kind:     trackInfo.Kind,
-						StreamID: trackInfo.StreamID,
-					})
 					s.logger.Debug("Subscribed to existing track",
 						zap.Uint("newUser", peer.UserID),
 						zap.Uint("existingUser", existingPeer.UserID),
@@ -759,16 +931,16 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 		}
 	}
 
-	// 如果有现有流，发送批量SSRC映射给新用户
+	// 发送批量 SSRC 映射给新用户（包含音频和视频）
 	if len(allSSRCs) > 0 {
 		s.sendToPeer(peer, SignalingMessage{
 			Type:   "ssrc_mapping",
 			RoomID: msg.RoomID,
 			SSRCs:  allSSRCs,
 		})
-		s.logger.Info("Existing tracks subscribed",
+		s.logger.Info("Existing tracks info sent",
 			zap.Uint("userID", peer.UserID),
-			zap.Int("tracksCount", len(allSSRCs)))
+			zap.Int("ssrcCount", len(allSSRCs)))
 	}
 
 	s.logger.Info("Peer joined successfully",

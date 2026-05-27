@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState } from 'react'
+import { useRef, useEffect, useState, memo, useMemo } from 'react'
 import { RoomMember } from '@/types'
 
 interface VideoGridProps {
@@ -9,15 +9,7 @@ interface VideoGridProps {
   remoteStreams: Map<number, MediaStream[]>
 }
 
-/**
- * 视频网格组件
- *
- * 架构说明：
- * - remoteStreams 按 userId 作为 key，每个 userId 对应一个流数组
- * - 如果 userId = 0，表示这些流还没有被后端映射（向后兼容）
- * - 支持屏幕共享（大屏模式） + 侧边摄像头小窗
- */
-export default function VideoGrid({
+export default memo(function VideoGrid({
   members,
   currentUserId,
   localStream,
@@ -27,12 +19,11 @@ export default function VideoGrid({
   const localHasVideo = localStream?.getVideoTracks().some(t => t.enabled) || false
   const hasScreenShare = screenStream !== null
 
-  // 获取所有开启视频的远程用户（排除自己）
-  const remoteMembersWithVideo = members.filter(
-    m => m.is_video_on && m.user_id !== currentUserId
+  const remoteMembersWithVideo = useMemo(
+    () => members.filter(m => m.is_video_on && m.user_id !== currentUserId),
+    [members, currentUserId]
   )
 
-  // 如果有屏幕共享，使用大屏模式
   if (hasScreenShare) {
     return (
       <div className="video-grid-with-screen">
@@ -77,17 +68,18 @@ export default function VideoGrid({
     )
   }
 
-  // 普通网格布局
   const totalVideoCount = (localHasVideo ? 1 : 0) + remoteMembersWithVideo.length
 
-  let columns = 1
-  if (totalVideoCount >= 2 && totalVideoCount < 4) columns = 2
-  if (totalVideoCount >= 4 && totalVideoCount < 9) columns = 3
-  if (totalVideoCount >= 9) columns = 4
+  const columns = useMemo(() => {
+    if (totalVideoCount >= 9) return 4
+    if (totalVideoCount >= 4) return 3
+    if (totalVideoCount >= 2) return 2
+    return 1
+  }, [totalVideoCount])
 
-  const gridStyle = {
+  const gridStyle = useMemo(() => ({
     gridTemplateColumns: `repeat(${columns}, 1fr)`,
-  }
+  }), [columns])
 
   return (
     <div className="video-grid" style={gridStyle}>
@@ -118,27 +110,18 @@ export default function VideoGrid({
       })}
     </div>
   )
-}
+})
 
-/**
- * 获取指定用户的远程流
- *
- * 优先级：
- * 1. 优先使用精确匹配 userId 的流（后端已实现 SSRC 映射时）
- * 2. 否则从 userId=0 的公共池中按索引分配（向后兼容）
- */
 function getRemoteStreamForUser(
   userId: number,
   remoteMembersWithVideo: RoomMember[],
   remoteStreams: Map<number, MediaStream[]>
 ): MediaStream | null {
-  // 1. 优先查找精确匹配
   const userStreams = remoteStreams.get(userId)
   if (userStreams && userStreams.length > 0) {
     return userStreams[0]
   }
 
-  // 2. 向后兼容：从公共池按索引分配
   const poolStreams = remoteStreams.get(0) || []
   const memberIndex = remoteMembersWithVideo.findIndex(m => m.user_id === userId)
   if (memberIndex !== -1 && poolStreams.length > memberIndex) {
@@ -156,7 +139,7 @@ interface VideoCardProps {
   isScreenShare?: boolean
 }
 
-function VideoCard({ stream, nickname, isSelf, muted, isScreenShare }: VideoCardProps) {
+const VideoCard = memo(function VideoCard({ stream, nickname, isSelf, muted, isScreenShare }: VideoCardProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const [streamError, setStreamError] = useState(false)
 
@@ -201,4 +184,4 @@ function VideoCard({ stream, nickname, isSelf, muted, isScreenShare }: VideoCard
       </div>
     </div>
   )
-}
+})
