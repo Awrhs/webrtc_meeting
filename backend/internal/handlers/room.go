@@ -149,6 +149,8 @@ func (h *Handler) DeleteRoom(c *gin.Context) {
 		return
 	}
 
+	h.audit(c, uint(id), userID, nil, "delete_room", "")
+
 	c.JSON(http.StatusOK, gin.H{"message": "room deleted"})
 }
 
@@ -168,6 +170,8 @@ func (h *Handler) LockRoom(c *gin.Context) {
 		return
 	}
 
+	h.audit(c, uint(id), userID, nil, "lock_room", "")
+
 	c.JSON(http.StatusOK, gin.H{"message": "room locked", "is_locked": true})
 }
 
@@ -186,6 +190,8 @@ func (h *Handler) UnlockRoom(c *gin.Context) {
 		c.JSON(http.StatusForbidden, gin.H{"error": err.Error()})
 		return
 	}
+
+	h.audit(c, uint(id), userID, nil, "unlock_room", "")
 
 	c.JSON(http.StatusOK, gin.H{"message": "room unlocked", "is_locked": false})
 }
@@ -221,6 +227,9 @@ func (h *Handler) KickMember(c *gin.Context) {
 
 	h.hub.BroadcastKick(uint(roomID), uint(targetID))
 
+	tID := uint(targetID)
+	h.audit(c, uint(roomID), userID, &tID, "kick", "")
+
 	c.JSON(http.StatusOK, gin.H{"message": "member kicked"})
 }
 
@@ -254,6 +263,9 @@ func (h *Handler) MuteMember(c *gin.Context) {
 	}
 
 	h.hub.BroadcastMute(uint(roomID), uint(targetID), true)
+
+	tID := uint(targetID)
+	h.audit(c, uint(roomID), userID, &tID, "mute", "")
 
 	c.JSON(http.StatusOK, gin.H{"message": "member muted", "is_muted": true})
 }
@@ -289,6 +301,9 @@ func (h *Handler) UnmuteMember(c *gin.Context) {
 
 	h.hub.BroadcastMute(uint(roomID), uint(targetID), false)
 
+	tID := uint(targetID)
+	h.audit(c, uint(roomID), userID, &tID, "unmute", "")
+
 	c.JSON(http.StatusOK, gin.H{"message": "member unmuted", "is_muted": false})
 }
 
@@ -315,6 +330,9 @@ func (h *Handler) SetAdmin(c *gin.Context) {
 	}
 
 	h.hub.BroadcastRoleChanged(uint(roomID), uint(targetID), models.RoleAdmin)
+
+	tID := uint(targetID)
+	h.audit(c, uint(roomID), userID, &tID, "set_admin", "")
 
 	c.JSON(http.StatusOK, gin.H{"message": "admin set", "role": models.RoleAdmin})
 }
@@ -343,6 +361,9 @@ func (h *Handler) RemoveAdmin(c *gin.Context) {
 
 	h.hub.BroadcastRoleChanged(uint(roomID), uint(targetID), models.RoleMember)
 
+	tID := uint(targetID)
+	h.audit(c, uint(roomID), userID, &tID, "remove_admin", "")
+
 	c.JSON(http.StatusOK, gin.H{"message": "admin removed", "role": models.RoleMember})
 }
 
@@ -370,6 +391,9 @@ func (h *Handler) TransferOwner(c *gin.Context) {
 
 	h.hub.BroadcastRoleChanged(uint(roomID), userID, models.RoleMember)
 	h.hub.BroadcastRoleChanged(uint(roomID), uint(targetID), models.RoleOwner)
+
+	tID := uint(targetID)
+	h.audit(c, uint(roomID), userID, &tID, "transfer_owner", "")
 
 	c.JSON(http.StatusOK, gin.H{"message": "ownership transferred"})
 }

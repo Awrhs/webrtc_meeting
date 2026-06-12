@@ -31,6 +31,7 @@ type TrackInfo struct {
 	Kind      string // "audio" or "video"
 	StreamID  string // e.g., "camera" or "screen"
 	IsEnabled bool
+	RID       string // simulcast layer rid: "" / "low" / "high"
 }
 
 type Peer struct {
@@ -58,7 +59,13 @@ type SFUServer struct {
 	allowedOrigins          []string
 	callbackToken           string
 	messageRateLimit        int
+	tokenReplayCheck        TokenReplayChecker
 	mu                      sync.Mutex
+}
+
+// TokenReplayChecker 抽象 jti 重放检查（生产用 Redis SetNX，测试可注入 mock）。
+type TokenReplayChecker interface {
+	MarkTokenUsed(jti string, ttl time.Duration) (bool, error)
 }
 
 type SSRC struct {
@@ -66,6 +73,7 @@ type SSRC struct {
 	UserID   uint   `json:"user_id"`
 	Kind     string `json:"kind"`      // "audio" or "video"
 	StreamID string `json:"stream_id"` // "camera" or "screen"
+	RID      string `json:"rid,omitempty"`
 }
 
 type SignalingMessage struct {
@@ -75,6 +83,7 @@ type SignalingMessage struct {
 	TargetUserID  uint        `json:"target_user_id,omitempty"` // subscribe/unsubscribe 目标用户
 	Kind          string      `json:"kind,omitempty"`           // "audio" | "video"
 	StreamID      string      `json:"stream_id,omitempty"`      // "camera" | "screen"
+	Quality       string      `json:"quality,omitempty"`        // simulcast 选层："high" | "low"
 	SDP           string      `json:"sdp,omitempty"`
 	Candidate     string      `json:"candidate,omitempty"`
 	SDPMLineIndex *int        `json:"sdp_m_line_index,omitempty"`
@@ -90,6 +99,7 @@ type ServerOptions struct {
 	AllowedOrigins          []string
 	CallbackToken           string
 	MessageRateLimit        int
+	TokenReplayChecker      TokenReplayChecker
 }
 
 func NewSFUServer(logger *zap.Logger, opts ServerOptions) *SFUServer {
@@ -126,6 +136,20 @@ func NewSFUServer(logger *zap.Logger, opts ServerOptions) *SFUServer {
 		logger.Fatal("Failed to register default codecs", zap.Error(err))
 	}
 
+	// 注册 simulcast 所需的 RTP 头扩展（仅 video 方向）
+	for _, ext := range []string{
+		"urn:ietf:params:rtp-hdrext:sdes:mid",
+		"urn:ietf:params:rtp-hdrext:sdes:rtp-stream-id",
+		"urn:ietf:params:rtp-hdrext:sdes:repaired-rtp-stream-id",
+	} {
+		if err := m.RegisterHeaderExtension(
+			webrtc.RTPHeaderExtensionCapability{URI: ext},
+			webrtc.RTPCodecTypeVideo,
+		); err != nil {
+			logger.Warn("Failed to register RTP header extension", zap.String("uri", ext), zap.Error(err))
+		}
+	}
+
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
 		webrtc.WithSettingEngine(settingEngine),
@@ -145,6 +169,7 @@ func NewSFUServer(logger *zap.Logger, opts ServerOptions) *SFUServer {
 		allowedOrigins:          opts.AllowedOrigins,
 		callbackToken:           opts.CallbackToken,
 		messageRateLimit:        opts.MessageRateLimit,
+		tokenReplayCheck:        opts.TokenReplayChecker,
 	}
 }
 
@@ -161,16 +186,21 @@ func NewSFUServer(logger *zap.Logger, opts ServerOptions) *SFUServer {
 func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, receiver *webrtc.RTPReceiver) {
 	trackKind := track.Kind().String()
 	streamID := track.StreamID()
+	rid := track.RID() // simulcast 层标识，单层时为 ""
 	trackKey := trackKind + "-" + streamID
+	if rid != "" {
+		trackKey = trackKey + "/" + rid
+	}
 
 	s.logger.Info("New track received",
 		zap.Uint("userID", peer.UserID),
 		zap.String("kind", trackKind),
 		zap.String("streamID", streamID),
+		zap.String("rid", rid),
 		zap.Uint32("ssrc", uint32(track.SSRC())))
 
 	// 创建本地可转发轨道：TrackLocalStaticRTP 用于将收到的 RTP 包原样转发给其他用户
-	localTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID(), streamID)
+	localTrack, err := webrtc.NewTrackLocalStaticRTP(track.Codec().RTPCodecCapability, track.ID()+rid, streamID)
 	if err != nil {
 		s.logger.Error("Failed to create local track", zap.Error(err))
 		return
@@ -188,6 +218,7 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 		Kind:      trackKind,
 		StreamID:  streamID,
 		IsEnabled: true,
+		RID:       rid,
 	}
 	peer.mu.Unlock()
 
@@ -229,6 +260,7 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 				UserID:   peer.UserID,
 				Kind:     trackKind,
 				StreamID: streamID,
+				RID:      rid,
 			},
 		},
 	}
@@ -469,21 +501,63 @@ func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessag
 	peer.mu.Lock()
 	defer peer.mu.Unlock()
 
-	added := false
-	for trackKey, trackInfo := range publisher.Tracks {
+	// 按 (kind, streamID) 分组候选 track，每组内按 RID 选层。
+	// 默认选 high；指定 Quality 时优先匹配；都找不到则回退单层 (RID=="")。
+	groups := make(map[string][]*TrackInfo) // key: kind-streamID
+	for _, trackInfo := range publisher.Tracks {
 		if trackInfo.Kind != msg.Kind {
 			continue
 		}
 		if msg.StreamID != "" && trackInfo.StreamID != msg.StreamID {
 			continue
 		}
+		groupKey := trackInfo.Kind + "-" + trackInfo.StreamID
+		groups[groupKey] = append(groups[groupKey], trackInfo)
+	}
 
+	desiredQuality := msg.Quality
+	if desiredQuality == "" {
+		desiredQuality = "high"
+	}
+
+	added := false
+	var ssrcs []SSRC
+	for _, candidates := range groups {
+		var chosen *TrackInfo
+		// 优先匹配指定 quality
+		for _, c := range candidates {
+			if c.RID == desiredQuality {
+				chosen = c
+				break
+			}
+		}
+		// 回退到单层
+		if chosen == nil {
+			for _, c := range candidates {
+				if c.RID == "" {
+					chosen = c
+					break
+				}
+			}
+		}
+		// 仍找不到（仅 simulcast 但 quality 不匹配）→ 取第一个
+		if chosen == nil && len(candidates) > 0 {
+			chosen = candidates[0]
+		}
+		if chosen == nil {
+			continue
+		}
+
+		trackKey := chosen.Kind + "-" + chosen.StreamID
+		if chosen.RID != "" {
+			trackKey = trackKey + "/" + chosen.RID
+		}
 		subKey := fmt.Sprintf("%d|%s", msg.TargetUserID, trackKey)
 		if peer.addedTracks[subKey] {
 			continue
 		}
 
-		sender, err := peer.PC.AddTrack(trackInfo.Track)
+		sender, err := peer.PC.AddTrack(chosen.Track)
 		if err != nil {
 			s.logger.Error("Failed to add track in handleSubscribe",
 				zap.Uint("from", msg.TargetUserID),
@@ -497,29 +571,23 @@ func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessag
 		s.startRTCPReadLoop(peer, sender, msg.TargetUserID, trackKey)
 		added = true
 
+		ssrcs = append(ssrcs, SSRC{
+			SSRC:     chosen.SSRC,
+			UserID:   msg.TargetUserID,
+			Kind:     chosen.Kind,
+			StreamID: chosen.StreamID,
+			RID:      chosen.RID,
+		})
+
 		s.logger.Info("Subscribed to track",
 			zap.Uint("subscriber", peer.UserID),
 			zap.Uint("publisher", msg.TargetUserID),
-			zap.String("trackKey", trackKey))
+			zap.String("trackKey", trackKey),
+			zap.String("rid", chosen.RID))
 	}
 
 	if added {
 		s.triggerRenegotiation(peer)
-
-		var ssrcs []SSRC
-		for _, trackInfo := range publisher.Tracks {
-			if trackInfo.Kind == msg.Kind {
-				if msg.StreamID != "" && trackInfo.StreamID != msg.StreamID {
-					continue
-				}
-				ssrcs = append(ssrcs, SSRC{
-					SSRC:     trackInfo.SSRC,
-					UserID:   msg.TargetUserID,
-					Kind:     trackInfo.Kind,
-					StreamID: trackInfo.StreamID,
-				})
-			}
-		}
 		if len(ssrcs) > 0 {
 			s.sendToPeer(peer, SignalingMessage{
 				Type:   "ssrc_mapping",
@@ -664,7 +732,24 @@ func (s *SFUServer) validateAdmission(r *http.Request) (*auth.SFUClaims, error) 
 	if token == "" {
 		return nil, errors.New("missing sfu token")
 	}
-	return auth.ValidateSFUJoinToken(token, s.sfuJWTSecret)
+	claims, err := auth.ValidateSFUJoinToken(token, s.sfuJWTSecret)
+	if err != nil {
+		return nil, err
+	}
+	// jti 重放检查（Redis 不可用时 best-effort，不阻断）
+	if s.tokenReplayCheck != nil && claims.JTI != "" {
+		ttl := time.Until(claims.ExpiresAt)
+		if ttl <= 0 {
+			ttl = 5 * time.Minute
+		}
+		ok, replayErr := s.tokenReplayCheck.MarkTokenUsed(claims.JTI, ttl)
+		if replayErr != nil {
+			s.logger.Warn("Token replay check failed (allow)", zap.Error(replayErr))
+		} else if !ok {
+			return nil, errors.New("sfu token already used")
+		}
+	}
+	return claims, nil
 }
 
 func (s *SFUServer) originAllowed(r *http.Request) bool {
@@ -901,6 +986,7 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 					UserID:   existingPeer.UserID,
 					Kind:     trackInfo.Kind,
 					StreamID: trackInfo.StreamID,
+					RID:      trackInfo.RID,
 				})
 
 				if trackInfo.Kind == "video" {

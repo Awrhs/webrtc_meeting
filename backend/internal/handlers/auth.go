@@ -3,11 +3,16 @@ package handlers
 import (
 	"conference-sfu/backend/internal/auth"
 	"conference-sfu/backend/internal/models"
+	"conference-sfu/backend/internal/repository"
 	"conference-sfu/backend/internal/service"
 	"conference-sfu/backend/internal/sfu"
 	"conference-sfu/backend/internal/signaling"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -15,6 +20,7 @@ import (
 
 type Handler struct {
 	userService      service.UserService
+	userRepo         repository.UserRepository
 	roomService      service.RoomService
 	chatService      service.ChatService
 	hub              *signaling.Hub
@@ -23,9 +29,10 @@ type Handler struct {
 	sfuCallbackToken string
 }
 
-func NewHandler(userService service.UserService, roomService service.RoomService, chatService service.ChatService, hub *signaling.Hub, sfuClient *sfu.ControlClient, sfuCallbackToken string, logger *zap.Logger) *Handler {
+func NewHandler(userService service.UserService, userRepo repository.UserRepository, roomService service.RoomService, chatService service.ChatService, hub *signaling.Hub, sfuClient *sfu.ControlClient, sfuCallbackToken string, logger *zap.Logger) *Handler {
 	return &Handler{
 		userService:      userService,
+		userRepo:         userRepo,
 		roomService:      roomService,
 		chatService:      chatService,
 		hub:              hub,
@@ -74,6 +81,9 @@ func (h *Handler) Login(c *gin.Context) {
 		return
 	}
 
+	// 登录成功后记录设备（best-effort，失败不阻断）
+	h.recordLoginDevice(c, user.ID)
+
 	c.JSON(http.StatusOK, gin.H{
 		"token": token,
 		"user": gin.H{
@@ -85,6 +95,61 @@ func (h *Handler) Login(c *gin.Context) {
 			"avatar":   user.Avatar,
 		},
 	})
+}
+
+func (h *Handler) recordLoginDevice(c *gin.Context, userID uint) {
+	if h.userRepo == nil {
+		return
+	}
+	ua := c.GetHeader("User-Agent")
+	deviceID := c.GetHeader("X-Device-Id")
+	if deviceID == "" {
+		// 用 UA 哈希作为设备指纹
+		sum := sha256.Sum256([]byte(ua))
+		deviceID = hex.EncodeToString(sum[:8])
+	}
+	device := &models.Device{
+		UserID:     userID,
+		DeviceID:   deviceID,
+		UserAgent:  truncateString(ua, 255),
+		IP:         c.ClientIP(),
+		LastActive: time.Now(),
+	}
+	if err := h.userRepo.UpsertDevice(device); err != nil {
+		h.logger.Warn("UpsertDevice failed", zap.Uint("userID", userID), zap.Error(err))
+	}
+}
+
+func truncateString(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n]
+}
+
+func (h *Handler) GetMyDevices(c *gin.Context) {
+	userID := GetUserID(c)
+	devices, err := h.userRepo.GetDevicesByUserID(userID)
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"devices": devices})
+}
+
+func (h *Handler) DeleteMyDevice(c *gin.Context) {
+	userID := GetUserID(c)
+	idStr := c.Param("id")
+	deviceID, err := strconv.ParseUint(idStr, 10, 64)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid device id"})
+		return
+	}
+	if err := h.userRepo.DeleteDevice(uint(deviceID), userID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{"message": "device removed"})
 }
 
 func (h *Handler) GetMe(c *gin.Context) {

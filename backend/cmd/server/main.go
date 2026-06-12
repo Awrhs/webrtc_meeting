@@ -69,7 +69,7 @@ func main() {
 		AllowCredentials: true,
 	}))
 
-	handler := handlers.NewHandler(userService, roomService, chatService, hub, sfuClient, cfg.SFUCallbackToken, log)
+	handler := handlers.NewHandler(userService, userRepo, roomService, chatService, hub, sfuClient, cfg.SFUCallbackToken, log)
 
 	api := r.Group("/api/v1")
 	{
@@ -82,6 +82,8 @@ func main() {
 			auth.GET("/user/me", handler.GetMe)
 			auth.PUT("/user/profile", handler.UpdateProfile)
 			auth.PUT("/user/password", handler.UpdatePassword)
+			auth.GET("/user/devices", handler.GetMyDevices)
+			auth.DELETE("/user/devices/:id", handler.DeleteMyDevice)
 
 			auth.POST("/rooms", handler.CreateRoom)
 			auth.GET("/rooms", handler.GetMyRooms)
@@ -102,6 +104,8 @@ func main() {
 
 			auth.GET("/rooms/:id/messages", handler.GetMessages)
 			auth.POST("/rooms/:id/messages", handler.SendMessage)
+
+			auth.GET("/rooms/:id/audit-logs", handler.GetAuditLogs)
 
 			auth.PUT("/rooms/:id/media-state", handler.UpdateMediaState)
 

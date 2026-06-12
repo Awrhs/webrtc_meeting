@@ -22,6 +22,7 @@ type UserRepository interface {
 	FindByUsername(username string) (*models.User, error)
 	Update(user *models.User) error
 	CreateDevice(device *models.Device) error
+	UpsertDevice(device *models.Device) error
 	GetDevicesByUserID(userID uint) ([]*models.Device, error)
 	DeleteDevice(deviceID uint, userID uint) error
 }
@@ -91,6 +92,28 @@ func (r *userRepository) CreateDevice(device *models.Device) error {
 	return r.db.Create(device).Error
 }
 
+// UpsertDevice 按 (user_id, device_id) 找到则更新，否则创建。
+func (r *userRepository) UpsertDevice(device *models.Device) error {
+	var existing models.Device
+	err := r.db.Where("user_id = ? AND device_id = ?", device.UserID, device.DeviceID).First(&existing).Error
+	if err == gorm.ErrRecordNotFound {
+		return r.db.Create(device).Error
+	}
+	if err != nil {
+		return err
+	}
+	existing.UserAgent = device.UserAgent
+	existing.IP = device.IP
+	existing.LastActive = device.LastActive
+	if device.DeviceName != "" {
+		existing.DeviceName = device.DeviceName
+	}
+	if device.DeviceType != "" {
+		existing.DeviceType = device.DeviceType
+	}
+	return r.db.Save(&existing).Error
+}
+
 func (r *userRepository) GetDevicesByUserID(userID uint) ([]*models.Device, error) {
 	var devices []*models.Device
 	err := r.db.Where("user_id = ?", userID).Order("last_active desc").Find(&devices).Error
@@ -118,6 +141,21 @@ func NewRedisClient(addr, password string, logger *zap.Logger) *RedisClient {
 func (r *RedisClient) SetOnline(userID uint, status string, expiration time.Duration) error {
 	ctx := context.Background()
 	return r.client.Set(ctx, "online:"+strconv.Itoa(int(userID)), status, expiration).Err()
+}
+
+// MarkTokenUsed 原子地标记 jti 为已使用。
+// 返回 (true, nil) 表示首次使用；(false, nil) 表示已使用过（重放）。
+func (r *RedisClient) MarkTokenUsed(jti string, ttl time.Duration) (bool, error) {
+	if jti == "" {
+		// 没有 jti 的旧 token：放行（向后兼容），不记录
+		return true, nil
+	}
+	if ttl <= 0 {
+		ttl = 5 * time.Minute
+	}
+	ctx := context.Background()
+	ok, err := r.client.SetNX(ctx, "sfu_jti:"+jti, "1", ttl).Result()
+	return ok, err
 }
 
 func (r *RedisClient) GetOnline(userID uint) (string, error) {

@@ -291,12 +291,55 @@ export class GroupE2EEManager {
   // 消息缓存：用于处理序号跳跃/丢包
   private pendingMessages: Map<string, Array<{ msg: EncryptedMessage; resolve: (s: string) => void; reject: (e: Error) => void }>> = new Map()
 
+  // 重放滑动窗口：senderId|epoch -> { highest, bitmap }
+  // bitmap 的最低位代表 highest，向上代表 highest-1, highest-2, ...
+  private replayWindows: Map<string, { highest: number; bitmap: bigint }> = new Map()
+  private readonly REPLAY_WINDOW_SIZE = 128
+
   private onNeedSendKey?: (targetUserId: number, encryptedChainKey: string) => void
   private onStateChange?: (ready: boolean) => void
   private onFingerprintReady?: (fingerprint: string) => void
 
   private senderChainKey(senderId: number, epoch: number): string {
     return `${senderId}:${epoch}`
+  }
+
+  /**
+   * 检查并更新重放窗口。返回 true 表示首次出现（接受），false 表示重放（拒绝）。
+   */
+  private checkAndUpdateReplay(senderId: number, epoch: number, messageNumber: number): boolean {
+    const key = `${senderId}|${epoch}`
+    const win = this.replayWindows.get(key)
+    if (!win) {
+      this.replayWindows.set(key, { highest: messageNumber, bitmap: 1n })
+      return true
+    }
+    if (messageNumber > win.highest) {
+      const shift = messageNumber - win.highest
+      if (shift >= this.REPLAY_WINDOW_SIZE) {
+        // 跳跃过大，重置窗口
+        win.bitmap = 1n
+      } else {
+        win.bitmap = (win.bitmap << BigInt(shift)) | 1n
+        // 截断到窗口大小
+        const mask = (1n << BigInt(this.REPLAY_WINDOW_SIZE)) - 1n
+        win.bitmap = win.bitmap & mask
+      }
+      win.highest = messageNumber
+      return true
+    }
+    const offset = win.highest - messageNumber
+    if (offset >= this.REPLAY_WINDOW_SIZE) {
+      // 太旧，超出窗口
+      return false
+    }
+    const bit = 1n << BigInt(offset)
+    if ((win.bitmap & bit) !== 0n) {
+      // 已置位 → 重放
+      return false
+    }
+    win.bitmap = win.bitmap | bit
+    return true
   }
 
   // ============= 初始化 =============
@@ -660,6 +703,17 @@ export class GroupE2EEManager {
 
   async decryptMessage(message: EncryptedMessage): Promise<string> {
     const epoch = message.epoch ?? 0
+
+    // 重放检查：拒绝重复 messageNumber
+    if (!this.checkAndUpdateReplay(message.senderId, epoch, message.messageNumber)) {
+      console.warn('[E2EE] Replay detected, dropping message', {
+        senderId: message.senderId,
+        epoch,
+        messageNumber: message.messageNumber,
+      })
+      throw new Error('Replay detected')
+    }
+
     let senderChain = this.peerSenderChains.get(this.senderChainKey(message.senderId, epoch))
 
     // 如果没有 Sender Chain，先缓存这条消息
@@ -690,6 +744,7 @@ export class GroupE2EEManager {
     this.currentRoomMembers.clear()
     this.currentEpoch = 0
     this.pendingMessages.clear()
+    this.replayWindows.clear()
   }
 }
 

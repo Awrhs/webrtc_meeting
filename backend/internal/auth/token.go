@@ -5,14 +5,17 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"github.com/google/uuid"
 )
 
 const PurposeSFUJoin = "sfu_join"
 
 type SFUClaims struct {
-	UserID  uint
-	RoomID  uint
-	Purpose string
+	UserID    uint
+	RoomID    uint
+	Purpose   string
+	JTI       string
+	ExpiresAt time.Time
 }
 
 func GenerateUserToken(userID uint, secret string, expiresIn time.Duration) (string, error) {
@@ -28,6 +31,7 @@ func GenerateSFUJoinToken(userID, roomID uint, secret string, expiresIn time.Dur
 		"user_id": float64(userID),
 		"room_id": float64(roomID),
 		"purpose": PurposeSFUJoin,
+		"jti":     uuid.NewString(),
 		"exp":     time.Now().Add(expiresIn).Unix(),
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
@@ -62,7 +66,15 @@ func ValidateSFUJoinToken(tokenStr, secret string) (*SFUClaims, error) {
 	if !ok {
 		return nil, errors.New("invalid token claims")
 	}
-	return &SFUClaims{UserID: uint(userID), RoomID: uint(roomID), Purpose: purpose}, nil
+	jti, _ := claims["jti"].(string)
+	exp, _ := numberClaim(claims, "exp")
+	return &SFUClaims{
+		UserID:    uint(userID),
+		RoomID:    uint(roomID),
+		Purpose:   purpose,
+		JTI:       jti,
+		ExpiresAt: time.Unix(int64(exp), 0),
+	}, nil
 }
 
 func parseMapClaims(tokenStr, secret string) (jwt.MapClaims, error) {

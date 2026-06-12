@@ -9,6 +9,7 @@ interface SSRCInfo {
   user_id: number
   kind: string
   stream_id: string
+  rid?: string
 }
 
 interface SFUMessage {
@@ -82,6 +83,15 @@ export class SFUConnection {
     return `${wsProtocol}//${wsHost}/ws?token=${encodeURIComponent(this.sfuToken)}`
   }
 
+  private canUseSimulcast(): boolean {
+    try {
+      const caps = (RTCRtpSender as any).getCapabilities?.('video')
+      return typeof this.pc?.addTransceiver === 'function' && !!caps
+    } catch {
+      return false
+    }
+  }
+
   async connect(localStream: MediaStream): Promise<void> {
     this.isManualDisconnect = false
     this.localStream = localStream
@@ -111,7 +121,26 @@ export class SFUConnection {
     this.pc = new RTCPeerConnection(configuration)
 
     localStream.getTracks().forEach((track) => {
-      const sender = this.pc!.addTrack(track, localStream)
+      let sender: RTCRtpSender
+      if (track.kind === 'video' && this.canUseSimulcast()) {
+        try {
+          const transceiver = this.pc!.addTransceiver(track, {
+            direction: 'sendrecv',
+            streams: [localStream],
+            sendEncodings: [
+              { rid: 'high', maxBitrate: 1_200_000 },
+              { rid: 'low', maxBitrate: 250_000, scaleResolutionDownBy: 4 },
+            ],
+          })
+          sender = transceiver.sender
+          console.log('[WebRTC] Camera track added with simulcast (high/low)')
+        } catch (err) {
+          console.warn('[WebRTC] addTransceiver simulcast failed, fallback to addTrack:', err)
+          sender = this.pc!.addTrack(track, localStream)
+        }
+      } else {
+        sender = this.pc!.addTrack(track, localStream)
+      }
       this.mediaE2EEManager?.attachSender(sender, track)
     })
 

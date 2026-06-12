@@ -34,6 +34,7 @@ type RoomService interface {
 	UpdateMediaState(roomID uint, userID uint, videoOn, audioOn *bool) (bool, bool, error)
 	GenerateSFUToken(roomID uint, userID uint) (string, error)
 	LogAudit(roomID, userID uint, targetID *uint, action, details, ipAddress, userAgent string) error
+	GetAuditLogs(roomID uint, limit, offset int) ([]*models.AuditLog, error)
 }
 
 type roomService struct {
@@ -622,6 +623,10 @@ func (s *roomService) LogAudit(roomID, userID uint, targetID *uint, action, deta
 		CreatedAt: time.Now(),
 	}
 	return s.roomRepo.CreateAuditLog(log)
+}
+
+func (s *roomService) GetAuditLogs(roomID uint, limit, offset int) ([]*models.AuditLog, error) {
+	return s.roomRepo.GetAuditLogs(roomID, limit, offset)
 }
 
 func generateRoomID() string {

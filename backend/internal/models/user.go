@@ -29,13 +29,15 @@ const (
 )
 
 type Device struct {
-	ID          uint      `json:"id" gorm:"primaryKey"`
-	UserID      uint      `json:"user_id"`
-	DeviceName  string    `json:"device_name" gorm:"size:100"`
-	DeviceType  string    `json:"device_type" gorm:"size:50"`
-	IP          string    `json:"ip" gorm:"size:50"`
-	LastActive  time.Time `json:"last_active"`
-	CreatedAt   time.Time `json:"created_at"`
+	ID         uint      `json:"id" gorm:"primaryKey"`
+	UserID     uint      `json:"user_id" gorm:"index;uniqueIndex:idx_user_device"`
+	DeviceID   string    `json:"device_id" gorm:"size:100;uniqueIndex:idx_user_device"`
+	DeviceName string    `json:"device_name" gorm:"size:100"`
+	DeviceType string    `json:"device_type" gorm:"size:50"`
+	UserAgent  string    `json:"user_agent" gorm:"size:255"`
+	IP         string    `json:"ip" gorm:"size:50"`
+	LastActive time.Time `json:"last_active"`
+	CreatedAt  time.Time `json:"created_at"`
 }
 
 type LoginRequest struct {

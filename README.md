@@ -107,8 +107,11 @@ SFU 媒体连接默认不再接受裸连。用户必须先通过 API 登录并�
   - ✅ 媒体流转发 - Pion WebRTC SFU转发音视频流，onTrack回调触发远端渲染
   - ✅ 多轨支持 - 摄像头和屏幕共享可作为独立视频轨道同时发布
   - ✅ 订阅清理 - 用户离开或被踢后清理其他 PeerConnection 中的旧 sender 并重新协商
-- **文本消息 E2EE 基础链路** - 群聊文本支持前端加密、密钥信令分发、后端密文持久化和接收端解密显示
+- **文本消息 E2EE 基础链路** - 群聊文本支持前端加密、密钥信令分发、后端密文持久化和接收端解密显示，并接入基于滑动窗口的消息重放防护
 - **SFU管理功能** - 通过gRPC强制踢人/静音，通过信令广播通知所有客户端
+- **选择性订阅与 Simulcast** - 视频按需订阅（音频/屏幕共享自动全量），摄像头视频默认两层 Simulcast 编码，订阅端可按 quality 选择层
+- **SFU token 防重放与登录设备记录** - SFU admission token 内嵌 jti 并通过 Redis 标记，登录设备会被指纹化记录并提供 API 管理
+- **房间审计 API** - kick/mute/admin/transfer/lock/delete 等敏感操作落库，owner/admin 通过 `/rooms/:id/audit-logs` 分页查询
 
 
 ## 🏗️ 项目架构
@@ -444,6 +447,160 @@ SFU_ALLOW_UNAUTHENTICATED_DEV=true
 
 ---
 
+### 🧪 功能冒烟手册（覆盖 Phase 6/7/8 新功能）
+
+下面这套清单覆盖核心会议链路 + 选择性订阅 + Simulcast + jti 防重放 + 设备记录 + 审计 API。**每项 5–10 分钟**，全部通过即可认为项目处于"已知良好"状态。
+
+**前置准备：**
+
+```bash
+# 1. 启动基础设施 + 后端 + 前端（任选 Docker 或原生方式）
+cp .env.example .env
+docker compose -f deployment/docker-compose.yml up -d --build
+
+# 2. 健康检查
+curl -s http://localhost:8080/healthz   # 期望: ok
+curl -s http://localhost:8080/readyz    # 期望: {"ready":true}
+curl -s http://localhost:8081/healthz 2>/dev/null || echo "SFU 没暴露 healthz 是预期"
+
+# 3. 准备两个浏览器/无痕窗口（下面记为 浏览器A、浏览器B）
+#    访问 http://localhost:3000 各注册一个账号 alice / bob
+```
+
+> 💡 整套手册会用到的 token 通过登录响应拿到。建议在浏览器 DevTools → Application → Local Storage 找到 `token` 字段，或直接用 `curl` 登录后复制。下面 curl 示例统一记为 `$ALICE_TOKEN` / `$BOB_TOKEN`。
+
+```bash
+# curl 登录拿 token 的范例
+ALICE_TOKEN=$(curl -s -X POST http://localhost:8080/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"account":"alice","password":"alicepass"}' | jq -r .token)
+echo $ALICE_TOKEN
+```
+
+#### 冒烟项 1 — 基础音视频互通
+
+1. 浏览器A：登录 alice → 创建房间（记下 6 位 `room_id`）→ 进入会议页，允许摄像头/麦克风
+2. 浏览器B：登录 bob → "加入房间"输入 `room_id` → 进入同一会议
+3. 预期：
+   - A、B 互相看到对方视频画面
+   - 互相听到声音（可让一方说话观察音量条）
+4. 失败定位：
+   - 黑屏：`chrome://webrtc-internals/` 看 `iceConnectionState` 是否 `connected`
+   - 单向：MeetingRoom 控制台搜 `[WebRTC]` 看 onTrack / onRemoteTrack 是否触发
+
+#### 冒烟项 2 — 选择性订阅（Phase 6）
+
+1. 在冒烟项 1 的会议中，**A 关闭摄像头**
+2. 预期：
+   - B 端 A 的 video tile 切换为占位符（"等待视频流..."）
+   - B 端 DevTools Network 面板 → SFU WebSocket → 应看到 B 发出的 `unsubscribe` 消息
+3. **A 重新开启摄像头**
+4. 预期：B 端恢复显示 A 的视频；B 应发出 `subscribe` 消息
+
+#### 冒烟项 3 — Simulcast 两层编码（Phase 7）
+
+1. 在冒烟项 1 的会议中，浏览器A 打开 `chrome://webrtc-internals/`
+2. 找到 A 的 PeerConnection → 展开 `outbound-rtp (video)`
+3. 预期：**应看到至少 2 条 outbound-rtp 视频条目**（不是 1 条），各自带 `[rid:high]` / `[rid:low]` 标识
+4. 同时检查 `framesEncoded` 都在持续递增（说明两层都在编码）
+5. 失败说明：浏览器降级回单层（Safari/Firefox 可能发生），观察控制台是否有 `[WebRTC] simulcast unsupported` 日志
+
+#### 冒烟项 4 — SFU token 一次性使用（Phase 8.2）
+
+```bash
+# 用 alice 加入房间，从响应里抽出 sfu_token
+ROOM_ID=<上面创建的 room 主键 id，不是 6 位 room_id>
+SFU_TOKEN=$(curl -s -X POST "http://localhost:8080/api/v1/rooms/$ROOM_ID/join" \
+  -H "Authorization: Bearer $ALICE_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq -r .sfu_token)
+echo $SFU_TOKEN
+
+# 用同一个 token 连接 SFU 两次（第二次应被拒绝）
+# 简便方式：在浏览器 DevTools Console 里跑：
+new WebSocket("ws://localhost:8081/ws?token=" + "<粘贴 SFU_TOKEN>")
+# 第一次会建立连接（前端已经在用了，可能直接看到 close）
+# 第二次预期：close code 1008/4401 或类似，SFU 日志里出现 "sfu token already used"
+```
+
+更直接的验证：
+- 检查 SFU server 日志，应看到 `validateAdmission ... ok=false reason=sfu_token_already_used` 类信息
+- Redis 中应有 `sfu_jti:<uuid>` 键存在（`docker exec -it <redis容器> redis-cli KEYS 'sfu_jti:*'`）
+
+#### 冒烟项 5 — 登录设备记录（Phase 8.3）
+
+```bash
+# 用 alice 的 token 查设备列表
+curl -s http://localhost:8080/api/v1/user/devices \
+  -H "Authorization: Bearer $ALICE_TOKEN" | jq .
+
+# 预期: devices 数组至少 1 条，包含 user_agent / ip / last_active
+```
+
+可选：换一个浏览器（比如 Edge）再登录 alice 一次，再调上面接口，应看到 2 条设备记录。
+
+```bash
+# 删除某条设备记录
+DEVICE_ID=<上面返回某条 id>
+curl -s -X DELETE "http://localhost:8080/api/v1/user/devices/$DEVICE_ID" \
+  -H "Authorization: Bearer $ALICE_TOKEN"
+# 再查一次，应少一条
+```
+
+#### 冒烟项 6 — 房间审计日志 API（Phase 8.4）
+
+1. 浏览器A（alice，房主）在会议中**踢掉 bob**
+2. 浏览器A 访问审计接口：
+
+```bash
+curl -s "http://localhost:8080/api/v1/rooms/$ROOM_ID/audit-logs?limit=20" \
+  -H "Authorization: Bearer $ALICE_TOKEN" | jq .
+```
+
+3. 预期：`audit_logs` 数组包含一条 `action="kick"` 记录，`user_id=alice.id`、`target_id=bob.id`、有 `ip_address` / `user_agent`
+4. 用 bob 的 token 调同一接口：
+
+```bash
+curl -s "http://localhost:8080/api/v1/rooms/$ROOM_ID/audit-logs" \
+  -H "Authorization: Bearer $BOB_TOKEN"
+# 预期: 403 permission denied（bob 不是 owner/admin）
+```
+
+#### 冒烟项 7 — 文本 E2EE 重放防护（Phase 8.1，自动化已覆盖）
+
+`encryption.test.ts` 中 6 个用例已覆盖：首次接受、重复拒绝、乱序窗口内、窗口外、跨 sender 隔离、大跳跃重置。
+
+```bash
+npm --prefix frontend test -- --run src/utils/encryption.test.ts
+# 预期: 6/6 passed
+```
+
+如需手动验证，可在 MeetingRoom 控制台手动构造重放消息，但成本高于自动化用例的覆盖度，**通常跳过**。
+
+#### 冒烟项 8 — 媒体 E2EE 状态显示
+
+1. Chrome/Edge 打开会议页：媒体 E2EE 标签应显示 **enabled**
+2. Safari/Firefox 打开会议页：标签应显示 **unsupported**（因为不支持 `RTCRtpScriptTransform`）
+3. Worker 应有解密成功计数：MeetingRoom 控制台搜 `mediaE2EE.*decrypted=` 关键字
+
+#### 冒烟项汇总判定
+
+| 序号 | 项目 | 通过判定 |
+|------|------|----------|
+| 1 | 基础音视频互通 | 双向能看能听 |
+| 2 | 选择性订阅 | 关摄像头另一端 tile 变占位符 |
+| 3 | Simulcast 两层 | webrtc-internals 看到 ≥2 条 outbound-rtp |
+| 4 | jti 一次性使用 | 同 token 第二次连接被拒 |
+| 5 | 设备记录 | `/user/devices` 返回当前设备 |
+| 6 | 审计 API | 踢人后 owner 能查到 `kick` 记录，普通成员被 403 |
+| 7 | E2EE 重放 | `encryption.test.ts` 6/6 |
+| 8 | 媒体 E2EE | Chrome 端显示 enabled |
+
+**全部通过** → 可以放心进入 Phase 9。
+**任意失败** → 告知对应序号 + 看到的现象/日志，先修后再推进。
+
+---
+
 ## 🔗 当前前后端配合的整体工作流程
 
 ### 正常会议流程
@@ -510,7 +667,7 @@ SFU_ALLOW_UNAUTHENTICATED_DEV=true
 
 ## 🔍 当前状态与后续改进
 
-核心会议链路、房间权限、SFU 入会鉴权、普通信令成员校验、聊天成员校验和文本消息 E2EE 基础链路已经实现。文本 E2EE 已支持成员变更后的 Sender Chain epoch 轮换；媒体 E2EE 已提供基于浏览器 Encoded Transform 的可选高安全模式。仍建议继续补充自动化权限测试、消息重放防护、设备身份验证和跨浏览器兼容验证。
+核心会议链路、房间权限、SFU 入会鉴权、普通信令成员校验、聊天成员校验和文本消息 E2EE 基础链路已经实现。文本 E2EE 已支持成员变更后的 Sender Chain epoch 轮换以及基于滑动窗口的消息重放防护；媒体 E2EE 已提供基于浏览器 Encoded Transform 的可选高安全模式。SFU 视频已实现按需选择性订阅与两层 Simulcast 编码，SFU 入会 token 通过 `jti + Redis` 阻止单 token 重放，登录设备会被记录，房间敏感操作会写审计日志并通过 API 提供查询。仍建议继续补充网络自适应（TWCC）、Simulcast 自动切层、跨浏览器自动化 E2E 测试和录制策略。
 
 ---
 
@@ -518,29 +675,35 @@ SFU_ALLOW_UNAUTHENTICATED_DEV=true
 
 | 优先级 | 功能 | 实现说明 |
 |-------|------|---------|
-| 🟡 中 | **群聊端到端加密基础链路 (Sender Keys)** | 支持多用户群聊文本加密的基础流程<br>• ECDH P-256 两两密钥协商<br>• HKDF 棘轮算法派生消息密钥<br>• Sender Key 通过成员校验后的信令分发<br>• 成员加入/离开/被踢后轮换 per-sender epoch<br>• 后端只持久化密文和 `encrypted` 标记<br>• 仍需补齐消息重放防护和设备身份验证 |
+| 🟡 中 | **群聊端到端加密基础链路 (Sender Keys)** | 支持多用户群聊文本加密的基础流程<br>• ECDH P-256 两两密钥协商<br>• HKDF 棘轮算法派生消息密钥<br>• Sender Key 通过成员校验后的信令分发<br>• 成员加入/离开/被踢后轮换 per-sender epoch<br>• 后端只持久化密文和 `encrypted` 标记<br>• 已接入基于 `senderId\|epoch` 的滑动窗口消息重放防护 |
 | 🔴 高 | **媒体流端到端加密高安全模式** | 基于 WebRTC Encoded Transform / `RTCRtpScriptTransform` 在浏览器端加密 encoded audio/video frame，SFU 只转发密文 payload；不支持的浏览器回退到 DTLS-SRTP 并显示状态提示 |
 | 🟢 中 | **公钥指纹验证** | SHA-256 指纹，8位可读格式，UI 弹窗支持线下比对 |
 | 🟢 低 | **密钥持久化** | PBKDF2 加密存储到 localStorage，刷新页面恢复密钥状态 |
-| 🟡 中 | **屏幕共享大屏模式** | 开启屏幕共享自动切换布局，大屏显示共享内容，侧边栏显示摄像头 |
+| 🟡 中 | **屏幕共享大屏模式** | 开启屏幕共享自动切换布局,大屏显示共享内容，侧边栏显示摄像头 |
 | 🟡 中 | **全局错误边界** | React ErrorBoundary 捕获渲染错误，友好提示用户 |
 | 🟡 中 | **TURN 服务器支持** | 支持环境变量配置 STUN/TURN 服务器，用于 NAT 穿透 |
 | 🟡 中 | **消息发送错误处理** | 发送失败时显示用户友好的错误提示 |
 | 🟢 高 | **SSRC 流映射** | SFU 下发 SSRC mapping，前端将远端流归属到对应 userId |
 | 🟢 高 | **多路流支持** | 同一用户可同时发送摄像头和屏幕共享流，SFU 独立转发 |
 | 🟡 中 | **管理员强制静音** | 音频轨道转发实际控制，静音状态广播给所有客户端 |
+| 🟢 高 | **选择性订阅** | 视频按需订阅（默认前 6 路可见用户），音频/屏幕共享全量自动订阅，订阅集随成员媒体状态动态调整 |
+| 🟢 中 | **Simulcast 两层编码** | 摄像头视频默认发送 `high` / `low` 两层（不支持的浏览器回退单层），订阅端按 `quality` 选择层；屏幕共享保持单层 |
+| 🟢 高 | **SFU token 一次性使用** | SFU admission token 内嵌 `jti`，SFU 接入时通过 Redis `SetNX` 标记，重复使用同一 token 会被拒绝 |
+| 🟡 中 | **登录设备记录** | 登录时记录设备指纹（`X-Device-Id` 或 UA 哈希）、UA、IP、最近活跃时间，提供 `/user/devices` 查询/删除 API |
+| 🟡 中 | **房间审计日志 API** | kick/mute/unmute/set_admin/remove_admin/transfer_owner/lock/unlock/delete 等敏感操作落库，owner/admin 通过 `/rooms/:id/audit-logs` 分页查询 |
 
 ### ✨ 待实现的高级功能
 > 功能基本可用，不影响核心流程，但可以增强体验或性能
 
 | 优先级 | 功能 | 技术方案 | 预期收益 |
 |-------|------|---------|---------|
-| 🟡 中 | **消息重放防护** | 消息序号验证 + 滑动窗口 | 防止消息重放攻击 |
-| 🟡 中 | 选择性订阅 | 前端通知 SFU 只订阅特定用户的流 | 降低带宽占用，支持大型会议 |
-| 🟢 低 | Simulcast 多层编码 | 发送方编码多分辨率，SFU 按需转发 | 适应不同网络环境 |
-| 🟢 低 | NACK/FEC 拥塞控制 | SFU 实现重传和前向纠错 | 弱网下视频流畅度提升 |
-| 🟢 低 | 录制回放功能 | SFU 将媒体流写入存储，提供回放接口 | 支持会议录播 |
-| 🟢 低 | SFU 集群部署 | 多 SFU 实例负载均衡，信令服务协调 | 支持万人级会议 |
+| 🔴 高 | TWCC + 自适应 Simulcast 切层 | 接入 transport-cc，按下行带宽估计自动选择 high/low 层 | 弱网下不再固定 high，避免卡顿/掉帧 |
+| 🟡 中 | NACK/FEC 完整链路 | SFU 启用重传和前向纠错 | 弱网下视频流畅度提升 |
+| 🟡 中 | 跨浏览器自动化 E2E | Playwright matrix（Chrome/Edge/Firefox/Safari） | 用真实多端冒烟代替手测假设 |
+| 🟢 中 | 公钥/设备身份比对 UI | safety number / 二维码线下比对 | 防止信令通道下的中间人替换公钥 |
+| 🟢 低 | 录制回放功能 | SFU 将媒体流写入存储，提供回放接口 | 支持会议录播（与媒体 E2EE 互斥，需要产品权衡） |
+| 🟢 低 | SFU 集群部署 | 多 SFU 实例 + 跨实例订阅同步 | 支持万人级会议 |
+| 🟢 低 | 移动端原生客户端 | iOS / Android 原生封装 | 真正多端覆盖 |
 
 ---
 
@@ -586,7 +749,7 @@ cd frontend && npm install && npm run dev
 
 > **关于 E2EE 和媒体加密的特别说明**：
 >
-> - 文本消息侧包含 E2EE 相关模型和前端加密工具，已支持 Sender Keys 基础链路和成员变更后的 per-sender epoch 轮换；仍需要结合实际产品流程继续补齐重放防护、设备身份验证和完整审计。
+> - 文本消息侧包含 E2EE 相关模型和前端加密工具，已支持 Sender Keys 基础链路、成员变更后的 per-sender epoch 轮换以及基于 `senderId|epoch` 的滑动窗口消息重放防护；下一步建议补齐设备身份比对 UI（safety number / 二维码线下校验）。
 > - 音视频媒体使用 WebRTC 标准的 DTLS-SRTP 传输加密：浏览器到 SFU、SFU 到浏览器每一段链路都是加密传输。
 > - 项目提供可选媒体 E2EE 高安全模式：支持 `RTCRtpScriptTransform` 的浏览器会在端侧加密 encoded audio/video frame，SFU 只转发密文 RTP payload。
 > - 媒体 E2EE 受浏览器支持限制；不支持的浏览器会回退到 DTLS-SRTP 传输加密并在 UI 中显示状态。

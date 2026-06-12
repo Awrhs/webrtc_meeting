@@ -3,6 +3,7 @@ package main
 import (
 	"conference-sfu/backend/internal/config"
 	"conference-sfu/backend/internal/middleware"
+	"conference-sfu/backend/internal/repository"
 	"conference-sfu/backend/internal/sfu"
 	"conference-sfu/backend/pkg/logger"
 	"context"
@@ -32,6 +33,16 @@ func main() {
 	cfg := config.Load()
 	log := logger.NewLogger()
 
+	// 创建 Redis client 供 SFU token jti 重放检查使用（不可用时降级为不检查）
+	var replayChecker sfu.TokenReplayChecker
+	redisClient := repository.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword, log)
+	if err := redisClient.Ping(); err != nil {
+		log.Warn("Redis ping failed, jti replay protection disabled", zap.Error(err))
+	} else {
+		replayChecker = redisClient
+		log.Info("Redis connected, jti replay protection enabled")
+	}
+
 	// 创建 SFU 核心服务器：初始化 Pion WebRTC API、ICE 配置、房间/Peer 管理
 	sfuServer := sfu.NewSFUServer(log, sfu.ServerOptions{
 		SFUJWTSecret:            cfg.SFUJWTSecret,
@@ -39,6 +50,7 @@ func main() {
 		AllowedOrigins:          cfg.AllowedOrigins,
 		CallbackToken:           cfg.SFUCallbackToken,
 		MessageRateLimit:        cfg.RateLimitSFUMsgPerMinute,
+		TokenReplayChecker:      replayChecker,
 	})
 
 	// 启动 gRPC 控制服务器（保存引用用于优雅关闭）
