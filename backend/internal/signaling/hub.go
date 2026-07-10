@@ -11,6 +11,16 @@ import (
 	"go.uber.org/zap"
 )
 
+// safeMarshal 封装 json.Marshal，失败时打 warn 日志
+// 内部消息结构体序列化理论上不会失败，失败即表示代码有bug
+func safeMarshal(v interface{}, logger *zap.Logger) []byte {
+	data, err := json.Marshal(v)
+	if err != nil {
+		logger.Warn("json.Marshal failed", zap.Any("data", v), zap.Error(err))
+	}
+	return data
+}
+
 type MessageType string
 
 const (
@@ -278,7 +288,7 @@ func (h *Hub) BroadcastUserJoined(roomID uint, userID uint) {
 		RoomID: roomID,
 		UserID: userID,
 	}
-	data, _ := json.Marshal(msg)
+	data := safeMarshal(msg, h.logger)
 	h.BroadcastToRoom(roomID, data, 0)
 }
 
@@ -288,7 +298,7 @@ func (h *Hub) BroadcastUserLeft(roomID uint, userID uint) {
 		RoomID: roomID,
 		UserID: userID,
 	}
-	data, _ := json.Marshal(msg)
+	data := safeMarshal(msg, h.logger)
 	h.BroadcastToRoom(roomID, data, 0)
 }
 
@@ -298,32 +308,32 @@ func (h *Hub) BroadcastKick(roomID uint, targetID uint) {
 		RoomID:   roomID,
 		TargetID: targetID,
 	}
-	data, _ := json.Marshal(msg)
+	data := safeMarshal(msg, h.logger)
 	h.BroadcastToRoom(roomID, data, 0)
 	h.SendToUser(targetID, data)
 }
 
 func (h *Hub) BroadcastMute(roomID uint, targetID uint, isMuted bool) {
-	data, _ := json.Marshal(map[string]bool{"is_muted": isMuted})
+	data := safeMarshal(map[string]bool{"is_muted": isMuted}, h.logger)
 	msg := Message{
 		Type:   MessageTypeMuted,
 		RoomID: roomID,
 		UserID: targetID,
 		Data:   json.RawMessage(data),
 	}
-	raw, _ := json.Marshal(msg)
+	raw := safeMarshal(msg, h.logger)
 	h.BroadcastToRoom(roomID, raw, 0)
 }
 
 func (h *Hub) BroadcastRoleChanged(roomID uint, userID uint, role models.Role) {
-	data, _ := json.Marshal(map[string]interface{}{"role": role})
+	data := safeMarshal(map[string]interface{}{"role": role}, h.logger)
 	msg := Message{
 		Type:   MessageTypeRoleChanged,
 		RoomID: roomID,
 		UserID: userID,
 		Data:   json.RawMessage(data),
 	}
-	raw, _ := json.Marshal(msg)
+	raw := safeMarshal(msg, h.logger)
 	h.BroadcastToRoom(roomID, raw, 0)
 }
 
@@ -333,35 +343,35 @@ func (h *Hub) SendConnectionFailed(roomID uint, userID uint) {
 		RoomID: roomID,
 		UserID: userID,
 	}
-	data, _ := json.Marshal(msg)
+	data := safeMarshal(msg, h.logger)
 	h.SendToUser(userID, data)
 }
 
 func (h *Hub) BroadcastMediaState(roomID uint, userID uint, videoEnabled bool, audioEnabled bool) {
-	data, _ := json.Marshal(map[string]bool{
+	data := safeMarshal(map[string]bool{
 		"video_enabled": videoEnabled,
 		"audio_enabled": audioEnabled,
-	})
+	}, h.logger)
 	msg := Message{
 		Type:   MessageTypeMediaState,
 		RoomID: roomID,
 		UserID: userID,
 		Data:   json.RawMessage(data),
 	}
-	raw, _ := json.Marshal(msg)
+	raw := safeMarshal(msg, h.logger)
 	h.BroadcastToRoom(roomID, raw, 0)
 }
 
 func (h *Hub) BroadcastMessage(roomID uint, message *models.Message, receiverID *uint) {
 	if receiverID != nil {
-		data, _ := json.Marshal(message)
+		data := safeMarshal(message, h.logger)
 		msg := Message{
 			Type:   MessageTypeChatMessage,
 			RoomID: roomID,
 			UserID: message.SenderID,
 			Data:   json.RawMessage(data),
 		}
-		raw, _ := json.Marshal(msg)
+		raw := safeMarshal(msg, h.logger)
 		h.SendToUser(message.SenderID, raw)
 		h.SendToUser(*receiverID, raw)
 	} else {
@@ -370,8 +380,8 @@ func (h *Hub) BroadcastMessage(roomID uint, message *models.Message, receiverID 
 			RoomID: roomID,
 			UserID: message.SenderID,
 		}
-		msg.Data, _ = json.Marshal(message)
-		raw, _ := json.Marshal(msg)
+		msg.Data = safeMarshal(message, h.logger)
+		raw := safeMarshal(msg, h.logger)
 		h.BroadcastToRoom(roomID, raw, 0)
 	}
 }
@@ -430,11 +440,11 @@ func (c *Client) handleMessage(msg *Message) {
 				c.hub.logger.Warn("Unauthorized signaling target", zap.Uint("userID", c.userID), zap.Uint("roomID", msg.RoomID), zap.Uint("targetID", msg.TargetID), zap.String("type", string(msg.Type)))
 				return
 			}
-			data, _ := json.Marshal(msg)
+			data := safeMarshal(msg, c.hub.logger)
 			c.hub.SendToUser(msg.TargetID, data)
 			return
 		}
-		data, _ := json.Marshal(msg)
+		data := safeMarshal(msg, c.hub.logger)
 		c.hub.BroadcastToRoom(msg.RoomID, data, c.userID)
 	}
 }

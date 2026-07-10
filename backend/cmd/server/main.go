@@ -37,8 +37,8 @@ func main() {
 	roomRepo := repository.NewRoomRepository(db)
 	chatRepo := repository.NewChatRepository(db)
 
-	userService := service.NewUserService(userRepo, redisClient, cfg.JWTSecret)
-	roomService := service.NewRoomService(roomRepo, userRepo, redisClient, cfg.SFUJWTSecret, cfg.SFUTokenExpiryMinutes)
+	userService := service.NewUserService(userRepo, redisClient, cfg.JWTSecret, log)
+	roomService := service.NewRoomService(roomRepo, userRepo, redisClient, cfg.SFUJWTSecret, cfg.SFUTokenExpiryMinutes, log)
 	chatService := service.NewChatService(chatRepo, roomRepo)
 
 	// Connect to SFU gRPC control server

@@ -345,17 +345,17 @@ export class GroupE2EEManager {
   // ============= 初始化 =============
 
   async init(userId?: number): Promise<void> {
-    // 如果提供了 userId，尝试从存储恢复
+    // 如果提供了 userId，尝试从内存缓存恢复
     if (userId !== undefined) {
-      const restored = await this.tryRestoreFromStorage(userId)
+      const restored = this.tryRestoreFromMemoryCache(userId)
       if (restored) {
-        console.log('[E2EE] Keys restored from storage')
+        console.log('[E2EE] Keys restored from memory cache')
         this.onStateChange?.(true)
         return
       }
     }
 
-    // 否则生成新密钥
+    // 生成新密钥对（每次页面刷新都重新生成，减少密钥暴露时间）
     this.identityKeyPair = await generateKeyPair()
     console.log('[E2EE] New identity key pair generated')
 
@@ -375,70 +375,31 @@ export class GroupE2EEManager {
   }
 
   /**
-   * 尝试从存储恢复密钥（简化实现：用固定密码，实际应该用用户登录密码）
+   * 尝试从内存缓存恢复密钥
+   * 注意：私钥仅保留在内存中，不落地到持久化存储
+   * 页面刷新后需要重新生成密钥对并重新进行密钥交换
    */
-  private async tryRestoreFromStorage(userId: number): Promise<boolean> {
-    // 简化：用 userId 作为临时密码，实际应该用用户的登录密码
-    const stored = await loadKeyStore(`user_${userId}_key`)
-    if (!stored) return false
-
-    try {
-      // 恢复私钥
-      const privateKeyRaw = base64ToArrayBuffer(stored.myIdentityPrivateKey)
-      const privateKey = await crypto.subtle.importKey(
-        'pkcs8',
-        privateKeyRaw,
-        { name: 'ECDH', namedCurve: 'P-256' },
-        true,
-        ['deriveKey']
-      )
-
-      if (!stored.myIdentityPublicKey) return false
-      this.identityKeyPair = {
-        publicKey: stored.myIdentityPublicKey,
-        privateKey,
-      }
-
-      // 恢复 Sender Chain
-      this.mySenderChain = stored.mySenderChain
-      this.currentEpoch = stored.mySenderChain?.epoch ?? 0
-
-      // 恢复其他用户的 Sender Chain
-      stored.peerSenderChains.forEach(({ userId, chain }) => {
-        this.peerSenderChains.set(this.senderChainKey(userId, chain.epoch ?? 0), {
-          ...chain,
-          epoch: chain.epoch ?? 0,
-        })
-      })
-
-      return true
-    } catch {
-      return false
-    }
+  private tryRestoreFromMemoryCache(_userId: number): boolean {
+    // 当前版本：密钥仅保留在内存中，不持久化
+    // 如需跨页面恢复，可考虑用 sessionStorage + 用户密码派生密钥
+    // 但要注意：任何持久化存储都有被窃取的风险
+    return false
   }
 
   /**
-   * 保存当前密钥状态到存储
+   * 保存当前密钥状态到内存（不持久化到存储）
+   *
+   * 安全设计原则：
+   * 1. 私钥永远不写入 localStorage/indexedDB
+   * 2. 私钥仅保留在 JS 堆内存中
+   * 3. 页面刷新或关闭后自动销毁
+   * 4. 减少密钥在内存中的暴露时间
    */
-  async saveToStorage(userId: number): Promise<void> {
-    if (!this.identityKeyPair || !this.mySenderChain) return
-
-    const privateKeyRaw = await crypto.subtle.exportKey('pkcs8', this.identityKeyPair.privateKey)
-
-    const peerChains: Array<{ userId: number; chain: SenderChain }> = []
-    this.peerSenderChains.forEach((chain, key) => {
-      const userId = Number(key.split(':')[0])
-      peerChains.push({ userId, chain })
-    })
-
-    await saveKeyStore(`user_${userId}_key`, {
-      myIdentityPublicKey: this.identityKeyPair.publicKey,
-      myIdentityPrivateKey: arrayBufferToBase64(privateKeyRaw),
-      mySenderChain: this.mySenderChain,
-      peerSenderChains: peerChains,
-    })
-
-    console.log('[E2EE] Keys saved to storage')
+  async saveToStorage(_userId: number): Promise<void> {
+    // 当前不做任何持久化，仅保留在对象内存中
+    // 如果需要跨标签页支持，可以考虑用 BroadcastChannel + 临时内存共享
+    // 但永远不要把私钥写入持久化存储
+    console.log('[E2EE] Keys kept in memory only (no persistence)')
   }
 
   getIdentityPublicKey(): string {
@@ -748,5 +709,31 @@ export class GroupE2EEManager {
   }
 }
 
+/**
+ * 安全清除 localStorage 中所有遗留的 E2EE 密钥数据
+ * 注意：调用此方法后所有历史密钥都会被清除，需要重新进行密钥交换
+ */
+export const clearLegacyKeyStore = (): void => {
+  try {
+    localStorage.removeItem(STORAGE_KEY)
+    localStorage.removeItem(STORAGE_SALT)
+    // 清除可能存在的旧版本 key（带 user id后缀）
+    const keysToRemove: string[] = []
+    for (let i = 0; i < localStorage.length; i++) {
+      const key = localStorage.key(i)
+      if (key && (key.startsWith('e2ee_') || key.includes('_key'))) {
+        keysToRemove.push(key)
+      }
+    }
+    keysToRemove.forEach(k => localStorage.removeItem(k))
+    console.log('[E2EE] Legacy key store cleared from localStorage')
+  } catch (e) {
+    // 静默失败
+  }
+}
+
 // 全局单例
 export const groupE2EEManager = new GroupE2EEManager()
+
+// 初始化时立即清除所有旧的持久化密钥（安全最佳实践）
+clearLegacyKeyStore()

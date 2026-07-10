@@ -452,6 +452,16 @@ export class SFUConnection {
       this.pc = null
     }
 
+    // 停止所有本地媒体轨道，释放摄像头/麦克风
+    if (this.localStream) {
+      this.localStream.getTracks().forEach(track => track.stop())
+      this.localStream = null
+    }
+    if (this.screenStream) {
+      this.screenStream.getTracks().forEach(track => track.stop())
+      this.screenStream = null
+    }
+
     this.iceCandidates = []
     this.remoteStreams.clear()
     this.ssrcToUserId.clear()

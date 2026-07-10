@@ -7,6 +7,7 @@ import (
 	"errors"
 	"time"
 
+	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -23,20 +24,27 @@ type userService struct {
 	repo      repository.UserRepository
 	redis     *repository.RedisClient
 	jwtSecret string
+	logger    *zap.Logger
 }
 
-func NewUserService(repo repository.UserRepository, redis *repository.RedisClient, jwtSecret string) UserService {
-	return &userService{repo: repo, redis: redis, jwtSecret: jwtSecret}
+func NewUserService(repo repository.UserRepository, redis *repository.RedisClient, jwtSecret string, logger *zap.Logger) UserService {
+	return &userService{repo: repo, redis: redis, jwtSecret: jwtSecret, logger: logger}
 }
 
 func (s *userService) Register(username, email, phone, password string) (*models.User, error) {
-	if existing, _ := s.repo.FindByEmail(email); existing != nil {
+	if existing, err := s.repo.FindByEmail(email); err != nil {
+		s.logger.Warn("FindByEmail failed", zap.String("email", email), zap.Error(err))
+	} else if existing != nil {
 		return nil, errors.New("email already registered")
 	}
-	if existing, _ := s.repo.FindByPhone(phone); existing != nil {
+	if existing, err := s.repo.FindByPhone(phone); err != nil {
+		s.logger.Warn("FindByPhone failed", zap.String("phone", phone), zap.Error(err))
+	} else if existing != nil {
 		return nil, errors.New("phone already registered")
 	}
-	if existing, _ := s.repo.FindByUsername(username); existing != nil {
+	if existing, err := s.repo.FindByUsername(username); err != nil {
+		s.logger.Warn("FindByUsername failed", zap.String("username", username), zap.Error(err))
+	} else if existing != nil {
 		return nil, errors.New("username already taken")
 	}
 

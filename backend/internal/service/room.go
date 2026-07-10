@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -43,15 +44,17 @@ type roomService struct {
 	redis                 *repository.RedisClient
 	sfuJWTSecret          string
 	sfuTokenExpiryMinutes int
+	logger                *zap.Logger
 }
 
-func NewRoomService(roomRepo repository.RoomRepository, userRepo repository.UserRepository, redis *repository.RedisClient, sfuJWTSecret string, sfuTokenExpiryMinutes int) RoomService {
+func NewRoomService(roomRepo repository.RoomRepository, userRepo repository.UserRepository, redis *repository.RedisClient, sfuJWTSecret string, sfuTokenExpiryMinutes int, logger *zap.Logger) RoomService {
 	return &roomService{
 		roomRepo:              roomRepo,
 		userRepo:              userRepo,
 		redis:                 redis,
 		sfuJWTSecret:          sfuJWTSecret,
 		sfuTokenExpiryMinutes: sfuTokenExpiryMinutes,
+		logger:                logger,
 	}
 }
 
@@ -201,10 +204,22 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 	}
 
 	// 先检查用户是否在房间中（未离开）
-	activeMember, _ := s.roomRepo.GetMember(room.ID, userID)
+	activeMember, err := s.roomRepo.GetMember(room.ID, userID)
+	if err != nil {
+		s.logger.Warn("Failed to get active member, falling back to new member creation",
+			zap.Uint("roomID", room.ID),
+			zap.Uint("userID", userID),
+			zap.Error(err))
+	}
 	if activeMember == nil {
 		// 用户不在房间中，检查是否有历史记录
-		existingMember, _ := s.roomRepo.GetAnyMember(room.ID, userID)
+		existingMember, err := s.roomRepo.GetAnyMember(room.ID, userID)
+		if err != nil {
+			s.logger.Warn("Failed to get existing member",
+				zap.Uint("roomID", room.ID),
+				zap.Uint("userID", userID),
+				zap.Error(err))
+		}
 		if existingMember == nil {
 			// 新成员，创建记录
 			member := &models.RoomMember{
@@ -351,8 +366,22 @@ func (s *roomService) KickMember(roomID uint, requesterID uint, targetID uint) e
 		return errors.New("permission denied")
 	}
 
-	requesterRole, _ := s.GetMemberRole(roomID, requesterID)
-	targetRole, _ := s.GetMemberRole(roomID, targetID)
+	requesterRole, err := s.GetMemberRole(roomID, requesterID)
+	if err != nil {
+		s.logger.Warn("Failed to get requester role",
+			zap.Uint("roomID", roomID),
+			zap.Uint("requesterID", requesterID),
+			zap.Error(err))
+		return errors.New("permission denied")
+	}
+	targetRole, err := s.GetMemberRole(roomID, targetID)
+	if err != nil {
+		s.logger.Warn("Failed to get target role",
+			zap.Uint("roomID", roomID),
+			zap.Uint("targetID", targetID),
+			zap.Error(err))
+		return errors.New("permission denied")
+	}
 
 	if targetRole == models.RoleOwner || (targetRole == models.RoleAdmin && requesterRole != models.RoleOwner) {
 		return errors.New("permission denied")
