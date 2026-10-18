@@ -10,6 +10,7 @@ import {
 import { RootState } from '@/store'
 import { Message } from '@/types'
 import { groupE2EEManager, EncryptedMessage } from '@/utils/encryption'
+import { api } from '@/utils/api'
 
 interface ChatProps {
   roomId: number
@@ -19,6 +20,7 @@ interface ChatProps {
 
 export default function Chat({ roomId, messages, signaling }: ChatProps) {
   const { user } = useSelector((state: RootState) => state.auth)
+  const { members } = useSelector((state: RootState) => state.room)
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
   const [e2eeReady, setE2eeReady] = useState(false)
@@ -29,6 +31,9 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
   const [memberFingerprints, setMemberFingerprints] = useState<Array<{ userId: number; name: string; fingerprint: string }>>([])
 
   const messagesEndRef = useRef<HTMLDivElement>(null)
+  // 自己发出的消息无法用自己的 Sender Key 解密（链已棘轮），发送时记住明文。
+  // 密文（含随机 IV）全局唯一，作为 key 可以可靠地把回显消息映射回明文。
+  const sentPlaintexts = useRef<Map<string, string>>(new Map())
 
   useEffect(() => {
     groupE2EEManager.setCallbacks(
@@ -94,6 +99,16 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
   useEffect(() => {
     messages.forEach(message => {
       if (!message.encrypted || decryptedMessages[message.id]) return
+
+      // 自己发送的消息：直接取发送时记录的明文（无需也无法解密）
+      if (message.sender_id === user?.id) {
+        const plaintext = sentPlaintexts.current.get(message.content)
+        if (plaintext !== undefined) {
+          setDecryptedMessages(prev => ({ ...prev, [message.id]: plaintext }))
+        }
+        return
+      }
+
       try {
         const encryptedData = JSON.parse(message.content) as EncryptedMessage
         groupE2EEManager.decryptMessage(encryptedData)
@@ -105,7 +120,7 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
         setDecryptedMessages(prev => ({ ...prev, [message.id]: '[消息格式错误]' }))
       }
     })
-  }, [messages, decryptedMessages])
+  }, [messages, decryptedMessages, user?.id])
 
   const showFingerprintModal = async () => {
     const fingerprints: Array<{ userId: number; name: string; fingerprint: string }> = [
@@ -130,24 +145,18 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
         content = JSON.stringify(encryptionData)
         encrypted = true
         setDebugInfo(`消息 #${encryptionData.messageNumber} 已加密`)
+        // 记住明文：回显的加密消息无法用自己的链解密
+        sentPlaintexts.current.set(content, input.trim())
         await groupE2EEManager.saveToStorage(user.id)
       }
 
-      const response = await fetch(`/api/v1/rooms/${roomId}/messages`, {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${localStorage.getItem('token')}`,
-        },
-        body: JSON.stringify({
-          type: 'text',
-          content,
-          encrypted,
-        }),
+      // 使用统一的 api 实例（走 VITE_API_HOST，携带认证头与 401 拦截），
+      // 旧实现用裸 fetch 相对路径，在 dev/Docker 下都会 404
+      await api.post(`/api/v1/rooms/${roomId}/messages`, {
+        type: 'text',
+        content,
+        encrypted,
       })
-      if (!response.ok) {
-        throw new Error('message send failed')
-      }
 
       setInput('')
     } catch (error) {
@@ -163,6 +172,16 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
       return message.content
     }
     return decryptedMessages[message.id] || '[已加密消息 - 正在解密...]'
+  }
+
+  // 后端广播/历史接口都不回填 sender_nickname（模型未联表），
+  // 前端从成员列表/当前用户解析发送者昵称
+  const senderName = (message: Message): string => {
+    if (message.sender_id === user?.id) {
+      return user?.nickname || '你'
+    }
+    const member = members.find(m => m.user_id === message.sender_id)
+    return member?.nickname || message.sender_nickname || `用户 ${message.sender_id}`
   }
 
   const isSelf = (message: Message) => message.sender_id === user?.id
@@ -198,7 +217,7 @@ export default function Chat({ roomId, messages, signaling }: ChatProps) {
             style={{ marginBottom: 12 }}
           >
             <div className="message-header" style={{ fontSize: 12, color: '#888' }}>
-              {message.sender_nickname}
+              {senderName(message)}
               <span style={{ marginLeft: 8 }}>
                 {new Date(message.created_at).toLocaleTimeString()}
               </span>

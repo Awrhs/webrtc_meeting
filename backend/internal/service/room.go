@@ -59,7 +59,20 @@ func NewRoomService(roomRepo repository.RoomRepository, userRepo repository.User
 }
 
 func (s *roomService) CreateRoom(ownerID uint, req *models.CreateRoomRequest) (*models.Room, error) {
-	roomID := generateRoomID()
+	// 生成唯一的 6 位 room_id：库中已有同号房间则重试，避免撞唯一索引后
+	// 直接报数据库错误（6 位数字空间有限，房间多时碰撞概率不可忽略）
+	var roomID string
+	for i := 0; i < 5; i++ {
+		candidate := generateRoomID()
+		if _, err := s.roomRepo.FindByRoomID(candidate); err != nil {
+			roomID = candidate
+			break
+		}
+		s.logger.Warn("room_id collision, retrying", zap.String("room_id", candidate))
+	}
+	if roomID == "" {
+		return nil, errors.New("failed to generate unique room id, please retry")
+	}
 	inviteCode := generateInviteCode()
 
 	room := &models.Room{
@@ -659,7 +672,7 @@ func (s *roomService) GetAuditLogs(roomID uint, limit, offset int) ([]*models.Au
 }
 
 func generateRoomID() string {
-	rand.Seed(time.Now().UnixNano())
+	// Go 1.20+ 全局 rand 默认自动播种，无需（也不应）调用已废弃的 rand.Seed
 	digits := "0123456789"
 	result := make([]byte, 6)
 	for i := 0; i < 6; i++ {

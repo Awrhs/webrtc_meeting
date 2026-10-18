@@ -46,7 +46,7 @@ export default function MeetingRoom() {
 
   const currentUserId = user?.id || 0
 
-  const { remoteStreams, addRemoteStream, removeRemoteStreamsByUser, clearRemoteStreams } = useRemoteStreams()
+  const { remoteStreams, addRemoteStream, removeRemoteStream, removeRemoteStreamsByUser, clearRemoteStreams } = useRemoteStreams()
 
   const canLockRoom = myPermissions.includes('lock_room')
   const canDeleteRoom = myPermissions.includes('delete_room')
@@ -62,8 +62,12 @@ export default function MeetingRoom() {
   }, [])
 
   const { sfuConnectionRef, connect: sfuConnect, disconnect: sfuDisconnect, setVideoSubscriptions } = useSFUMedia({
-    onRemoteTrack: (_userId: number, _track: MediaStreamTrack, stream: MediaStream) => {
-      addRemoteStream(_userId, stream)
+    onRemoteTrack: (userId: number, _track: MediaStreamTrack, stream: MediaStream) => {
+      // 流归属明确后，将其从 userId=0 的未识别池中移除，避免同一流被渲染两次
+      if (userId !== 0) {
+        removeRemoteStream(0, stream)
+      }
+      addRemoteStream(userId, stream)
     },
     mediaE2EEManagerRef,
     localStreamRef,

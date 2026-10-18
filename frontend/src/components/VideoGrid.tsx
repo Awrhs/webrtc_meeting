@@ -119,10 +119,17 @@ function getRemoteStreamForUser(
 ): MediaStream | null {
   const userStreams = remoteStreams.get(userId)
   if (userStreams && userStreams.length > 0) {
-    return userStreams[0]
+    // 同一用户可能有多路流（音频流 + 摄像头/屏幕流是不同的 msid），
+    // 优先取带活跃视频轨道的流，避免拿到纯音频流导致黑屏。
+    const withVideo = userStreams.find(
+      s => s.getVideoTracks().some(t => t.readyState === 'live')
+    )
+    return withVideo ?? userStreams[0]
   }
 
-  const poolStreams = remoteStreams.get(0) || []
+  const poolStreams = (remoteStreams.get(0) || []).filter(
+    s => s.getVideoTracks().some(t => t.readyState === 'live')
+  )
   const memberIndex = remoteMembersWithVideo.findIndex(m => m.user_id === userId)
   if (memberIndex !== -1 && poolStreams.length > memberIndex) {
     return poolStreams[memberIndex]

@@ -15,13 +15,20 @@ CREATE TABLE IF NOT EXISTS users (
 CREATE TABLE IF NOT EXISTS devices (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL,
+    device_id VARCHAR(100),
     device_name VARCHAR(100),
     device_type VARCHAR(50),
+    user_agent VARCHAR(255),
     ip VARCHAR(50),
     last_active TIMESTAMP,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
 );
+
+-- 兼容旧库：补齐早期 devices 表缺失的列与唯一索引（与 Device 模型对齐）
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_id VARCHAR(100);
+ALTER TABLE devices ADD COLUMN IF NOT EXISTS user_agent VARCHAR(255);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_user_device ON devices(user_id, device_id);
 
 CREATE TABLE IF NOT EXISTS rooms (
     id SERIAL PRIMARY KEY,

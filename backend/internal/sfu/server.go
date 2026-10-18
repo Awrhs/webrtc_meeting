@@ -18,7 +18,6 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/pion/rtcp"
-	"github.com/pion/rtp"
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/zap"
 )
@@ -67,15 +66,6 @@ type Peer struct {
 	Subscriptions map[uint][]*webrtc.RTPSender // key: fromUserID
 	addedTracks   map[string]bool              // key: fromUserID|trackKey
 	renegoPending bool                         // 是否有待处理的 renegotiation
-}
-
-// rtpPool 复用 RTP 包对象，减少 GC 压力
-// 注意：Pion ReadRTP 返回的是新分配的对象，我们在 WriteRTP 后把它放回池
-// 下次从池取出时 pion 会覆写内容，这比每次分配新对象省很多 GC
-var rtpPool = sync.Pool{
-	New: func() interface{} {
-		return &rtp.Packet{}
-	},
 }
 
 // 订阅相关的事件类型已定义在 peerEventType 中
@@ -380,8 +370,8 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 
 	// 启动 RTP 包转发 goroutine：从浏览器发来的 track 读取 RTP 包，写入 localTrack
 	// localTrack 会被挂载到其他用户的 PeerConnection 上，Pion 会自动将其 RTP 包发送出去
-	// 优化 1：使用 ReadRTP/WriteRTP 避免二次解析 RTP 包
-	// 优化 2：使用 atomic.Bool 检查 IsEnabled，无需在每个包上都加锁（消除热点锁）
+	// 使用 ReadRTP/WriteRTP 避免二次解析 RTP 包；
+	// 通过 atomic.Bool 检查 IsEnabled，无需在每个包上都加锁（消除热点锁）
 	go func() {
 		for {
 			// 读取已解析的 RTP 包，避免后续 Write 时二次解析
@@ -393,22 +383,12 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 				return
 			}
 
-			// 【重要优化】使用 atomic.Bool 无需锁即可检查状态
-			// 之前：每个 RTP 包都要加锁解锁 -> 每秒约 100 次锁竞争
-			// 现在：通过闭包捕获的 trackInfo 直接原子读取，零开销，完全无竞争
-			isEnabled := trackInfo.IsEnabled.Load()
-
 			// 只有启用的轨道才转发（被 MuteUser 禁用的轨道会跳过）
-			if isEnabled {
-				// 直接写入已解析的 RTP 包，省一次 Unmarshal 开销
+			if trackInfo.IsEnabled.Load() {
 				if err := localTrack.WriteRTP(pkt); err != nil {
-					rtpPool.Put(pkt) // 即使失败也要放回池
 					return
 				}
 			}
-
-			// 放回复用，减少 GC
-			rtpPool.Put(pkt)
 		}
 	}()
 
@@ -428,31 +408,17 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 	}
 
 
-	for _, otherPeer := range room.Peers {
-		// 给所有用户（包括发布者自己）发送 SSRC 映射，方便前端做流归属
+	for _, otherPeer := range peersToNotify {
+		// 给所有用户（包括发布者自己）发送 SSRC/流映射，方便前端做流归属。
+		// 【注意】必须使用上面加锁获取的 peersToNotify 快照：直接遍历 room.Peers
+		// 会与 handleJoin/removePeer 等并发 map 写入产生竞争，可能触发
+		// "concurrent map iteration and map write" 致命错误。
 		s.sendToPeer(otherPeer, ssrcMapping)
-
-		// 给其他用户添加轨道订阅：音频和屏幕共享自动扇出，普通视频由前端按需 subscribe
-		if otherPeer.UserID == peer.UserID {
-			continue
-		}
-
-		if trackKind == "video" && streamID != "screen" {
-			continue
-		}
-
-		// 通过 peerEvent 串行执行 AddTrack，消除 otherPeer.mu 竞争
-		// 注意：此处不等待结果，让订阅操作异步在事件循环中完成
-		s.sendPeerEvent(otherPeer, peerEvent{
-			typ: peerEvtSubscribe,
-			data: subscribeEvent{
-				targetUserID: peer.UserID,
-				kind:         trackKind,
-				streamID:     streamID,
-				tracks:       []*TrackInfo{trackInfo},
-			},
-		})
 	}
+
+	// 订阅扇出统一由 peerEvtTrackAdded 事件中的 autoSubscribeTrack 处理：
+	// 音频与无 RID 的视频（屏幕共享/非 simulcast 回退）自动订阅；
+	// 带 RID 的摄像头视频（simulcast 层）由前端按需 subscribe。
 }
 
 
@@ -550,7 +516,11 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 	switch evt.typ {
 	case peerEvtTrackAdded:
 		data := evt.data.(trackAddedEvent)
+		// peer.Tracks 会被 handleJoin / handleSubscribe / HandleMetrics 在 peer.mu
+		// 保护下读取，写入时必须持有同一把锁，否则存在 map 并发读写竞争。
+		peer.mu.Lock()
 		peer.Tracks[data.trackInfo.Key()] = data.trackInfo
+		peer.mu.Unlock()
 		data.trackInfo.IsEnabled.Store(true) // 原子设置
 
 		s.logger.Info("Track added via event loop",
@@ -603,7 +573,7 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 	case peerEvtSubscribe:
 		data := evt.data.(subscribeEvent)
 		added := false
-		var firstSSRC uint32
+		var addedTracks []*TrackInfo
 
 		for _, ti := range data.tracks {
 			trackKey := ti.Key()
@@ -626,19 +596,19 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 			peer.Subscriptions[data.targetUserID] = append(peer.Subscriptions[data.targetUserID], sender)
 			s.startRTCPReadLoop(peer, sender, data.targetUserID, trackKey)
 			added = true
-			firstSSRC = ti.SSRC
+			addedTracks = append(addedTracks, ti)
 
 			s.logger.Info("Subscribed to track via event loop",
 				zap.Uint("subscriber", peer.UserID),
-				zap.Uint("publisher", data.targetUserID),
-				zap.String("trackKey", trackKey))
+			zap.Uint("publisher", data.targetUserID),
+			zap.String("trackKey", trackKey))
 		}
 
 		if added {
 			s.triggerRenegotiation(peer)
 		}
 		if evt.respCh != nil {
-			evt.respCh <- peerResp{err: nil, result: map[string]interface{}{"added": added, "ssrc": firstSSRC}}
+			evt.respCh <- peerResp{err: nil, result: map[string]interface{}{"added": added, "tracks": addedTracks}}
 		}
 
 	case peerEvtUnsubscribe:
@@ -863,8 +833,8 @@ func (s *SFUServer) SubscribeTracks(peer *Peer, targetUserID uint, kind, streamI
 	return nil
 }
 
-// SubscribeTracksWait 订阅指定用户的轨道（同步等待结果）
-func (s *SFUServer) SubscribeTracksWait(peer *Peer, targetUserID uint, kind, streamID string, tracks []*TrackInfo) (bool, uint32, error) {
+// SubscribeTracksWait 订阅指定用户的轨道（同步等待结果，返回本次新增的轨道列表）
+func (s *SFUServer) SubscribeTracksWait(peer *Peer, targetUserID uint, kind, streamID string, tracks []*TrackInfo) ([]*TrackInfo, error) {
 	resp := s.sendPeerEventWait(peer, peerEvent{
 		typ: peerEvtSubscribe,
 		data: subscribeEvent{
@@ -875,10 +845,15 @@ func (s *SFUServer) SubscribeTracksWait(peer *Peer, targetUserID uint, kind, str
 		},
 	})
 	if resp.err != nil {
-		return false, 0, resp.err
+		return nil, resp.err
 	}
 	result := resp.result.(map[string]interface{})
-	return result["added"].(bool), result["ssrc"].(uint32), nil
+	added, _ := result["added"].(bool)
+	if !added {
+		return nil, nil
+	}
+	addedTracks, _ := result["tracks"].([]*TrackInfo)
+	return addedTracks, nil
 }
 
 // UnsubscribeTracks 取消订阅指定用户的轨道（异步）
@@ -918,7 +893,7 @@ func (s *SFUServer) sendToPeer(peer *Peer, msg SignalingMessage) {
 	}
 }
 
-// doRenegotiate 真正执行一次 renegotiation。仅由 peerEventLoop 的 renegoTicker 调用，
+// doRenegotiate 真正执行一次 renegotiation。仅由 renegotiationWorker 串行调用，
 // 因此天然单线程，不会与自身并发；SignalingState 检查作为防御性兜底。
 func (s *SFUServer) doRenegotiate(peer *Peer) {
 	// 【架构说明】此处无需 peer.mu 保护
@@ -953,9 +928,17 @@ func (s *SFUServer) doRenegotiate(peer *Peer) {
 		return
 	}
 
+	// CreateOffer 返回的 SDP 不包含 ICE 候选；候选只在 PendingLocalDescription
+	// 中注入（pion 的 populateLocalCandidates）。重新协商复用已有 ICE 通道时
+	// 候选通常已收集完成，这里优先使用 Pending 描述，避免丢失候选。
+	offerSDP := offer.SDP
+	if pending := peer.PC.PendingLocalDescription(); pending != nil && pending.SDP != "" {
+		offerSDP = pending.SDP
+	}
+
 	s.sendToPeer(peer, SignalingMessage{
 		Type: "offer",
-		SDP:  offer.SDP,
+		SDP:  offerSDP,
 	})
 	s.logger.Info("Sent renegotiation offer", zap.Uint("userID", peer.UserID))
 }
@@ -970,10 +953,11 @@ func (s *SFUServer) doRenegotiate(peer *Peer) {
 // RTCPTarget 记录 SSRC 对应的发送端信息
 // 当订阅者发送 RTCP 反馈时，我们需要找到对应的 publisher 并将反馈发给他
 type RTCPTarget struct {
-	Publisher  *Peer                // 轨道发布者
-	TrackSSRC  uint32               // 发布者的原始 SSRC（浏览器发送的）
-	TrackKey   string               // 轨道唯一标识
-	FromUserID uint                 // 发布者用户ID
+	Publisher  *Peer  // 轨道发布者
+	Subscriber *Peer  // 订阅者（startRTCPReadLoop 注册时非空；onTrack 注册时为 nil）
+	TrackSSRC  uint32 // 发布者的原始 SSRC（浏览器发送的）
+	TrackKey   string // 轨道唯一标识
+	FromUserID uint   // 发布者用户ID
 }
 
 // RTCPRouter RTCP 路由表，将接收端的反馈转发给对应的发送端
@@ -996,12 +980,18 @@ func (r *RTCPRouter) Register(ssrc uint32, target *RTCPTarget) {
 	r.ssrcMap[ssrc] = target
 }
 
-// UnregisterByUser 清理用户相关的所有 SSRC 映射
+// UnregisterByUser 清理与用户相关的所有 SSRC 映射：
+// 用户既可能是发布者（onTrack 注册），也可能是订阅者（startRTCPReadLoop 注册）。
+// 只按发布者清理会遗漏订阅侧条目，造成路由表无限增长和悬挂的 Peer 指针。
 func (r *RTCPRouter) UnregisterByUser(userID uint) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	for ssrc, target := range r.ssrcMap {
 		if target.FromUserID == userID {
+			delete(r.ssrcMap, ssrc)
+			continue
+		}
+		if target.Subscriber != nil && target.Subscriber.UserID == userID {
 			delete(r.ssrcMap, ssrc)
 		}
 	}
@@ -1053,15 +1043,15 @@ func (r *RTCPRouter) Route(pkt rtcp.Packet) bool {
 // 这是视频质量自适应的关键：PLI 请求关键帧、NACK 请求重传、REMB 码率估计
 func (s *SFUServer) startRTCPReadLoop(peer *Peer, sender *webrtc.RTPSender, fromUserID uint, trackKey string) {
 	// 在订阅时注册 SSRC 映射，确保 RTCP 能路由回去
-	// 注意：sender.GetParameters().Encodings[0].SSRC 就是轨道的 SSRC
+	// 注意：sender.GetParameters().Encodings[0].SSRC 就是本订阅侧出站轨道的 SSRC
 	params := sender.GetParameters()
 	if len(params.Encodings) > 0 {
 		ssrc := uint32(params.Encodings[0].SSRC)
 		publisher := s.getPeerByID(peer.RoomID, fromUserID)
 		if publisher != nil {
-			// 找到 publisher 对应的 receiver（简化处理，实际需要精确匹配）
 			s.rtcpRouter.Register(ssrc, &RTCPTarget{
 				Publisher:  publisher,
+				Subscriber: peer,
 				FromUserID: fromUserID,
 				TrackKey:   trackKey,
 			})
@@ -1215,20 +1205,31 @@ func (s *SFUServer) getRoom(roomID uint) *Room {
 	return s.rooms[roomID]
 }
 
-// autoSubscribeTrack 将 publisher 的新轨道自动订阅给房间内所有其他用户。
-// 规则：音频和屏幕共享自动订阅，视频按需订阅。
+// autoSubscribeTrack 将 publisher 的新轨道自动订阅给房间内其他用户。
+// 规则：
+//   - 音频：自动订阅给所有人；
+//   - 视频（RID == ""，即屏幕共享或非 simulcast 浏览器的摄像头回退）：自动订阅；
+//   - 视频（RID != ""，即带 simulcast 层的摄像头）：不自动订阅，由前端按需 subscribe。
+//
+// 【注意】浏览器 SDP 中的 msid/StreamID 是浏览器生成的 GUID，不能与 "camera"/"screen"
+// 字面量比较；摄像头与屏幕共享的区分依赖 RID（前端摄像头默认两层 simulcast，屏幕共享单层）。
 func (s *SFUServer) autoSubscribeTrack(room *Room, publisher *Peer, trackInfo *TrackInfo) {
-	// 普通视频不由系统自动订阅，由前端按需发起 subscribe 请求
-	if trackInfo.Kind == "video" && trackInfo.StreamID == "camera" {
+	if trackInfo.Kind == "video" && trackInfo.RID != "" {
 		return
 	}
 
-	// 音频和屏幕共享：广播给所有其他用户
-	for _, otherPeer := range room.Peers {
-		if otherPeer.UserID == publisher.UserID {
-			continue
+	// 加锁获取快照：autoSubscribeTrack 运行在事件循环 goroutine 中，
+	// 直接遍历 room.Peers 会与 handleJoin/removePeer 的并发写入竞争。
+	room.mu.Lock()
+	otherPeers := make([]*Peer, 0, len(room.Peers))
+	for _, p := range room.Peers {
+		if p.UserID != publisher.UserID {
+			otherPeers = append(otherPeers, p)
 		}
+	}
+	room.mu.Unlock()
 
+	for _, otherPeer := range otherPeers {
 		// 通过统一事件循环串行执行订阅，消除竞态
 		s.SubscribeTracks(otherPeer, publisher.UserID, trackInfo.Kind, trackInfo.StreamID, []*TrackInfo{trackInfo})
 
@@ -1246,7 +1247,9 @@ func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessag
 		return
 	}
 
+	room.mu.Lock()
 	publisher := room.Peers[msg.TargetUserID]
+	room.mu.Unlock()
 	if publisher == nil {
 		s.logger.Debug("Subscribe target not found",
 			zap.Uint("subscriber", peer.UserID),
@@ -1310,22 +1313,29 @@ func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessag
 	}
 
 	// 通过统一事件循环串行执行订阅
-	added, ssrc, err := s.SubscribeTracksWait(peer, msg.TargetUserID, msg.Kind, msg.StreamID, selectedTracks)
+	addedTracks, err := s.SubscribeTracksWait(peer, msg.TargetUserID, msg.Kind, msg.StreamID, selectedTracks)
 	if err != nil {
 		s.sendToPeer(peer, SignalingMessage{Type: "error", Error: err.Error()})
 		return
 	}
 
-	if added && ssrc > 0 {
-		// 发送 SSRC 映射给前端（让其能把 RTP 包归属到正确的用户）
-		// 注意：RID 信息已包含在 trackKey 中，这里简化处理
+	// 发送新增轨道的 SSRC/流映射给前端（让其能把 RTP 包/流归属到正确的用户）。
+	// 注意要带上 StreamID/RID：Pion 转发时会重写 SSRC（每个订阅者一个新随机 SSRC），
+	// 前端可靠的归属依据是 SDP msid（StreamID），SFU 原样保留了发布者的 msid。
+	if len(addedTracks) > 0 {
+		ssrcs := make([]SSRC, 0, len(addedTracks))
+		for _, ti := range addedTracks {
+			ssrcs = append(ssrcs, SSRC{
+				SSRC:     ti.SSRC,
+				UserID:   msg.TargetUserID,
+				Kind:     ti.Kind,
+				StreamID: ti.StreamID,
+				RID:      ti.RID,
+			})
+		}
 		s.sendToPeer(peer, SignalingMessage{
 			Type: "ssrc_mapping",
-			SSRCs: []SSRC{{
-				SSRC:   ssrc,
-				UserID: msg.TargetUserID,
-				Kind:   msg.Kind,
-			}},
+			SSRCs: ssrcs,
 		})
 	}
 }
@@ -1672,12 +1682,13 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 
 	// 订阅房间内已存在的其他用户的流
 	// 音频：自动全量订阅；视频：仅收集 SSRC 信息，由前端按需 subscribe
-	// 注意：room.mu 已在函数开头通过 defer 持有，此处无需再次加锁
-	// 注意：existingPeer.Tracks 读取无需加锁 - TrackInfo 的 SSRC/Kind/StreamID/RID 创建后不可变
+	// 注意：room.mu 已在函数开头通过 defer 持有，此处无需再次加锁；
+	// existingPeer.Tracks 由发布者事件循环在 peer.mu 保护下写入，读取需持同一把锁
 	var allSSRCs []SSRC
 	for _, existingPeer := range room.Peers {
 		if existingPeer.UserID != peer.UserID {
 			var audioTracks []*TrackInfo
+			existingPeer.mu.Lock()
 			for _, trackInfo := range existingPeer.Tracks {
 				allSSRCs = append(allSSRCs, SSRC{
 					SSRC:     trackInfo.SSRC,
@@ -1691,6 +1702,7 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 					audioTracks = append(audioTracks, trackInfo)
 				}
 			}
+			existingPeer.mu.Unlock()
 
 			// 音频自动订阅：通过事件循环串行执行，避免竞态
 			if len(audioTracks) > 0 {
@@ -1807,6 +1819,8 @@ func (s *SFUServer) removePeer(roomID, userID uint) {
 	s.cleanupPeerSubscriptions(room, userID)
 	s.closePeer(peer)
 	delete(room.Peers, userID)
+	// 清理该用户相关的 RTCP 路由（发布侧 + 订阅侧）
+	s.rtcpRouter.UnregisterByUser(userID)
 
 	if len(room.Peers) == 0 {
 		s.mu.Lock()
@@ -1869,7 +1883,10 @@ func (s *SFUServer) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 		room.mu.Lock()
 		peers += len(room.Peers)
 		for _, peer := range room.Peers {
+			// peer.Tracks 由事件循环在 peer.mu 保护下写入，读取同样需要持锁
+			peer.mu.Lock()
 			tracks += len(peer.Tracks)
+			peer.mu.Unlock()
 		}
 		room.mu.Unlock()
 	}
@@ -1906,6 +1923,8 @@ func (s *SFUServer) KickUser(roomID, userID uint, reason string) error {
 	s.cleanupPeerSubscriptions(room, userID)
 	s.closePeer(peer)
 	delete(room.Peers, userID)
+	// 清理该用户相关的 RTCP 路由（发布侧 + 订阅侧）
+	s.rtcpRouter.UnregisterByUser(userID)
 
 	// Clean up empty room
 	if len(room.Peers) == 0 {
@@ -1932,10 +1951,18 @@ func (s *SFUServer) MuteUser(roomID, userID uint, isMuted bool) error {
 		return errors.New("room not found")
 	}
 
+	// 快照 peer 列表后立即释放 room.mu：
+	// 不能在持有 room.mu 时同步等待事件循环（sendPeerEventWait）——
+	// 事件循环处理 trackAdded 时需要获取 room.mu（autoSubscribeTrack），
+	// 两者互相等待会造成死锁/长时间卡顿。
 	room.mu.Lock()
-	defer room.mu.Unlock()
-
 	peer, ok := room.Peers[userID]
+	allPeers := make([]*Peer, 0, len(room.Peers))
+	for _, p := range room.Peers {
+		allPeers = append(allPeers, p)
+	}
+	room.mu.Unlock()
+
 	if !ok {
 		return errors.New("peer not found in room")
 	}
@@ -1952,22 +1979,13 @@ func (s *SFUServer) MuteUser(roomID, userID uint, isMuted bool) error {
 	// 提取结果中的轨道计数
 	trackCount, _ := resp.result.(int)
 
-	// 发送静音通知给用户（通过信令WebSocket通知客户端）
-	s.sendToPeer(peer, SignalingMessage{
-		Type:   "muted",
-		UserID: userID,
-		Data:   map[string]bool{"is_muted": isMuted},
-	})
-
-	// 广播静音状态给房间内所有用户
-	for _, otherPeer := range room.Peers {
-		if otherPeer.UserID != userID {
-			s.sendToPeer(otherPeer, SignalingMessage{
-				Type:   "muted",
-				UserID: userID,
-				Data:   map[string]bool{"is_muted": isMuted},
-			})
-		}
+	// 广播静音状态给房间内所有用户（包括被静音者本人）
+	for _, p := range allPeers {
+		s.sendToPeer(p, SignalingMessage{
+			Type:   "muted",
+			UserID: userID,
+			Data:   map[string]bool{"is_muted": isMuted},
+		})
 	}
 
 	s.logger.Info("User mute state changed - tracks enabled/disabled",

@@ -25,8 +25,13 @@ func NewChatService(repo repository.ChatRepository, roomRepo repository.RoomRepo
 }
 
 func (s *chatService) SendMessage(senderID uint, roomID uint, receiverID *uint, msgType models.MessageType, content string, encrypted bool) (*models.Message, error) {
-	if !s.isActiveRoomMember(roomID, senderID) {
+	member, err := s.roomRepo.GetMember(roomID, senderID)
+	if err != nil {
 		return nil, errors.New("permission denied")
+	}
+	// 禁言强制执行：被禁言成员不能发送房间消息（前端同样会禁用输入）
+	if member.IsMuted {
+		return nil, errors.New("you are muted in this room")
 	}
 	if receiverID != nil && !s.isActiveRoomMember(roomID, *receiverID) {
 		return nil, errors.New("receiver is not in room")
@@ -41,7 +46,7 @@ func (s *chatService) SendMessage(senderID uint, roomID uint, receiverID *uint, 
 		Encrypted:  encrypted,
 	}
 
-	err := s.repo.CreateMessage(message)
+	err = s.repo.CreateMessage(message)
 	return message, err
 }
 

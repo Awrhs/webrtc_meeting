@@ -125,16 +125,20 @@ func (h *Hub) Run() {
 	for {
 		select {
 		case client := <-h.register:
+			// 同一 userID 重复注册（如同一账号开两个标签页）时，踢掉旧连接：
+			// 否则 h.clients[userID] 会被覆盖，旧连接残留在房间映射里，
+			// 其后续 Unregister 还会误删新连接的注册状态。
+			if existing, ok := h.clients[client.userID]; ok && existing != client {
+				h.removeClientNoLock(existing)
+			}
 			h.clients[client.userID] = client
 			h.logger.Info("Client registered", zap.Uint("userID", client.userID))
 
 		case client := <-h.unregister:
-			if _, ok := h.clients[client.userID]; ok {
-				for _, roomID := range client.joinedRoomIDs() {
-					h.removeClientFromRoomNoLock(client, roomID)
-				}
-				delete(h.clients, client.userID)
-				close(client.send)
+			// 幂等且按对象身份匹配：只有当前注册的还是这个 client 才清理。
+			// （client 可能已被慢消费者清理路径移除，或已被新连接顶替）
+			if current, ok := h.clients[client.userID]; ok && current == client {
+				h.removeClientNoLock(client)
 				h.logger.Info("Client unregistered", zap.Uint("userID", client.userID))
 			}
 
@@ -145,9 +149,10 @@ func (h *Hub) Run() {
 						select {
 						case client.send <- msg.Message:
 						default:
-							close(client.send)
-							h.removeClientFromRoomNoLock(client, msg.RoomID)
-							delete(h.clients, client.userID)
+							// 发送队列满：完整移除该客户端（所有房间 + 全局表）。
+							// 只从当前房间移除会使其残留在其他房间映射里，
+							// 之后广播会向已关闭的 send 通道发送，导致整个 Hub panic。
+							h.removeClientNoLock(client)
 						}
 					}
 				}
@@ -158,8 +163,7 @@ func (h *Hub) Run() {
 				select {
 				case client.send <- msg.Message:
 				default:
-					close(client.send)
-					delete(h.clients, client.userID)
+					h.removeClientNoLock(client)
 				}
 			}
 
@@ -218,6 +222,19 @@ func (h *Hub) RemoveClientFromRoom(client *Client, roomID uint) {
 }
 
 // ==================== 辅助方法（仅在Run() goroutine内部调用，无需锁） ====================
+
+// removeClientNoLock 从所有房间和全局客户端表中完整移除 client，并关闭其 send 通道。
+// 关闭 send 会让 WritePump 退出并关闭底层连接，进而触发 ReadPump 的 Unregister（幂等）。
+// 【注意】仅在 Run() goroutine 内部调用，无需锁。
+func (h *Hub) removeClientNoLock(client *Client) {
+	for _, roomID := range client.joinedRoomIDs() {
+		h.removeClientFromRoomNoLock(client, roomID)
+	}
+	if current, ok := h.clients[client.userID]; ok && current == client {
+		delete(h.clients, client.userID)
+	}
+	close(client.send)
+}
 
 func (h *Hub) removeClientFromRoomNoLock(client *Client, roomID uint) {
 	if room, ok := h.rooms[roomID]; ok {

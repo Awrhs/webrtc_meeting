@@ -37,9 +37,17 @@ export class SFUConnection {
   private sfuToken: string
   private localStream: MediaStream | null = null
   private screenStream: MediaStream | null = null
+  // 摄像头轨道（可能晚于 connect 发布：默认以音频入会，并机时才 replaceVideoTrack）
+  private cameraTrack: MediaStreamTrack | null = null
+  private cameraStream: MediaStream | null = null
   private remoteStreams: Map<number, MediaStream> = new Map()
   // SSRC 到 UserID 的映射表（由 SFU 信令填充）
   private ssrcToUserId: Map<number, number> = new Map()
+  // 媒体流 ID（SDP msid）到 UserID 的映射表。
+  // 【重要】Pion 转发时会给每个订阅者重写 SSRC（随机新值），SFU 下发的发布者原始
+  // SSRC 与本地接收到的 SSRC 永远对不上；而 msid（StreamID）被 SFU 原样保留，
+  // 浏览器 event.streams[0].id 就是它，因此流归属以 msid 为准，SSRC 仅作兆底。
+  private streamIdToUserId: Map<string, number> = new Map()
   // UserID 到 用户名的映射（用于显示）
   private userIdToName: Map<number, string> = new Map()
   private onRemoteTrack: (userId: number, track: MediaStreamTrack, stream: MediaStream) => void
@@ -53,9 +61,12 @@ export class SFUConnection {
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
   private isManualDisconnect = false
   private negotiationPromise: Promise<void> = Promise.resolve()
-  private pendingRemoteTracks: { ssrc: number; track: MediaStreamTrack; stream: MediaStream }[] = []
+  private pendingRemoteTracks: { ssrc: number; streamId: string; track: MediaStreamTrack; stream: MediaStream }[] = []
   private mediaE2EEManager: MediaE2EEManager | null = null
+  // 已同步给 SFU 的视频订阅集合（每次 WS 连接重置）
   private subscribedVideos: Set<number> = new Set()
+  // 期望的视频订阅集合（跨重连保留，joined 后重新同步）
+  private desiredVideoSubscriptions: Set<number> = new Set()
 
   constructor(
     roomId: number,
@@ -144,6 +155,20 @@ export class SFUConnection {
       this.mediaE2EEManager?.attachSender(sender, track)
     })
 
+    // 重连场景：摄像头轨道可能晚于 connect() 发布（默认音频入会），
+    // 重建 PC 后需要重新发布，否则重连后远端看不到摄像头画面。
+    // 注意这里不能立即 createAndSendOffer——此时 WS 还未建立，
+    // joined 之后统一发 offer（会包含新建的 transceiver）。
+    if (this.cameraTrack && !localStream.getVideoTracks().some(t => t === this.cameraTrack)) {
+      try {
+        this.publishCameraTrack(this.cameraTrack, this.cameraStream ?? undefined)
+      } catch (err) {
+        console.warn('[WebRTC] Failed to re-publish camera track after reconnect:', err)
+        this.cameraTrack = null
+        this.cameraStream = null
+      }
+    }
+
     this.pc.onicecandidate = (event) => {
       if (event.candidate) {
         this.sendIceCandidate(event.candidate)
@@ -162,14 +187,15 @@ export class SFUConnection {
 
       console.log('[WebRTC] Received remote track:', track.kind, 'SSRC:', ssrc, 'StreamID:', stream.id)
 
-      const mappedUserId = this.ssrcToUserId.get(ssrc)
+      // 流归属优先级：msid（SFU 原样保留，可靠）> SSRC（被 Pion 重写，基本对不上）
+      const mappedUserId = this.ssrcToUserId.get(ssrc) ?? this.streamIdToUserId.get(stream.id)
       this.mediaE2EEManager?.attachReceiver(receiver, track, mappedUserId)
       if (mappedUserId !== undefined) {
         this.onRemoteTrack(mappedUserId, track, stream)
         return
       }
 
-      this.pendingRemoteTracks.push({ ssrc, track, stream })
+      this.pendingRemoteTracks.push({ ssrc, streamId: stream.id, track, stream })
       this.onRemoteTrack(0, track, stream)
     }
 
@@ -251,11 +277,15 @@ export class SFUConnection {
 
     this.reconnectTimer = setTimeout(() => {
       console.log('[WebRTC] Attempting reconnect...')
-      if (this.localStream) {
+      const stream = this.localStream
+      if (stream) {
         this.refreshSFUToken()
           .then(() => {
-            this.closeTransport()
-            return this.connect(this.localStream!)
+            // 重连时不能销毁本地媒体（摄像头/麦克风），只重建 WS + PC；
+            // closeTransport() 会把 localStream 置空，之前直接传 this.localStream!
+            // 会导致 connect(null) 崩溃，重连必然失败。
+            this.closeTransport(false)
+            return this.connect(stream)
           })
           .catch((err) => {
             console.error('[WebRTC] Reconnect failed:', err)
@@ -272,6 +302,9 @@ export class SFUConnection {
     switch (message.type) {
       case 'joined':
         console.log('[WebRTC] Joined SFU room, creating offer...')
+        // 新连接：SFU 侧订阅状态为空，重置已同步集合并重发期望的视频订阅
+        this.subscribedVideos = new Set()
+        this.syncVideoSubscriptions()
         await this.createAndSendOffer()
         break
       case 'answer':
@@ -309,12 +342,13 @@ export class SFUConnection {
         this.onError(message.error || 'SFU error')
         break
       case 'ssrc_mapping':
-        // 处理SSRC到UserID的映射
+        // 处理流/SSRC到UserID的映射
         if (message.ssrcs && message.ssrcs.length > 0) {
           console.log('[WebRTC] Received SSRC mapping:', message.ssrcs)
           this.setSsrcMappings(message.ssrcs.map(s => ({
             ssrc: s.ssrc,
             userId: s.user_id,
+            streamId: s.stream_id,
           })))
         }
         break
@@ -417,6 +451,14 @@ export class SFUConnection {
 
   setVideoSubscriptions(userIds: number[]) {
     const newSet = new Set(userIds)
+    // 期望集合跨重连保留；WS 未连接时发送会被丢弃，joined 后会统一重发
+    this.desiredVideoSubscriptions = newSet
+    this.syncVideoSubscriptions()
+  }
+
+  // 将期望订阅集与已同步集做差量同步到 SFU
+  private syncVideoSubscriptions() {
+    const newSet = this.desiredVideoSubscriptions
     for (const id of newSet) {
       if (!this.subscribedVideos.has(id)) {
         this.subscribeToUser(id, 'video')
@@ -427,7 +469,7 @@ export class SFUConnection {
         this.unsubscribeFromUser(id, 'video')
       }
     }
-    this.subscribedVideos = newSet
+    this.subscribedVideos = new Set(newSet)
   }
 
   disconnect() {
@@ -441,7 +483,9 @@ export class SFUConnection {
     this.closeTransport()
   }
 
-  private closeTransport() {
+  // closeTransport 重建传输层。stopLocalMedia=false 用于重连场景：
+  // 保留摄像头/麦克风轨道（不调用 track.stop()），重连后重新发布。
+  private closeTransport(stopLocalMedia = true) {
     if (this.ws) {
       this.ws.close(1000, 'Connection reset')
       this.ws = null
@@ -452,26 +496,47 @@ export class SFUConnection {
       this.pc = null
     }
 
-    // 停止所有本地媒体轨道，释放摄像头/麦克风
-    if (this.localStream) {
-      this.localStream.getTracks().forEach(track => track.stop())
-      this.localStream = null
-    }
-    if (this.screenStream) {
-      this.screenStream.getTracks().forEach(track => track.stop())
-      this.screenStream = null
+    if (stopLocalMedia) {
+      // 停止所有本地媒体轨道，释放摄像头/麦克风
+      if (this.localStream) {
+        this.localStream.getTracks().forEach(track => track.stop())
+        this.localStream = null
+      }
+      if (this.screenStream) {
+        this.screenStream.getTracks().forEach(track => track.stop())
+        this.screenStream = null
+      }
+      if (this.cameraTrack) {
+        this.cameraTrack.stop()
+        this.cameraTrack = null
+      }
+      if (this.cameraStream) {
+        this.cameraStream.getTracks().forEach(track => track.stop())
+        this.cameraStream = null
+      }
     }
 
     this.iceCandidates = []
     this.remoteStreams.clear()
     this.ssrcToUserId.clear()
+    this.streamIdToUserId.clear()
     this.pendingRemoteTracks = []
     this.subscribedVideos.clear()
     this.negotiationPromise = Promise.resolve()
-    this.mediaE2EEManager?.clearTransforms()
+    if (stopLocalMedia) {
+      this.mediaE2EEManager?.clearTransforms()
+    }
   }
 
+  // 静音/取消静音基于 PC 中实际发送的轨道操作，而不是记录在案的 stream 对象：
+  // 摄像头轨道可能晚于 connect() 发布（replaceVideoTrack），
+  // 旧实现读取 this.localStream 会导致摄像头轨道永远不会被正确启停。
   muteAudio(muted: boolean) {
+    this.pc?.getSenders()
+      .filter(s => s.track?.kind === 'audio')
+      .forEach(s => {
+        if (s.track) s.track.enabled = !muted
+      })
     if (this.localStream) {
       this.localStream.getAudioTracks().forEach((track) => {
         track.enabled = !muted
@@ -480,20 +545,67 @@ export class SFUConnection {
   }
 
   muteVideo(muted: boolean) {
-    if (this.localStream) {
-      this.localStream.getVideoTracks().forEach((track) => {
-        track.enabled = !muted
+    this.pc?.getSenders()
+      .filter(s => s.track?.kind === 'video')
+      .forEach(s => {
+        if (s.track) s.track.enabled = !muted
       })
+    if (this.cameraTrack) {
+      this.cameraTrack.enabled = !muted
     }
   }
 
-  // 动态添加轨道（用于切换摄像头/屏幕共享）
-  async replaceVideoTrack(newTrack: MediaStreamTrack) {
+  // 动态添加/替换摄像头视频轨道（默认入会时不携带视频，开摄像头时才发布）
+  async replaceVideoTrack(newTrack: MediaStreamTrack, stream?: MediaStream) {
     if (!this.pc) return
-    const sender = this.pc.getSenders().find((s) => s.track?.kind === 'video')
-    if (sender) {
-      await sender.replaceTrack(newTrack)
+
+    // 已存在摄像头 sender：直接替换轨道，无需重新协商
+    const existingSender = this.pc.getSenders().find((s) => s.track?.kind === 'video')
+    if (existingSender) {
+      await existingSender.replaceTrack(newTrack)
+      this.cameraTrack = newTrack
+      if (stream) this.cameraStream = stream
+      return
     }
+
+    // 不存在视频 sender（默认音频入会）：必须新建 transceiver 发布视频轨道，
+    // 否则视频根本不会被发送给 SFU（旧实现在这里直接 no-op，导致开摄像头无效）。
+    // 摄像头默认两层 simulcast，与 connect() 内首次携带视频的行为保持一致。
+    this.publishCameraTrack(newTrack, stream)
+
+    // 新增 m-line 需要重新协商
+    await this.createAndSendOffer()
+  }
+
+  // 在当前 PC 上发布摄像头轨道（新建 simulcast transceiver 或普通 addTrack）。
+  // 不触发协商，由调用方决定何时 createAndSendOffer。
+  private publishCameraTrack(newTrack: MediaStreamTrack, stream?: MediaStream) {
+    if (!this.pc) return
+
+    if (this.canUseSimulcast()) {
+      try {
+        const transceiver = this.pc.addTransceiver(newTrack, {
+          direction: 'sendrecv',
+          streams: stream ? [stream] : [],
+          sendEncodings: [
+            { rid: 'high', maxBitrate: 1_200_000 },
+            { rid: 'low', maxBitrate: 250_000, scaleResolutionDownBy: 4 },
+          ],
+        })
+        this.mediaE2EEManager?.attachSender(transceiver.sender, newTrack)
+        console.log('[WebRTC] Camera track published with simulcast (high/low)')
+      } catch (err) {
+        console.warn('[WebRTC] addTransceiver simulcast failed, fallback to addTrack:', err)
+        const sender = this.pc.addTrack(newTrack, stream ?? new MediaStream([newTrack]))
+        this.mediaE2EEManager?.attachSender(sender, newTrack)
+      }
+    } else {
+      const sender = this.pc.addTrack(newTrack, stream ?? new MediaStream([newTrack]))
+      this.mediaE2EEManager?.attachSender(sender, newTrack)
+    }
+
+    this.cameraTrack = newTrack
+    if (stream) this.cameraStream = stream
   }
 
   // 添加新的视频轨道（用于屏幕共享，不替换摄像头）
@@ -524,13 +636,16 @@ export class SFUConnection {
     console.log(`[WebRTC] SSRC mapping set: ${ssrc} -> user ${userId}`)
   }
 
-  // 批量设置 SSRC 映射
-  setSsrcMappings(mappings: { ssrc: number; userId: number }[]) {
-    mappings.forEach(({ ssrc, userId }) => {
+  // 批量设置 SSRC / 媒体流ID 映射，并尝试归属此前未识别的远端轨道
+  setSsrcMappings(mappings: { ssrc: number; userId: number; streamId?: string }[]) {
+    mappings.forEach(({ ssrc, userId, streamId }) => {
       this.ssrcToUserId.set(ssrc, userId)
+      if (streamId) {
+        this.streamIdToUserId.set(streamId, userId)
+      }
     })
-    this.pendingRemoteTracks = this.pendingRemoteTracks.filter(({ ssrc, track, stream }) => {
-      const userId = this.ssrcToUserId.get(ssrc)
+    this.pendingRemoteTracks = this.pendingRemoteTracks.filter(({ ssrc, streamId, track, stream }) => {
+      const userId = this.ssrcToUserId.get(ssrc) ?? this.streamIdToUserId.get(streamId)
       if (userId === undefined) return true
       this.mediaE2EEManager?.bindReceiverTrack(track.id, userId)
       this.onRemoteTrack(userId, track, stream)

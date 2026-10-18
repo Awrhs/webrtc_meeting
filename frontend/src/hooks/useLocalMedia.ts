@@ -36,7 +36,8 @@ export function useLocalMedia({ sfuConnectionRef, currentRoomId }: UseLocalMedia
         setLocalStream(stream)
         const videoTrack = stream.getVideoTracks()[0]
         if (sfuConnectionRef.current) {
-          await sfuConnectionRef.current.replaceVideoTrack(videoTrack)
+          // 传入 stream 以携带 msid：SFU 转发后订阅端靠 msid 把流归属到对应用户
+          await sfuConnectionRef.current.replaceVideoTrack(videoTrack, stream)
         }
       } catch (error) {
         console.error('[useLocalMedia] Camera error:', error)
