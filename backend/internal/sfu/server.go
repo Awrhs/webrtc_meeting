@@ -17,6 +17,7 @@ import (
 	"conference-sfu/backend/internal/auth"
 
 	"github.com/gorilla/websocket"
+	"github.com/pion/interceptor"
 	"github.com/pion/rtcp"
 	"github.com/pion/webrtc/v3"
 	"go.uber.org/zap"
@@ -32,9 +33,12 @@ type TrackInfo struct {
 	Track     *webrtc.TrackLocalStaticRTP
 	SSRC      uint32
 	Kind      string // "audio" or "video"
-	StreamID  string // e.g., "camera" or "screen"
+	StreamID  string // 发布者浏览器 MediaStream 的 msid（GUID）
 	IsEnabled atomic.Bool // 原子操作，转发 goroutine 中无需锁即可读写
 	RID       string      // simulcast layer rid: "" / "low" / "high"
+	Codec     webrtc.RTPCodecCapability // 录制与统计用：轨道编码
+	bytesIn   atomic.Uint64 // 从发布者收到的字节数
+	bytesOut  atomic.Uint64 // 成功转发给所有订阅者的字节数
 }
 
 type Peer struct {
@@ -167,7 +171,9 @@ type SFUServer struct {
 	callbackToken           string
 	messageRateLimit        int
 	tokenReplayCheck        TokenReplayChecker
-	rtcpRouter              *RTCPRouter // RTCP 路由表：接收端反馈 -> 发送端
+	rtcpRouter              *RTCPRouter      // RTCP 路由表：接收端反馈 -> 发送端
+	qos                     *QoSController   // 自适应 Simulcast 切层控制器
+	recorders               *recorderManager // 会议录制（SFU_RECORDING_DIR 非空时启用）
 	mu                      sync.Mutex
 }
 
@@ -221,6 +227,7 @@ type ServerOptions struct {
 	CallbackToken           string
 	MessageRateLimit        int
 	TokenReplayChecker      TokenReplayChecker
+	RecordingDir            string // SFU_RECORDING_DIR，非空启用录制
 }
 
 func NewSFUServer(logger *zap.Logger, opts ServerOptions) *SFUServer {
@@ -257,6 +264,11 @@ func NewSFUServer(logger *zap.Logger, opts ServerOptions) *SFUServer {
 		logger.Fatal("Failed to register default codecs", zap.Error(err))
 	}
 
+	// 注册 REMB 反馈：浏览器据此向 SFU 上报下行带宽估计，
+	// 供 QoSController 做 Simulcast 自动切层决策
+	// （NACK/PLI 与 transport-cc 由 RegisterDefaultInterceptors 一并注册）。
+	m.RegisterFeedback(webrtc.RTCPFeedback{Type: webrtc.TypeRTCPFBGoogREMB}, webrtc.RTPCodecTypeVideo)
+
 	// 注册 simulcast 所需的 RTP 头扩展（仅 video 方向）
 	for _, ext := range []string{
 		"urn:ietf:params:rtp-hdrext:sdes:mid",
@@ -271,9 +283,20 @@ func NewSFUServer(logger *zap.Logger, opts ServerOptions) *SFUServer {
 		}
 	}
 
+	// 拦截器链（完整 NACK/RTCP/TWCC 链路）：
+	//   - NACK responder：订阅端 NACK 丢包时 SFU 从缓存重传（下行丢包补偿）
+	//   - NACK generator：SFU 收包丢包时向发布端发 NACK（上行丢包补偿）
+	//   - RTCP report sender：SFU 周期性向浏览器发送 SR/RR
+	//   - TWCC sender：向发布端发送 transport-cc 反馈，供浏览器做上行带宽自适应
+	registry := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(m, registry); err != nil {
+		logger.Fatal("Failed to register default interceptors", zap.Error(err))
+	}
+
 	api := webrtc.NewAPI(
 		webrtc.WithMediaEngine(m),
 		webrtc.WithSettingEngine(settingEngine),
+		webrtc.WithInterceptorRegistry(registry),
 	)
 
 	if opts.MessageRateLimit <= 0 {
@@ -292,6 +315,8 @@ func NewSFUServer(logger *zap.Logger, opts ServerOptions) *SFUServer {
 		messageRateLimit:        opts.MessageRateLimit,
 		tokenReplayCheck:        opts.TokenReplayChecker,
 		rtcpRouter:              NewRTCPRouter(),
+		qos:                     NewQoSController(),
+		recorders:               newRecorderManager(opts.RecordingDir),
 	}
 }
 
@@ -336,6 +361,7 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 		Kind:     trackKind,
 		StreamID: streamID,
 		RID:      rid,
+		Codec:    track.Codec().RTPCodecCapability,
 	}
 
 	// 通过事件循环串行添加轨道，消除 peer.mu 竞争
@@ -372,6 +398,11 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 	// localTrack 会被挂载到其他用户的 PeerConnection 上，Pion 会自动将其 RTP 包发送出去
 	// 使用 ReadRTP/WriteRTP 避免二次解析 RTP 包；
 	// 通过 atomic.Bool 检查 IsEnabled，无需在每个包上都加锁（消除热点锁）
+	// 开启录制时同步把 RTP 包落盘（VP8→IVF / Opus→OGG / 其他→原始 RTP dump）
+	var recorder *trackRecorder
+	if s.recorders.enabled() {
+		recorder = s.recorders.trackRecorderFor(room.ID, trackKey, track.Codec().RTPCodecCapability, trackKind, streamID)
+	}
 	go func() {
 		for {
 			// 读取已解析的 RTP 包，避免后续 Write 时二次解析
@@ -383,11 +414,17 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 				return
 			}
 
+			trackInfo.bytesIn.Add(uint64(len(pkt.Raw)))
+			if recorder != nil {
+				recorder.writeRTP(pkt)
+			}
+
 			// 只有启用的轨道才转发（被 MuteUser 禁用的轨道会跳过）
 			if trackInfo.IsEnabled.Load() {
 				if err := localTrack.WriteRTP(pkt); err != nil {
 					return
 				}
+				trackInfo.bytesOut.Add(uint64(len(pkt.Raw)))
 			}
 		}
 	}()
@@ -578,7 +615,11 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 		for _, ti := range data.tracks {
 			trackKey := ti.Key()
 			subKey := fmt.Sprintf("%d|%s", data.targetUserID, trackKey)
-			if peer.addedTracks[subKey] {
+			// addedTracks 可能被 RTCP 线程的 hasSubscriptionFor 读取，读写均需 peer.mu
+			peer.mu.Lock()
+			alreadyAdded := peer.addedTracks[subKey]
+			peer.mu.Unlock()
+			if alreadyAdded {
 				continue
 			}
 
@@ -592,7 +633,9 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 				continue
 			}
 
+			peer.mu.Lock()
 			peer.addedTracks[subKey] = true
+			peer.mu.Unlock()
 			peer.Subscriptions[data.targetUserID] = append(peer.Subscriptions[data.targetUserID], sender)
 			s.startRTCPReadLoop(peer, sender, data.targetUserID, trackKey)
 			added = true
@@ -625,6 +668,7 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 		remaining := make([]*webrtc.RTPSender, 0, len(senders))
 		for _, sender := range senders {
 			shouldRemove := false
+			peer.mu.Lock()
 			for key := range peer.addedTracks {
 				prefix := fmt.Sprintf("%d|%s-", data.targetUserID, data.kind)
 				if strings.HasPrefix(key, prefix) {
@@ -635,6 +679,7 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 					}
 				}
 			}
+			peer.mu.Unlock()
 			if shouldRemove {
 				if err := peer.PC.RemoveTrack(sender); err != nil {
 					s.logger.Warn("Failed to remove track in unsubscription",
@@ -813,6 +858,20 @@ func (t *TrackInfo) Key() string {
 }
 
 // ===== 订阅操作便捷封装 =====
+
+// hasSubscriptionFor 检查订阅者是否已订阅发布者的某类流（粗粒度前缀匹配）。
+// addedTracks 由事件循环在 peer.mu 保护下写入，此处读取同样持锁。
+func (p *Peer) hasSubscriptionFor(fromUserID uint, kind, streamID string) bool {
+	prefix := fmt.Sprintf("%d|%s-", fromUserID, kind)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for key := range p.addedTracks {
+		if strings.HasPrefix(key, prefix) && strings.Contains(key, streamID) {
+			return true
+		}
+	}
+	return false
+}
 // 这些函数封装了 event loop 的通信细节，外部调用只需关注业务逻辑
 
 // SubscribeTracks 订阅指定用户的轨道（异步）
@@ -958,6 +1017,51 @@ type RTCPTarget struct {
 	TrackSSRC  uint32 // 发布者的原始 SSRC（浏览器发送的）
 	TrackKey   string // 轨道唯一标识
 	FromUserID uint   // 发布者用户ID
+
+	// 订阅端上报的最近一次统计（GetRoomStats / QoS 用）
+	lastFractionLost atomic.Uint32 // 丢包率（8bit 定点 0~255）
+	lastJitter       atomic.Uint32 // 抖动（时钟单位）
+	lastTotalLost    atomic.Uint32 // 累计丢包数
+}
+
+// Lookup 按 SSRC 查找路由目标（返回内部指针，仅读字段）
+func (r *RTCPRouter) Lookup(ssrc uint32) (*RTCPTarget, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	t, ok := r.ssrcMap[ssrc]
+	return t, ok
+}
+
+// lookupFor 查找某订阅者对某发布者的任一路由条目（REMB 无媒体 SSRC 时用）
+func (r *RTCPRouter) lookupFor(subscriber *Peer, publisherID uint) (*RTCPTarget, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, t := range r.ssrcMap {
+		if t.Subscriber == subscriber && t.FromUserID == publisherID {
+			return t, true
+		}
+	}
+	return nil, false
+}
+
+// StatsByPublisher 汇总某发布者全部出站轨道的最新接收统计。
+func (r *RTCPRouter) StatsByPublisher(userID uint) (fractionLost, jitter, totalLost uint32, ok bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, t := range r.ssrcMap {
+		if t.FromUserID != userID {
+			continue
+		}
+		ok = true
+		if fl := t.lastFractionLost.Load(); fl > fractionLost {
+			fractionLost = fl
+		}
+		if j := t.lastJitter.Load(); j > jitter {
+			jitter = j
+		}
+		totalLost += t.lastTotalLost.Load()
+	}
+	return
 }
 
 // RTCPRouter RTCP 路由表，将接收端的反馈转发给对应的发送端
@@ -1109,25 +1213,43 @@ func (s *SFUServer) startRTCPReadLoop(peer *Peer, sender *webrtc.RTPSender, from
 					s.rtcpRouter.Route(pkt)
 
 				case *rtcp.ReceiverEstimatedMaximumBitrate:
-					// REMB：接收端估计的可用带宽（码率控制）
+					// REMB：接收端估计的可用下行带宽。
+					// REMB 描述的是订阅者的下行估计，直接转发给发布者会误导其码率控制，
+					// 正确用法是作为 SFU 自己的发送带宽估计，驱动 Simulcast 自动切层。
 					s.logger.Debug("RTCP REMB received",
 						zap.Uint("fromUser", peer.UserID),
 						zap.Uint("toUser", fromUserID),
 						zap.Float64("bitrateMbps", float64(p.Bitrate)/1000000),
 						zap.String("trackKey", trackKey))
-					// 注意：REMB 没有 MediaSSRC，需要特殊处理
-					// 简化：暂时不路由，留给带宽估计算法
+					// 仅对摄像头（simulcast，trackKey 带 rid 后缀）轨道做自适应切层
+					if strings.Contains(trackKey, "/") {
+						if _, changed := s.qos.UpdateREMB(peer.UserID, fromUserID, p.Bitrate, time.Now()); changed {
+							s.applyQualitySwitch(peer, fromUserID)
+						}
+					}
 
 				case *rtcp.ReceiverReport:
 					// RR：接收端统计报告（丢包率、延迟抖动）
 					for _, report := range p.Reports {
-						if report.TotalLost > 0 {
+						// 更新路由表上的最新统计（GetRoomStats / QoS 用）
+						if target, ok := s.rtcpRouter.Lookup(report.SSRC); ok {
+							target.lastFractionLost.Store(uint32(report.FractionLost))
+							target.lastJitter.Store(report.Jitter)
+							target.lastTotalLost.Store(report.TotalLost)
+						}
+						if report.FractionLost > 0 || report.TotalLost > 0 {
 							s.logger.Debug("RTCP Receiver Report",
 								zap.Uint("fromUser", peer.UserID),
 								zap.Uint("toUser", fromUserID),
-								zap.Uint32("lostPackets", report.TotalLost),
+								zap.Uint8("fractionLost", report.FractionLost),
 								zap.Uint32("jitter", report.Jitter),
 								zap.String("trackKey", trackKey))
+						}
+						// 摄像头 simulcast 轨道：根据丢包率自适应切层
+						if strings.Contains(trackKey, "/") {
+							if _, changed := s.qos.UpdateLoss(peer.UserID, fromUserID, report.FractionLost, time.Now()); changed {
+								s.applyQualitySwitch(peer, fromUserID)
+							}
 						}
 					}
 					s.rtcpRouter.Route(pkt)
@@ -1187,11 +1309,15 @@ func (s *SFUServer) cleanupPeerSubscriptionsNoLock(peer *Peer, targetUserID uint
 	}
 	delete(peer.Subscriptions, targetUserID)
 	prefix := fmt.Sprintf("%d|", targetUserID)
+	peer.mu.Lock()
 	for key := range peer.addedTracks {
 		if strings.HasPrefix(key, prefix) {
 			delete(peer.addedTracks, key)
 		}
 	}
+	peer.mu.Unlock()
+	// 清理该订阅关系的 QoS 状态
+	s.qos.Remove(peer.UserID, targetUserID)
 
 	if removed {
 		s.triggerRenegotiation(peer)
@@ -1241,6 +1367,7 @@ func (s *SFUServer) autoSubscribeTrack(room *Room, publisher *Peer, trackInfo *T
 }
 
 // handleSubscribe 处理前端发来的选择性订阅请求。
+// Quality："high"/"low" 固定该层；"auto"（或空）交给 QoS 自适应。
 func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessage) {
 	if msg.TargetUserID == 0 || msg.Kind == "" {
 		s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "subscribe requires target_user_id and kind"})
@@ -1257,57 +1384,13 @@ func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessag
 		return
 	}
 
-	// 只在读取 publisher.Tracks 时加锁，选层完成立即释放
-	// 订阅者自身的状态操作在 peerEventLoop 中串行进行，无需锁
-	publisher.mu.Lock()
-	// 按 (kind, streamID) 分组候选 track，每组内按 RID 选层。
-	// 默认选 high；指定 Quality 时优先匹配；都找不到则回退单层 (RID=="")。
-	groups := make(map[string][]*TrackInfo) // key: kind-streamID
-	for _, trackInfo := range publisher.Tracks {
-		if trackInfo.Kind != msg.Kind {
-			continue
-		}
-		if msg.StreamID != "" && trackInfo.StreamID != msg.StreamID {
-			continue
-		}
-		groupKey := trackInfo.Kind + "-" + trackInfo.StreamID
-		groups[groupKey] = append(groups[groupKey], trackInfo)
+	// 显式选层时更新 QoS 固定状态（"auto" 解除固定，交回自动切层）
+	if msg.Quality != "" {
+		s.qos.Pin(peer.UserID, msg.TargetUserID, msg.Quality)
 	}
-	publisher.mu.Unlock()
+	desiredQuality := s.qos.Current(peer.UserID, msg.TargetUserID)
 
-	desiredQuality := msg.Quality
-	if desiredQuality == "" {
-		desiredQuality = "high"
-	}
-
-	var selectedTracks []*TrackInfo
-	for _, candidates := range groups {
-		var chosen *TrackInfo
-		// 优先匹配指定 quality
-		for _, c := range candidates {
-			if c.RID == desiredQuality {
-				chosen = c
-				break
-			}
-		}
-		// 回退到单层
-		if chosen == nil {
-			for _, c := range candidates {
-				if c.RID == "" {
-					chosen = c
-					break
-				}
-			}
-		}
-		// 仍找不到（仅 simulcast 但 quality 不匹配）→ 取第一个
-		if chosen == nil && len(candidates) > 0 {
-			chosen = candidates[0]
-		}
-		if chosen != nil {
-			selectedTracks = append(selectedTracks, chosen)
-		}
-	}
-
+	selectedTracks := s.selectTracksForQuality(publisher, msg.Kind, msg.StreamID, desiredQuality)
 	if len(selectedTracks) == 0 {
 		return
 	}
@@ -1340,6 +1423,126 @@ func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessag
 	}
 }
 
+// selectTracksForQuality 在发布者的轨道中按 (kind, streamID) 分组，
+// 每组内按期望质量层（simulcast rid）选择轨道。
+func (s *SFUServer) selectTracksForQuality(publisher *Peer, kind, streamID, quality string) []*TrackInfo {
+	// 只在读取 publisher.Tracks 时加锁，选层完成立即释放
+	publisher.mu.Lock()
+	// 按 (kind, streamID) 分组候选 track，每组内按 RID 选层。
+	// 期望层找不到则回退单层 (RID=="")，仍找不到取第一个。
+	groups := make(map[string][]*TrackInfo) // key: kind-streamID
+	for _, trackInfo := range publisher.Tracks {
+		if trackInfo.Kind != kind {
+			continue
+		}
+		if streamID != "" && trackInfo.StreamID != streamID {
+			continue
+		}
+		groupKey := trackInfo.Kind + "-" + trackInfo.StreamID
+		groups[groupKey] = append(groups[groupKey], trackInfo)
+	}
+	publisher.mu.Unlock()
+
+	var selectedTracks []*TrackInfo
+	for _, candidates := range groups {
+		var chosen *TrackInfo
+		// 优先匹配指定 quality
+		for _, c := range candidates {
+			if c.RID == quality {
+				chosen = c
+				break
+			}
+		}
+		// 回退到单层
+		if chosen == nil {
+			for _, c := range candidates {
+				if c.RID == "" {
+					chosen = c
+					break
+				}
+			}
+		}
+		// 仍找不到（仅 simulcast 但 quality 不匹配）→ 取第一个
+		if chosen == nil && len(candidates) > 0 {
+			chosen = candidates[0]
+		}
+		if chosen != nil {
+			selectedTracks = append(selectedTracks, chosen)
+		}
+	}
+	return selectedTracks
+}
+
+// applyQualitySwitch 执行一次自适应/手动切层：
+// 把订阅者对发布者摄像头视频的订阅切换到 QoSController 当前期望的层。
+// 由 RTCP 读循环触发（RR/REMB 到达时），全部动作经由事件循环串行执行。
+func (s *SFUServer) applyQualitySwitch(subscriber *Peer, publisherID uint) {
+	quality := s.qos.Current(subscriber.UserID, publisherID)
+
+	s.mu.Lock()
+	room := s.rooms[subscriber.RoomID]
+	s.mu.Unlock()
+	if room == nil {
+		return
+	}
+
+	publisher := s.getPeerByID(room.ID, publisherID)
+	if publisher == nil {
+		return
+	}
+
+	// 找到摄像头流（带 RID 的视频轨道）的 streamID
+	publisher.mu.Lock()
+	var cameraStreamID string
+	for _, ti := range publisher.Tracks {
+		if ti.Kind == "video" && ti.RID != "" {
+			cameraStreamID = ti.StreamID
+			break
+		}
+	}
+	publisher.mu.Unlock()
+	if cameraStreamID == "" {
+		return // 发布者没有 simulcast 摄像头流，无需切层
+	}
+
+	// 只对已订阅该摄像头流的订阅者切层（避免为未订阅用户建立订阅）
+	if !subscriber.hasSubscriptionFor(publisherID, "video", cameraStreamID) {
+		return
+	}
+
+	// 退订当前层，再按新层订阅
+	if err := s.UnsubscribeTracks(subscriber, publisherID, "video", cameraStreamID); err != nil {
+		s.logger.Warn("QoS switch: unsubscribe failed", zap.Error(err))
+		return
+	}
+	selected := s.selectTracksForQuality(publisher, "video", cameraStreamID, quality)
+	if len(selected) == 0 {
+		return
+	}
+	addedTracks, err := s.SubscribeTracksWait(subscriber, publisherID, "video", cameraStreamID, selected)
+	if err != nil {
+		s.logger.Warn("QoS switch: subscribe failed", zap.Error(err))
+		return
+	}
+	if len(addedTracks) > 0 {
+		ssrcs := make([]SSRC, 0, len(addedTracks))
+		for _, ti := range addedTracks {
+			ssrcs = append(ssrcs, SSRC{
+				SSRC:     ti.SSRC,
+				UserID:   publisherID,
+				Kind:     ti.Kind,
+				StreamID: ti.StreamID,
+				RID:      ti.RID,
+			})
+		}
+		s.sendToPeer(subscriber, SignalingMessage{Type: "ssrc_mapping", SSRCs: ssrcs})
+	}
+	s.logger.Info("QoS: switched simulcast layer",
+		zap.Uint("subscriber", subscriber.UserID),
+		zap.Uint("publisher", publisherID),
+		zap.String("quality", quality))
+}
+
 func (s *SFUServer) handleUnsubscribe(room *Room, peer *Peer, msg *SignalingMessage) {
 	if msg.TargetUserID == 0 || msg.Kind == "" {
 		s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "unsubscribe requires target_user_id and kind"})
@@ -1361,23 +1564,34 @@ func (s *SFUServer) closePeer(peer *Peer) {
 	peer.PC.Close()
 }
 
+// deleteRoomIfEmpty 房间没人时删除房间并落盘录制文件。
+// 调用方必须已持有 room.mu。
+func (s *SFUServer) deleteRoomIfEmpty(room *Room) {
+	if len(room.Peers) != 0 {
+		return
+	}
+	s.mu.Lock()
+	delete(s.rooms, room.ID)
+	s.mu.Unlock()
+	s.recorders.stopRoom(room.ID)
+}
+
 func (s *SFUServer) onConnectionStateChange(room *Room, peer *Peer, state webrtc.PeerConnectionState) {
 	if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
 		room.mu.Lock()
 		defer room.mu.Unlock()
-		if _, ok := room.Peers[peer.UserID]; !ok {
+		// 按对象身份匹配：同账号多端入会时新 peer 已覆盖同 userID 的表项，
+		// 旧 peer 的连接状态回调不能误删新 peer。
+		if current, ok := room.Peers[peer.UserID]; !ok || current != peer {
 			return
 		}
 		s.cleanupPeerSubscriptions(room, peer.UserID)
 		s.rtcpRouter.UnregisterByUser(peer.UserID)
+		s.qos.RemoveAllForUser(peer.UserID)
 		delete(room.Peers, peer.UserID)
 		s.closePeer(peer)
 
-		if len(room.Peers) == 0 {
-			s.mu.Lock()
-			delete(s.rooms, room.ID)
-			s.mu.Unlock()
-		}
+		s.deleteRoomIfEmpty(room)
 
 		if state == webrtc.PeerConnectionStateFailed {
 			s.logger.Warn("Peer connection failed (ICE negotiation failed)",
@@ -1492,7 +1706,7 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	defer func() {
 		if peer != nil {
-			s.removePeer(peer.RoomID, peer.UserID)
+			s.removePeer(peer)
 		}
 		conn.Close()
 	}()
@@ -1614,6 +1828,23 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 
 	room.mu.Lock()
 	defer room.mu.Unlock()
+
+	// 同账号多端入会同房间：踢掉旧连接（与信令 Hub 行为对齐）。
+	// 旧连接以 CloseCode 4001 关闭，前端据此停止自动重连，避免两头互相顶替。
+	if existing, ok := room.Peers[msg.UserID]; ok {
+		s.logger.Warn("Duplicate join: evicting existing session",
+			zap.Uint("roomID", msg.RoomID),
+			zap.Uint("userID", msg.UserID))
+		s.sendToPeer(existing, SignalingMessage{Type: "error", Error: "session_replaced"})
+		_ = existing.Conn.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(4001, "replaced by another session"),
+			time.Now().Add(time.Second))
+		s.cleanupPeerSubscriptions(room, msg.UserID)
+		s.rtcpRouter.UnregisterByUser(msg.UserID)
+		s.qos.RemoveAllForUser(msg.UserID)
+		s.closePeer(existing)
+		delete(room.Peers, msg.UserID)
+	}
 
 	// 创建PeerConnection
 	pc, err := s.api.NewPeerConnection(s.configuration)
@@ -1799,9 +2030,9 @@ func (s *SFUServer) handleIceCandidate(peer *Peer, msg *SignalingMessage) error 
 	return resp.err
 }
 
-func (s *SFUServer) removePeer(roomID, userID uint) {
+func (s *SFUServer) removePeer(peer *Peer) {
 	s.mu.Lock()
-	room, ok := s.rooms[roomID]
+	room, ok := s.rooms[peer.RoomID]
 	s.mu.Unlock()
 
 	if !ok {
@@ -1811,24 +2042,23 @@ func (s *SFUServer) removePeer(roomID, userID uint) {
 	room.mu.Lock()
 	defer room.mu.Unlock()
 
-	peer, ok := room.Peers[userID]
-	if !ok {
+	// 按对象身份匹配：同账号多端场景下，被顶替的旧 peer 断开时
+	// 不能误删新 peer 的表项。
+	current, ok := room.Peers[peer.UserID]
+	if !ok || current != peer {
 		return
 	}
 
-	s.cleanupPeerSubscriptions(room, userID)
+	s.cleanupPeerSubscriptions(room, peer.UserID)
 	s.closePeer(peer)
-	delete(room.Peers, userID)
-	// 清理该用户相关的 RTCP 路由（发布侧 + 订阅侧）
-	s.rtcpRouter.UnregisterByUser(userID)
+	delete(room.Peers, peer.UserID)
+	// 清理该用户相关的 RTCP 路由（发布侧 + 订阅侧）与 QoS 状态
+	s.rtcpRouter.UnregisterByUser(peer.UserID)
+	s.qos.RemoveAllForUser(peer.UserID)
 
-	if len(room.Peers) == 0 {
-		s.mu.Lock()
-		delete(s.rooms, roomID)
-		s.mu.Unlock()
-	}
+	s.deleteRoomIfEmpty(room)
 
-	s.logger.Info("Peer removed", zap.Uint("room", roomID), zap.Uint("user", userID))
+	s.logger.Info("Peer removed", zap.Uint("room", peer.RoomID), zap.Uint("user", peer.UserID))
 }
 
 func sendError(conn *websocket.Conn, errorType, message string) {
@@ -1923,15 +2153,12 @@ func (s *SFUServer) KickUser(roomID, userID uint, reason string) error {
 	s.cleanupPeerSubscriptions(room, userID)
 	s.closePeer(peer)
 	delete(room.Peers, userID)
-	// 清理该用户相关的 RTCP 路由（发布侧 + 订阅侧）
+	// 清理该用户相关的 RTCP 路由（发布侧 + 订阅侧）与 QoS 状态
 	s.rtcpRouter.UnregisterByUser(userID)
+	s.qos.RemoveAllForUser(userID)
 
 	// Clean up empty room
-	if len(room.Peers) == 0 {
-		s.mu.Lock()
-		delete(s.rooms, roomID)
-		s.mu.Unlock()
-	}
+	s.deleteRoomIfEmpty(room)
 
 	s.logger.Info("User kicked from room",
 		zap.Uint("roomID", roomID),
@@ -2002,8 +2229,73 @@ func (s *SFUServer) ClosePeerConnection(roomID, userID uint) error {
 	return s.KickUser(roomID, userID, "administrative close")
 }
 
-// GetRoomStats returns statistics for a specific room
-func (s *SFUServer) GetRoomStats(roomID uint) (uint, []uint, error) {
+// SetVideoEnabled 启用/禁用用户视频轨道的转发（gRPC 控制面调用）。
+// 与 MuteUser 对音频的处理对称：不销毁轨道，仅停止转发 RTP。
+func (s *SFUServer) SetVideoEnabled(roomID, userID uint, enabled bool) error {
+	s.mu.Lock()
+	room, ok := s.rooms[roomID]
+	s.mu.Unlock()
+
+	if !ok {
+		return errors.New("room not found")
+	}
+
+	room.mu.Lock()
+	peer, ok := room.Peers[userID]
+	allPeers := make([]*Peer, 0, len(room.Peers))
+	for _, p := range room.Peers {
+		allPeers = append(allPeers, p)
+	}
+	room.mu.Unlock()
+
+	if !ok {
+		return errors.New("peer not found in room")
+	}
+
+	// 快照后释放 room.mu 再等待事件循环（避免持锁等待造成死锁）
+	resp := s.sendPeerEventWait(peer, peerEvent{
+		typ: peerEvtMuteTrack,
+		data: muteTrackEvent{
+			kind:    "video",
+			enabled: enabled,
+		},
+	})
+	trackCount, _ := resp.result.(int)
+
+	for _, p := range allPeers {
+		s.sendToPeer(p, SignalingMessage{
+			Type:   "video_state",
+			UserID: userID,
+			Data:   map[string]bool{"video_enabled": enabled},
+		})
+	}
+
+	s.logger.Info("User video state changed - tracks enabled/disabled",
+		zap.Uint("roomID", roomID),
+		zap.Uint("userID", userID),
+		zap.Bool("enabled", enabled),
+		zap.Int("videoTracksCount", trackCount))
+
+	return nil
+}
+
+// PeerStat 单个成员的实时统计（GetRoomStats 用）
+type PeerStat struct {
+	UserID          uint
+	AudioEnabled    bool
+	VideoEnabled    bool
+	BytesReceived   uint64
+	BytesSent       uint64
+	Jitter          uint32
+	PacketsLost     uint32
+	FractionLost    uint32
+	ConnectionState string
+}
+
+// GetRoomStats returns statistics for a specific room（真实统计：
+// 转发字节来自 TrackInfo 计数器，丢包/抖动来自订阅端 RTCP RR，
+// 连接状态来自 PeerConnection）
+func (s *SFUServer) GetRoomStats(roomID uint) (uint, []PeerStat, error) {
 	s.mu.Lock()
 	room, ok := s.rooms[roomID]
 	s.mu.Unlock()
@@ -2013,14 +2305,43 @@ func (s *SFUServer) GetRoomStats(roomID uint) (uint, []uint, error) {
 	}
 
 	room.mu.Lock()
-	defer room.mu.Unlock()
-
 	peerIDs := make([]uint, 0, len(room.Peers))
 	for id := range room.Peers {
 		peerIDs = append(peerIDs, id)
 	}
+	stats := make([]PeerStat, 0, len(room.Peers))
+	for id, peer := range room.Peers {
+		st := PeerStat{
+			UserID:          id,
+			ConnectionState: peer.PC.ConnectionState().String(),
+		}
+		peer.mu.Lock()
+		for _, ti := range peer.Tracks {
+			st.BytesReceived += ti.bytesIn.Load()
+			st.BytesSent += ti.bytesOut.Load()
+			if ti.Kind == "audio" && ti.IsEnabled.Load() {
+				st.AudioEnabled = true
+			}
+			if ti.Kind == "video" && ti.IsEnabled.Load() {
+				st.VideoEnabled = true
+			}
+		}
+		peer.mu.Unlock()
+		stats = append(stats, st)
+	}
+	room.mu.Unlock()
 
-	return uint(len(room.Peers)), peerIDs, nil
+	// 合并订阅端上报的接收质量（关于该成员出站轨道的 RR 统计）
+	for i := range stats {
+		fractionLost, jitter, totalLost, ok := s.rtcpRouter.StatsByPublisher(stats[i].UserID)
+		if ok {
+			stats[i].FractionLost = fractionLost
+			stats[i].Jitter = jitter
+			stats[i].PacketsLost = totalLost
+		}
+	}
+
+	return uint(len(stats)), stats, nil
 }
 
 // ListRooms returns all active rooms on this SFU node

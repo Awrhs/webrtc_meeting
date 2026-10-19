@@ -60,27 +60,39 @@ func (s *ControlServer) MuteUser(ctx context.Context, req *sfupb.MuteUserRequest
 }
 
 func (s *ControlServer) SetVideoEnabled(ctx context.Context, req *sfupb.SetVideoEnabledRequest) (*sfupb.SetVideoEnabledResponse, error) {
-	// Simplified implementation - video control similar to audio
-	// Full implementation would need to handle track management
+	// 启用/禁用用户视频轨道转发（与音频静音对称）
+	err := s.sfuServer.SetVideoEnabled(uint(req.RoomId), uint(req.UserId), req.Enabled)
+	if err != nil {
+		s.logger.Error("Failed to set video enabled", zap.Error(err))
+		return &sfupb.SetVideoEnabledResponse{
+			Success: false,
+			Message: err.Error(),
+		}, status.Error(codes.Internal, err.Error())
+	}
+
 	return &sfupb.SetVideoEnabledResponse{
 		Success: true,
-		Message: "Video state updated (placeholder)",
+		Message: "Video state updated",
 	}, nil
 }
 
 func (s *ControlServer) GetRoomStats(ctx context.Context, req *sfupb.GetRoomStatsRequest) (*sfupb.GetRoomStatsResponse, error) {
-	count, peerIDs, err := s.sfuServer.GetRoomStats(uint(req.RoomId))
+	count, peerStats, err := s.sfuServer.GetRoomStats(uint(req.RoomId))
 	if err != nil {
 		return nil, status.Error(codes.NotFound, err.Error())
 	}
 
-	peers := make([]*sfupb.PeerStats, 0, len(peerIDs))
-	for _, id := range peerIDs {
+	peers := make([]*sfupb.PeerStats, 0, len(peerStats))
+	for _, st := range peerStats {
 		peers = append(peers, &sfupb.PeerStats{
-			UserId:          uint32(id),
-			AudioEnabled:    true,
-			VideoEnabled:    true,
-			ConnectionState: "connected",
+			UserId:          uint32(st.UserID),
+			AudioEnabled:    st.AudioEnabled,
+			VideoEnabled:    st.VideoEnabled,
+			BytesReceived:   int64(st.BytesReceived),
+			BytesSent:       int64(st.BytesSent),
+			Jitter:          uint32(st.Jitter),
+			PacketsLost:     uint32(st.PacketsLost),
+			ConnectionState: st.ConnectionState,
 		})
 	}
 
