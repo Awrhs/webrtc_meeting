@@ -76,7 +76,7 @@ services:
       COTURN_URL: ${COTURN_URL:-turn:coturn:3478}
       COTURN_USER: ${COTURN_USER:-username}
       COTURN_PASSWORD: ${COTURN_PASSWORD:-password}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080,http://localhost,http://127.0.0.1}
       SFU_ALLOW_UNAUTHENTICATED_DEV: ${SFU_ALLOW_UNAUTHENTICATED_DEV:-false}
       HTTP_READ_TIMEOUT_SECONDS: ${HTTP_READ_TIMEOUT_SECONDS:-10}
       HTTP_WRITE_TIMEOUT_SECONDS: ${HTTP_WRITE_TIMEOUT_SECONDS:-10}
@@ -117,7 +117,7 @@ services:
       COTURN_URL: ${COTURN_URL:-turn:coturn:3478}
       COTURN_USER: ${COTURN_USER:-username}
       COTURN_PASSWORD: ${COTURN_PASSWORD:-password}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080,http://localhost,http://127.0.0.1}
       SFU_ALLOW_UNAUTHENTICATED_DEV: ${SFU_ALLOW_UNAUTHENTICATED_DEV:-false}
       RATE_LIMIT_SFU_WS_PER_MINUTE: ${RATE_LIMIT_SFU_WS_PER_MINUTE:-20}
       RATE_LIMIT_SFU_MSG_PER_MINUTE: ${RATE_LIMIT_SFU_MSG_PER_MINUTE:-120}
