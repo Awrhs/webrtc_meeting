@@ -21,6 +21,8 @@ type Config struct {
 	SFUPort                    string
 	SFUGRPCPort                string
 	SFUAddr                    string
+	SFUPublicWSURL             string
+	SFURecordingDir            string
 	DatabaseDSN                string
 	RedisAddr                  string
 	RedisPassword              string
@@ -43,6 +45,9 @@ type Config struct {
 	RateLimitWSPerMinute       int
 	RateLimitSFUWSPerMinute    int
 	RateLimitSFUMsgPerMinute   int
+	UploadDir                  string
+	UploadMaxBytes             int
+	PresenceGraceSeconds       int
 }
 
 func loadEnvFromFile(filename string) error {
@@ -104,6 +109,8 @@ func Load() *Config {
 		SFUPort:                    sfuPort,
 		SFUGRPCPort:                getEnv("SFU_GRPC_PORT", "50051"),
 		SFUAddr:                    getEnv("SFU_ADDR", "localhost:50051"),
+		SFUPublicWSURL:             getEnv("SFU_PUBLIC_WS_URL", "ws://localhost:"+sfuPort),
+		SFURecordingDir:            getEnv("SFU_RECORDING_DIR", ""),
 		DatabaseDSN:                dsn,
 		RedisAddr:                  getEnv("REDIS_ADDR", "localhost:6379"),
 		RedisPassword:              getEnv("REDIS_PASSWORD", ""),
@@ -126,6 +133,9 @@ func Load() *Config {
 		RateLimitWSPerMinute:       getEnvAsInt("RATE_LIMIT_WS_PER_MINUTE", 20),
 		RateLimitSFUWSPerMinute:    getEnvAsInt("RATE_LIMIT_SFU_WS_PER_MINUTE", 20),
 		RateLimitSFUMsgPerMinute:   getEnvAsInt("RATE_LIMIT_SFU_MSG_PER_MINUTE", 120),
+		UploadDir:                  getEnv("UPLOAD_DIR", "./uploads"),
+		UploadMaxBytes:             getEnvAsInt("UPLOAD_MAX_BYTES", 20<<20),
+		PresenceGraceSeconds:       getEnvAsInt("PRESENCE_GRACE_SECONDS", 90),
 	}
 	if err := cfg.Validate(); err != nil {
 		panic(err)

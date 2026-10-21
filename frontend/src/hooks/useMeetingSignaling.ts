@@ -127,6 +127,10 @@ export function useMeetingSignaling(callbacks: UseMeetingSignalingCallbacks) {
       }
     })
 
+    signaling.on('server_shutdown', () => {
+      message.warning('服务器即将停机维护，连接将在稍后断开，请稍后重新进入会议', 8)
+    })
+
     void signaling.joinRoom(roomId, userId, members)
   }, [callbacks, getMemberByUserId])
 

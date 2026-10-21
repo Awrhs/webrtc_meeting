@@ -191,6 +191,137 @@ func (r *RedisClient) Close() error {
 	return r.client.Close()
 }
 
+// ==================== SFU 集群实例注册表 ====================
+
+// SFUInstance 描述一个在线的 SFU 实例（集群模式）。
+type SFUInstance struct {
+	ID        string `json:"id"`         // 实例标识（唯一，建议 hostname:grpcPort）
+	GRPCAddr  string `json:"grpc_addr"`  // gRPC 控制面地址（API 服务器可达）
+	WSURL     string `json:"ws_url"`     // 对浏览器公开的 WebSocket 地址
+	StartedAt int64  `json:"started_at"` // 实例启动时间
+}
+
+const (
+	sfuInstanceKeyPrefix = "sfu:instance:"
+	sfuRoomInstanceKey   = "sfu:room_instance:"
+	sfuInstanceRoomsKey  = "sfu:instance_rooms"
+)
+
+// RegisterSFUInstance 注册/心跳一个 SFU 实例（TTL 内未续期视为下线）。
+func (r *RedisClient) RegisterSFUInstance(inst SFUInstance, ttl time.Duration) error {
+	ctx := context.Background()
+	data, err := json.Marshal(inst)
+	if err != nil {
+		return err
+	}
+	pipe := r.client.TxPipeline()
+	pipe.Set(ctx, sfuInstanceKeyPrefix+inst.ID, data, ttl)
+	pipe.ZIncrBy(ctx, sfuInstanceRoomsKey, 0, inst.ID) // 确保出现在负载排序集中
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+// UnregisterSFUInstance 摘除一个 SFU 实例。
+func (r *RedisClient) UnregisterSFUInstance(instanceID string) error {
+	ctx := context.Background()
+	r.client.ZRem(ctx, sfuInstanceRoomsKey, instanceID)
+	return r.client.Del(ctx, sfuInstanceKeyPrefix+instanceID).Err()
+}
+
+// ListSFUInstances 返回全部在线实例（TTL 内有心跳的）。
+func (r *RedisClient) ListSFUInstances() ([]SFUInstance, error) {
+	ctx := context.Background()
+	var cursor uint64
+	var result []SFUInstance
+	for {
+		keys, next, err := r.client.Scan(ctx, cursor, sfuInstanceKeyPrefix+"*", 100).Result()
+		if err != nil {
+			return nil, err
+		}
+		for _, key := range keys {
+			data, err := r.client.Get(ctx, key).Bytes()
+			if err != nil {
+				continue
+			}
+			var inst SFUInstance
+			if json.Unmarshal(data, &inst) == nil {
+				result = append(result, inst)
+			}
+		}
+		cursor = next
+		if cursor == 0 {
+			break
+		}
+	}
+	return result, nil
+}
+
+// GetSFUInstanceByID 查找指定实例。
+func (r *RedisClient) GetSFUInstanceByID(instanceID string) (*SFUInstance, error) {
+	ctx := context.Background()
+	data, err := r.client.Get(ctx, sfuInstanceKeyPrefix+instanceID).Bytes()
+	if err != nil {
+		return nil, err
+	}
+	var inst SFUInstance
+	if err := json.Unmarshal(data, &inst); err != nil {
+		return nil, err
+	}
+	return &inst, nil
+}
+
+// GetRoomSFUInstance 读取房间的实例亲和映射。
+func (r *RedisClient) GetRoomSFUInstance(roomID uint) (string, error) {
+	ctx := context.Background()
+	return r.client.Get(ctx, fmt.Sprintf("%s%d", sfuRoomInstanceKey, roomID)).Result()
+}
+
+// SetRoomSFUInstance 写入房间的实例亲和映射（房间固定路由到同一实例）。
+func (r *RedisClient) SetRoomSFUInstance(roomID uint, instanceID string) error {
+	ctx := context.Background()
+	pipe := r.client.TxPipeline()
+	pipe.Set(ctx, fmt.Sprintf("%s%d", sfuRoomInstanceKey, roomID), instanceID, 24*time.Hour)
+	pipe.ZIncrBy(ctx, sfuInstanceRoomsKey, 1, instanceID)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// PickLeastLoadedSFU 返回当前承载房间数最少的在线实例（简单负载均衡）。
+func (r *RedisClient) PickLeastLoadedSFU() (*SFUInstance, error) {
+	instances, err := r.ListSFUInstances()
+	if err != nil {
+		return nil, err
+	}
+	if len(instances) == 0 {
+		return nil, redis.Nil
+	}
+	ctx := context.Background()
+	scores, err := r.client.ZRangeByScoreWithScores(ctx, sfuInstanceRoomsKey, &redis.ZRangeBy{
+		Min: "-inf", Max: "+inf",
+	}).Result()
+	if err != nil || len(scores) == 0 {
+		// 排序集不可用时退化为第一个实例
+		inst := instances[0]
+		return &inst, nil
+	}
+	scoreOf := func(id string) float64 {
+		for _, z := range scores {
+			if z.Member == id {
+				return z.Score
+			}
+		}
+		return 0
+	}
+	best := instances[0]
+	bestScore := scoreOf(best.ID)
+	for _, inst := range instances[1:] {
+		if s := scoreOf(inst.ID); s < bestScore {
+			best, bestScore = inst, s
+		}
+	}
+	return &best, nil
+}
+
 func (r *RedisClient) Ping() error {
 	ctx := context.Background()
 	return r.client.Ping(ctx).Err()

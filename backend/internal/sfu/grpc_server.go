@@ -90,7 +90,7 @@ func (s *ControlServer) GetRoomStats(ctx context.Context, req *sfupb.GetRoomStat
 			VideoEnabled:    st.VideoEnabled,
 			BytesReceived:   int64(st.BytesReceived),
 			BytesSent:       int64(st.BytesSent),
-			Jitter:          uint32(st.Jitter),
+			Jitter:          float64(st.Jitter),
 			PacketsLost:     uint32(st.PacketsLost),
 			ConnectionState: st.ConnectionState,
 		})

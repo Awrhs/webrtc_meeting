@@ -14,7 +14,6 @@ package sfu
 import (
 	"encoding/binary"
 	"fmt"
-	"hash/crc32"
 	"os"
 	"path/filepath"
 	"strings"
@@ -248,7 +247,7 @@ type trackRecorder struct {
 }
 
 // newTrackRecorder 打开录制文件并根据编码选择封装格式。
-func newTrackRecorder(dir, baseName string, codec webrtc.RTPCodecCapability, kind string, streamID string) (*trackRecorder, error) {
+func newTrackRecorder(dir, baseName string, codec webrtc.RTPCodecParameters, kind string, streamID string) (*trackRecorder, error) {
 	rec := &trackRecorder{}
 
 	mime := strings.ToLower(codec.MimeType)
@@ -259,7 +258,7 @@ func newTrackRecorder(dir, baseName string, codec webrtc.RTPCodecCapability, kin
 		if err != nil {
 			return nil, err
 		}
-		ow, err := newOGGWriter(f, 2, 48000, time.Now().UnixNano()&0xffffffff)
+		ow, err := newOGGWriter(f, 2, 48000, uint32(time.Now().UnixNano()&0xffffffff))
 		if err != nil {
 			f.Close()
 			return nil, err
@@ -382,7 +381,7 @@ func (m *recorderManager) enabled() bool {
 }
 
 // trackRecorderFor 返回（必要时创建）某房间某轨道的录制器。
-func (m *recorderManager) trackRecorderFor(roomID uint, trackKey string, codec webrtc.RTPCodecCapability, kind, streamID string) *trackRecorder {
+func (m *recorderManager) trackRecorderFor(roomID uint, trackKey string, codec webrtc.RTPCodecParameters, kind, streamID string) *trackRecorder {
 	if !m.enabled() {
 		return nil
 	}

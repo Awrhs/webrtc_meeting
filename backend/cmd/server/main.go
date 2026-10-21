@@ -41,16 +41,18 @@ func main() {
 	roomService := service.NewRoomService(roomRepo, userRepo, redisClient, cfg.SFUJWTSecret, cfg.SFUTokenExpiryMinutes, log)
 	chatService := service.NewChatService(chatRepo, roomRepo)
 
-	// Connect to SFU gRPC control server
-	sfuClient, err := sfu.NewControlClient(cfg.SFUAddr, cfg.SFUControlToken, log)
+	// Connect to SFU gRPC control server（默认实例；集群模式下按房间路由到各实例）
+	var defaultSFUClient *sfu.ControlClient
+	defaultSFUClient, err = sfu.NewControlClient(cfg.SFUAddr, cfg.SFUControlToken, log)
 	if err != nil {
 		log.Warn("Failed to connect to SFU gRPC server, running without SFU control", zap.Error(err))
 	} else {
-		defer sfuClient.Close()
 		log.Info("Connected to SFU gRPC server successfully", zap.String("addr", cfg.SFUAddr))
 	}
+	sfuRouter := sfu.NewControlRouter(redisClient, defaultSFUClient, cfg.SFUControlToken, log)
+	defer sfuRouter.Close()
 
-	hub := signaling.NewHub(roomService, chatService, cfg.AllowedOrigins, log)
+	hub := signaling.NewHubWithGrace(roomService, chatService, cfg.AllowedOrigins, time.Duration(cfg.PresenceGraceSeconds)*time.Second, log)
 	go hub.Run()
 
 	r := gin.Default()
@@ -69,7 +71,7 @@ func main() {
 		AllowCredentials: true,
 	}))
 
-	handler := handlers.NewHandler(userService, userRepo, roomService, chatService, hub, sfuClient, cfg.SFUCallbackToken, log)
+	handler := handlers.NewHandler(userService, userRepo, roomService, chatService, hub, sfuRouter, cfg.SFUCallbackToken, cfg.UploadDir, int64(cfg.UploadMaxBytes), log)
 
 	api := r.Group("/api/v1")
 	{
@@ -104,10 +106,16 @@ func main() {
 
 			auth.GET("/rooms/:id/messages", handler.GetMessages)
 			auth.POST("/rooms/:id/messages", handler.SendMessage)
+			auth.GET("/rooms/:id/messages/private/:userId", handler.GetPrivateMessages)
+			auth.POST("/rooms/:id/upload", handler.UploadFile)
 
 			auth.GET("/rooms/:id/audit-logs", handler.GetAuditLogs)
 
 			auth.PUT("/rooms/:id/media-state", handler.UpdateMediaState)
+
+			// 离开会议与实时在线状态
+			auth.POST("/rooms/:id/leave", handler.LeaveRoom)
+			auth.GET("/rooms/:id/presence", handler.GetPresence)
 
 			// E2EE 端到端加密密钥交换
 			auth.POST("/e2ee/public-key", handler.UploadPublicKey)
@@ -121,6 +129,9 @@ func main() {
 	r.GET("/healthz", func(c *gin.Context) {
 		c.String(http.StatusOK, "ok")
 	})
+
+	// 聊天图片/文件的静态目录
+	r.Static("/uploads", cfg.UploadDir)
 	r.GET("/readyz", func(c *gin.Context) {
 		sqlDB, err := db.DB()
 		if err != nil || sqlDB.Ping() != nil || redisClient.Ping() != nil {
@@ -162,8 +173,27 @@ func main() {
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+
+	// 定期清理过期的踢出封禁记录，避免 kick_bans 表无限增长
+	go func() {
+		ticker := time.NewTicker(10 * time.Minute)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if err := roomRepo.RemoveExpiredKicks(); err != nil {
+					log.Warn("RemoveExpiredKicks failed", zap.Error(err))
+				}
+			}
+		}
+	}()
+
 	go func() {
 		<-ctx.Done()
+		// 停机前通知所有在线客户端（前端提示后停止重连）
+		hub.NotifyShutdown("server is shutting down")
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.ShutdownTimeoutSeconds)*time.Second)
 		defer cancel()
 		if err := server.Shutdown(shutdownCtx); err != nil {

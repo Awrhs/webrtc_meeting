@@ -51,7 +51,21 @@ func main() {
 		CallbackToken:           cfg.SFUCallbackToken,
 		MessageRateLimit:        cfg.RateLimitSFUMsgPerMinute,
 		TokenReplayChecker:      replayChecker,
+		RecordingDir:            cfg.SFURecordingDir,
 	})
+
+	// 集群模式：向共享 Redis 心跳注册本实例（API 服务器据此做房间亲和路由）。
+	// Redis 不可用时不注册，API 自动回退到单机默认实例。
+	if replayChecker != nil {
+		instanceID := sfu.DefaultInstanceID(cfg.SFUGRPCPort)
+		stopRegistration := sfu.StartInstanceRegistration(redisClient, repository.SFUInstance{
+			ID:        instanceID,
+			GRPCAddr:  cfg.SFUAddr,
+			WSURL:     cfg.SFUPublicWSURL,
+			StartedAt: time.Now().Unix(),
+		}, log)
+		defer stopRegistration()
+	}
 
 	// 启动 gRPC 控制服务器（保存引用用于优雅关闭）
 	// 注意：极简测试页面不直接调用 gRPC，这是给 API 服务器用的管理通道
@@ -74,6 +88,10 @@ func main() {
 		_, _ = w.Write([]byte("ready"))
 	})
 	mux.HandleFunc("/metrics.json", sfuServer.HandleMetrics)
+
+	// 录制管理接口（X-SFU-Callback-Token 鉴权）：查询与下载/回放录制文件
+	mux.HandleFunc("/recordings/list", sfuServer.HandleRecordingsList)
+	mux.HandleFunc("/recordings/download", sfuServer.HandleRecordingsDownload)
 
 	// 添加 CORS 中间件：允许前端页面跨域连接
 	c := cors.New(cors.Options{
@@ -98,6 +116,8 @@ func main() {
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.ShutdownTimeoutSeconds)*time.Second)
 		defer cancel()
 		grpcServer.GracefulStop()
+		// 优雅停机：落盘全部录制文件
+		sfuServer.Shutdown()
 		if err := server.Shutdown(shutdownCtx); err != nil {
 			log.Error("Failed to shutdown SFU server", zap.Error(err))
 		}

@@ -1,5 +1,6 @@
 import { createSlice, createAsyncThunk, PayloadAction } from '@reduxjs/toolkit'
 import { api } from '@/utils/api'
+import { clearLegacyKeyStore } from '@/utils/encryption'
 
 interface User {
   id: number
@@ -78,6 +79,8 @@ const authSlice = createSlice({
   initialState,
   reducers: {
     logout: (state) => {
+      // 显式登出：销毁本设备的 E2EE 密钥（历史加密消息将不可再解密）
+      clearLegacyKeyStore()
       localStorage.removeItem('token')
       state.user = null
       state.token = null

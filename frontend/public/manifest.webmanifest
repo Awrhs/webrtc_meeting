@@ -1,0 +1,17 @@
+{
+  "name": "加密SFU音视频会议",
+  "short_name": "SFU会议",
+  "description": "基于 WebRTC SFU 的加密音视频会议系统",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#000000",
+  "theme_color": "#1677ff",
+  "icons": [
+    {
+      "src": "/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}

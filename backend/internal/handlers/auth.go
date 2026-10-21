@@ -24,21 +24,25 @@ type Handler struct {
 	roomService      service.RoomService
 	chatService      service.ChatService
 	hub              *signaling.Hub
-	sfuClient        *sfu.ControlClient
+	sfuRouter        *sfu.ControlRouter
 	logger           *zap.Logger
 	sfuCallbackToken string
+	uploadDir        string
+	uploadMaxBytes   int64
 }
 
-func NewHandler(userService service.UserService, userRepo repository.UserRepository, roomService service.RoomService, chatService service.ChatService, hub *signaling.Hub, sfuClient *sfu.ControlClient, sfuCallbackToken string, logger *zap.Logger) *Handler {
+func NewHandler(userService service.UserService, userRepo repository.UserRepository, roomService service.RoomService, chatService service.ChatService, hub *signaling.Hub, sfuRouter *sfu.ControlRouter, sfuCallbackToken string, uploadDir string, uploadMaxBytes int64, logger *zap.Logger) *Handler {
 	return &Handler{
 		userService:      userService,
 		userRepo:         userRepo,
-		roomService:      roomService,
-		chatService:      chatService,
-		hub:              hub,
-		sfuClient:        sfuClient,
-		logger:           logger,
-		sfuCallbackToken: sfuCallbackToken,
+		roomService:       roomService,
+		chatService:       chatService,
+		hub:               hub,
+		sfuRouter:         sfuRouter,
+		logger:            logger,
+		sfuCallbackToken:  sfuCallbackToken,
+		uploadDir:         uploadDir,
+		uploadMaxBytes:    uploadMaxBytes,
 	}
 }
 

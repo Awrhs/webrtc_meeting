@@ -34,6 +34,7 @@ type RoomService interface {
 	GetMemberRole(roomID uint, userID uint) (models.Role, error)
 	UpdateMediaState(roomID uint, userID uint, videoOn, audioOn *bool) (bool, bool, error)
 	GenerateSFUToken(roomID uint, userID uint) (string, error)
+	PickSFUEndpoint(roomID uint) (string, error)
 	LogAudit(roomID, userID uint, targetID *uint, action, details, ipAddress, userAgent string) error
 	GetAuditLogs(roomID uint, limit, offset int) ([]*models.AuditLog, error)
 }
@@ -651,6 +652,29 @@ func (s *roomService) GenerateSFUToken(roomID uint, userID uint) (string, error)
 		expiresIn = 5 * time.Minute
 	}
 	return auth.GenerateSFUJoinToken(userID, roomID, s.sfuJWTSecret, expiresIn)
+}
+
+// PickSFUEndpoint 返回房间所在 SFU 实例面向浏览器的 WebSocket 地址（集群模式）。
+// 首次访问时选择负载最低的实例并固定房间亲和；没有实例注册（单机模式）时返回空串，
+// 前端回退到默认 VITE_SFU_HOST。
+func (s *roomService) PickSFUEndpoint(roomID uint) (string, error) {
+	// 已有亲和映射且实例仍在线
+	if instanceID, err := s.redis.GetRoomSFUInstance(roomID); err == nil && instanceID != "" {
+		if inst, err := s.redis.GetSFUInstanceByID(instanceID); err == nil {
+			return inst.WSURL, nil
+		}
+	}
+	inst, err := s.redis.PickLeastLoadedSFU()
+	if err != nil {
+		// 无实例注册：单机部署模式
+		return "", nil
+	}
+	if err := s.redis.SetRoomSFUInstance(roomID, inst.ID); err != nil {
+		s.logger.Warn("Failed to pin room to SFU instance", zap.Error(err))
+	}
+	s.logger.Info("Room pinned to SFU instance",
+		zap.Uint("roomID", roomID), zap.String("instance", inst.ID), zap.String("ws_url", inst.WSURL))
+	return inst.WSURL, nil
 }
 
 func (s *roomService) LogAudit(roomID, userID uint, targetID *uint, action, details, ipAddress, userAgent string) error {

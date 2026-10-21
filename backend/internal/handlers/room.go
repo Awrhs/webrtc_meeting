@@ -107,11 +107,14 @@ func (h *Handler) JoinRoom(c *gin.Context) {
 
 	h.hub.BroadcastUserJoined(result.Room.ID, userID)
 
+	sfuURL, _ := h.roomService.PickSFUEndpoint(result.Room.ID)
+
 	c.JSON(http.StatusOK, gin.H{
 		"room":           result.Room,
 		"members":        result.Members,
 		"my_permissions": result.Permissions,
 		"sfu_token":      result.SFUToken,
+		"sfu_url":        sfuURL,
 	})
 }
 
@@ -130,7 +133,9 @@ func (h *Handler) GetSFUToken(c *gin.Context) {
 		return
 	}
 
-	c.JSON(http.StatusOK, gin.H{"sfu_token": token})
+	sfuURL, _ := h.roomService.PickSFUEndpoint(uint(roomID))
+
+	c.JSON(http.StatusOK, gin.H{"sfu_token": token, "sfu_url": sfuURL})
 }
 
 func (h *Handler) DeleteRoom(c *gin.Context) {
@@ -219,8 +224,8 @@ func (h *Handler) KickMember(c *gin.Context) {
 	}
 
 	// Call SFU to force disconnect the user's media connection
-	if h.sfuClient != nil {
-		if err := h.sfuClient.KickUser(uint(roomID), uint(targetID), "kicked by admin"); err != nil {
+	if h.sfuRouter != nil {
+		if err := h.sfuRouter.KickUser(uint(roomID), uint(targetID), "kicked by admin"); err != nil {
 			h.logger.Warn("Failed to kick user from SFU, continuing with signaling", zap.Error(err))
 		}
 	}
@@ -256,8 +261,8 @@ func (h *Handler) MuteMember(c *gin.Context) {
 	}
 
 	// Call SFU to mute the user's media stream
-	if h.sfuClient != nil {
-		if err := h.sfuClient.MuteUser(uint(roomID), uint(targetID), true); err != nil {
+	if h.sfuRouter != nil {
+		if err := h.sfuRouter.MuteUser(uint(roomID), uint(targetID), true); err != nil {
 			h.logger.Warn("Failed to mute user in SFU, continuing with signaling", zap.Error(err))
 		}
 	}
@@ -293,8 +298,8 @@ func (h *Handler) UnmuteMember(c *gin.Context) {
 	}
 
 	// Call SFU to unmute the user's media stream
-	if h.sfuClient != nil {
-		if err := h.sfuClient.MuteUser(uint(roomID), uint(targetID), false); err != nil {
+	if h.sfuRouter != nil {
+		if err := h.sfuRouter.MuteUser(uint(roomID), uint(targetID), false); err != nil {
 			h.logger.Warn("Failed to unmute user in SFU, continuing with signaling", zap.Error(err))
 		}
 	}
@@ -396,6 +401,50 @@ func (h *Handler) TransferOwner(c *gin.Context) {
 	h.audit(c, uint(roomID), userID, &tID, "transfer_owner", "")
 
 	c.JSON(http.StatusOK, gin.H{"message": "ownership transferred"})
+}
+
+// LeaveRoom 显式离开会议：软删成员记录、同步房间人数、广播 user_left。
+// 前端在离开会议/关闭页面时调用；断线未重连的用户由 Hub 宽限期机制自动补记。
+func (h *Handler) LeaveRoom(c *gin.Context) {
+	userID := GetUserID(c)
+	idStr := c.Param("id")
+	roomID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+
+	// 幂等：已不是成员时直接返回成功
+	if _, err := h.roomService.GetMemberRole(uint(roomID), userID); err != nil {
+		c.JSON(http.StatusOK, gin.H{"message": "left"})
+		return
+	}
+
+	if err := h.roomService.LeaveRoom(uint(roomID), userID); err != nil {
+		h.logger.Warn("Failed to leave room", zap.Error(err), zap.Uint("roomID", uint(roomID)), zap.Uint("userID", userID))
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	// 从信令房间中移除连接（如仍在线）并广播离开事件
+	h.hub.RemoveUserFromRoom(userID, uint(roomID))
+	h.hub.BroadcastUserLeft(uint(roomID), userID)
+
+	c.JSON(http.StatusOK, gin.H{"message": "left"})
+}
+
+// GetPresence 返回房间内当前 WebSocket 在线的用户列表（实时在线状态）。
+func (h *Handler) GetPresence(c *gin.Context) {
+	idStr := c.Param("id")
+	roomID, err := strconv.Atoi(idStr)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"room_id":         roomID,
+		"online_user_ids": h.hub.OnlineUserIDs(uint(roomID)),
+	})
 }
 
 func (h *Handler) NotifyConnectionFailed(c *gin.Context) {

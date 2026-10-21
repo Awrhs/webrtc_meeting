@@ -251,6 +251,12 @@ export class SignalingClient {
     try {
       const message = JSON.parse(event.data) as SignalingMessage
 
+      // 服务停机通知：停止自动重连，避免停机期间反复重试
+      if (message.type === 'server_shutdown') {
+        this.isManualDisconnect = true
+        console.warn('[Signaling] Server is shutting down:', message.data)
+      }
+
       if (message.type === 'public_key' && message.user_id !== this.currentUserId) {
         const publicKey = message.data?.public_key
         if (publicKey) {

@@ -1,12 +1,24 @@
 import { useRef, useEffect, useState, memo, useMemo } from 'react'
 import { RoomMember } from '@/types'
 
+export interface RemoteStreamMeta {
+  userId: number
+  kind: string
+  rid: string
+}
+
 interface VideoGridProps {
   members: RoomMember[]
   currentUserId: number
   localStream: MediaStream | null
   screenStream: MediaStream | null
   remoteStreams: Map<number, MediaStream[]>
+  // 流元信息（streamId -> kind/rid）：rid 非空为摄像头（simulcast 层），空为屏幕共享/单层流
+  remoteStreamMeta?: Map<string, RemoteStreamMeta>
+}
+
+function hasLiveVideo(stream: MediaStream): boolean {
+  return stream.getVideoTracks().some(t => t.readyState === 'live')
 }
 
 export default memo(function VideoGrid({
@@ -15,23 +27,68 @@ export default memo(function VideoGrid({
   localStream,
   screenStream,
   remoteStreams,
+  remoteStreamMeta,
 }: VideoGridProps) {
   const localHasVideo = localStream?.getVideoTracks().some(t => t.enabled) || false
-  const hasScreenShare = screenStream !== null
+
+  // 按成员归类远端流：摄像头流与屏幕共享流分开
+  const memberStreams = useMemo(() => {
+    const cameras = new Map<number, MediaStream>()
+    const screens = new Map<number, MediaStream>()
+    for (const [userId, streams] of remoteStreams.entries()) {
+      if (userId === 0) continue
+      for (const stream of streams) {
+        if (!hasLiveVideo(stream)) continue
+        const meta = remoteStreamMeta?.get(stream.id)
+        if (meta && meta.kind === 'video' && meta.rid === '') {
+          // 无 rid 的视频流 = 屏幕共享（或非 simulcast 浏览器的摄像头）
+          if (!screens.has(userId)) screens.set(userId, stream)
+        } else {
+          // 带 rid 的视频流 = 摄像头；无元信息时也按摄像头处理
+          if (!cameras.has(userId)) cameras.set(userId, stream)
+        }
+      }
+    }
+    return { cameras, screens }
+  }, [remoteStreams, remoteStreamMeta])
+
+  const hasLocalScreenShare = screenStream !== null
+  const firstRemoteScreen = useMemo(() => {
+    for (const [userId, stream] of memberStreams.screens.entries()) {
+      // 屏幕共享的成员即使没开摄像头也要展示其共享内容
+      if (userId !== currentUserId) return stream
+    }
+    return null
+  }, [memberStreams, currentUserId])
+
+  // 大屏内容：优先远端共享（先到先得），其次本地共享
+  const mainScreenStream = firstRemoteScreen ?? (hasLocalScreenShare ? screenStream : null)
+  const hasScreenShareLayout = mainScreenStream !== null
+  const mainScreenOwner = useMemo(() => {
+    if (!hasScreenShareLayout) return ''
+    if (mainScreenStream === screenStream && firstRemoteScreen === null) return '你'
+    for (const [userId] of memberStreams.screens.entries()) {
+      if (userId !== currentUserId) {
+        const m = members.find(mm => mm.user_id === userId)
+        return m?.nickname || `用户 ${userId}`
+      }
+    }
+    return '远端成员'
+  }, [hasScreenShareLayout, mainScreenStream, screenStream, firstRemoteScreen, memberStreams, members, currentUserId])
 
   const remoteMembersWithVideo = useMemo(
     () => members.filter(m => m.is_video_on && m.user_id !== currentUserId),
     [members, currentUserId]
   )
 
-  if (hasScreenShare) {
+  if (hasScreenShareLayout) {
     return (
       <div className="video-grid-with-screen">
         <div className="screen-share-main">
           <VideoCard
-            stream={screenStream}
-            nickname="屏幕共享"
-            isSelf
+            stream={mainScreenStream}
+            nickname={mainScreenOwner === '你' ? '屏幕共享' : `${mainScreenOwner} 的屏幕共享`}
+            isSelf={mainScreenStream === screenStream}
             muted={false}
             isScreenShare
           />
@@ -47,16 +104,12 @@ export default memo(function VideoGrid({
             />
           )}
 
-          {remoteMembersWithVideo.slice(0, 3).map((member) => {
-            const stream = getRemoteStreamForUser(
-              member.user_id,
-              remoteMembersWithVideo,
-              remoteStreams
-            )
+          {remoteMembersWithVideo.slice(0, 6).map((member) => {
+            const stream = memberStreams.cameras.get(member.user_id)
             return (
               <VideoCard
                 key={member.user_id}
-                stream={stream}
+                stream={stream ?? null}
                 nickname={member.nickname || `用户 ${member.user_id}`}
                 isSelf={false}
                 muted={member.is_muted}
@@ -93,15 +146,11 @@ export default memo(function VideoGrid({
       )}
 
       {remoteMembersWithVideo.map((member) => {
-        const stream = getRemoteStreamForUser(
-          member.user_id,
-          remoteMembersWithVideo,
-          remoteStreams
-        )
+        const stream = memberStreams.cameras.get(member.user_id)
         return (
           <VideoCard
             key={member.user_id}
-            stream={stream}
+            stream={stream ?? null}
             nickname={member.nickname || `用户 ${member.user_id}`}
             isSelf={false}
             muted={member.is_muted}
@@ -111,32 +160,6 @@ export default memo(function VideoGrid({
     </div>
   )
 })
-
-function getRemoteStreamForUser(
-  userId: number,
-  remoteMembersWithVideo: RoomMember[],
-  remoteStreams: Map<number, MediaStream[]>
-): MediaStream | null {
-  const userStreams = remoteStreams.get(userId)
-  if (userStreams && userStreams.length > 0) {
-    // 同一用户可能有多路流（音频流 + 摄像头/屏幕流是不同的 msid），
-    // 优先取带活跃视频轨道的流，避免拿到纯音频流导致黑屏。
-    const withVideo = userStreams.find(
-      s => s.getVideoTracks().some(t => t.readyState === 'live')
-    )
-    return withVideo ?? userStreams[0]
-  }
-
-  const poolStreams = (remoteStreams.get(0) || []).filter(
-    s => s.getVideoTracks().some(t => t.readyState === 'live')
-  )
-  const memberIndex = remoteMembersWithVideo.findIndex(m => m.user_id === userId)
-  if (memberIndex !== -1 && poolStreams.length > memberIndex) {
-    return poolStreams[memberIndex]
-  }
-
-  return null
-}
 
 interface VideoCardProps {
   stream: MediaStream | null

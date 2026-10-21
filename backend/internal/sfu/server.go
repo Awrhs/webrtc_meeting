@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,7 +37,7 @@ type TrackInfo struct {
 	StreamID  string // 发布者浏览器 MediaStream 的 msid（GUID）
 	IsEnabled atomic.Bool // 原子操作，转发 goroutine 中无需锁即可读写
 	RID       string      // simulcast layer rid: "" / "low" / "high"
-	Codec     webrtc.RTPCodecCapability // 录制与统计用：轨道编码
+	Codec     webrtc.RTPCodecParameters // 录制用：轨道编码（含 PayloadType）
 	bytesIn   atomic.Uint64 // 从发布者收到的字节数
 	bytesOut  atomic.Uint64 // 成功转发给所有订阅者的字节数
 }
@@ -361,7 +362,7 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 		Kind:     trackKind,
 		StreamID: streamID,
 		RID:      rid,
-		Codec:    track.Codec().RTPCodecCapability,
+		Codec:    track.Codec(),
 	}
 
 	// 通过事件循环串行添加轨道，消除 peer.mu 竞争
@@ -401,7 +402,7 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 	// 开启录制时同步把 RTP 包落盘（VP8→IVF / Opus→OGG / 其他→原始 RTP dump）
 	var recorder *trackRecorder
 	if s.recorders.enabled() {
-		recorder = s.recorders.trackRecorderFor(room.ID, trackKey, track.Codec().RTPCodecCapability, trackKind, streamID)
+		recorder = s.recorders.trackRecorderFor(room.ID, trackKey, track.Codec(), trackKind, streamID)
 	}
 	go func() {
 		for {
@@ -1223,7 +1224,7 @@ func (s *SFUServer) startRTCPReadLoop(peer *Peer, sender *webrtc.RTPSender, from
 						zap.String("trackKey", trackKey))
 					// 仅对摄像头（simulcast，trackKey 带 rid 后缀）轨道做自适应切层
 					if strings.Contains(trackKey, "/") {
-						if _, changed := s.qos.UpdateREMB(peer.UserID, fromUserID, p.Bitrate, time.Now()); changed {
+						if _, changed := s.qos.UpdateREMB(peer.UserID, fromUserID, uint32(p.Bitrate), time.Now()); changed {
 							s.applyQualitySwitch(peer, fromUserID)
 						}
 					}
@@ -2102,6 +2103,55 @@ func (l *rateLimiter) Allow() bool {
 	}
 	l.count++
 	return true
+}
+
+// ==================== 录制管理接口（X-SFU-Callback-Token 鉴权） ====================
+
+// HandleRecordingsList 返回录制目录清单：GET /recordings/list
+func (s *SFUServer) HandleRecordingsList(w http.ResponseWriter, r *http.Request) {
+	if s.callbackToken != "" && r.Header.Get("X-SFU-Callback-Token") != s.callbackToken {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled": s.recorders.enabled(),
+		"dir":     s.recorders.baseDir,
+		"rooms":   s.recorders.listRecordings(),
+	})
+}
+
+// HandleRecordingsDownload 下载/回放录制文件：GET /recordings/download?room=<dir>&file=<name>
+// 路径做了严格清洗，禁止目录穿越。
+func (s *SFUServer) HandleRecordingsDownload(w http.ResponseWriter, r *http.Request) {
+	if s.callbackToken != "" && r.Header.Get("X-SFU-Callback-Token") != s.callbackToken {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+		return
+	}
+	if !s.recorders.enabled() {
+		http.Error(w, "recording disabled", http.StatusNotFound)
+		return
+	}
+	roomDir := sanitizeFileName(r.URL.Query().Get("room"))
+	fileName := sanitizeFileName(r.URL.Query().Get("file"))
+	if roomDir == "" || fileName == "" {
+		http.Error(w, "room and file required", http.StatusBadRequest)
+		return
+	}
+	path := filepath.Join(s.recorders.baseDir, roomDir, fileName)
+	// 二次校验：清洗后的路径必须仍在录制根目录内
+	absRoot, err1 := filepath.Abs(s.recorders.baseDir)
+	absPath, err2 := filepath.Abs(path)
+	if err1 != nil || err2 != nil || !strings.HasPrefix(absPath, absRoot+string(os.PathSeparator)) {
+		http.Error(w, "invalid path", http.StatusBadRequest)
+		return
+	}
+	http.ServeFile(w, r, path)
+}
+
+// Shutdown 优雅停机：落盘全部录制文件。
+func (s *SFUServer) Shutdown() {
+	s.recorders.stopAll()
 }
 
 func (s *SFUServer) HandleMetrics(w http.ResponseWriter, r *http.Request) {

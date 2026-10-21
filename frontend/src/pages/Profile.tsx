@@ -1,10 +1,13 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useCallback } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { useDispatch, useSelector } from 'react-redux'
-import { Layout, Card, Form, Input, Button, Avatar, message, Typography, Divider } from 'antd'
-import { UserOutlined } from '@ant-design/icons'
+import { Layout, Card, Form, Input, Button, Avatar, message, Typography, Divider, List, Tag, Popconfirm } from 'antd'
+import { UserOutlined, LaptopOutlined, DeleteOutlined } from '@ant-design/icons'
 import { updateProfile, getMe } from '@/store/slices/authSlice'
+import { clearLegacyKeyStore } from '@/utils/encryption'
+import { api } from '@/utils/api'
 import { RootState, AppDispatch } from '@/store'
+import { Device } from '@/types'
 
 const { Header, Content } = Layout
 const { Title } = Typography
@@ -15,10 +18,39 @@ export default function Profile() {
   const { user } = useSelector((state: RootState) => state.auth)
   const [formProfile] = Form.useForm()
   const [loading, setLoading] = useState(false)
+  // 登录设备管理
+  const [devices, setDevices] = useState<Device[]>([])
+  const [devicesLoading, setDevicesLoading] = useState(false)
+
+  const loadDevices = useCallback(async () => {
+    setDevicesLoading(true)
+    try {
+      const response = await api.get('/api/v1/user/devices')
+      setDevices(response.data?.devices || [])
+    } catch {
+      message.error('获取设备列表失败')
+    } finally {
+      setDevicesLoading(false)
+    }
+  }, [])
+
+  const handleDeleteDevice = async (deviceId: number) => {
+    try {
+      await api.delete(`/api/v1/user/devices/${deviceId}`)
+      message.success('设备记录已删除')
+      void loadDevices()
+    } catch {
+      message.error('删除设备记录失败')
+    }
+  }
 
   useEffect(() => {
     dispatch(getMe())
   }, [dispatch])
+
+  useEffect(() => {
+    void loadDevices()
+  }, [loadDevices])
 
   useEffect(() => {
     if (user) {
@@ -124,6 +156,61 @@ export default function Profile() {
               <span>{user?.phone}</span>
             </div>
           </div>
+
+          <Divider />
+
+          <Title level={5}>登录设备</Title>
+          <div style={{ color: '#999', fontSize: 12, marginBottom: 8 }}>
+            每次登录会记录设备指纹（X-Device-Id 或 UA 哈希）、UA 与 IP，可在此删除异常设备记录。
+          </div>
+          <List
+            loading={devicesLoading}
+            dataSource={devices}
+            locale={{ emptyText: '暂无设备记录' }}
+            renderItem={(device) => (
+              <List.Item
+                actions={[
+                  <Popconfirm
+                    key="delete"
+                    title="确定删除该设备记录？"
+                    onConfirm={() => handleDeleteDevice(device.id)}
+                  >
+                    <Button size="small" danger icon={<DeleteOutlined />}>删除</Button>
+                  </Popconfirm>,
+                ]}
+              >
+                <List.Item.Meta
+                  avatar={<LaptopOutlined style={{ fontSize: 24, color: '#1677ff' }} />}
+                  title={
+                    <span>
+                      {device.device_name || device.device_id.slice(0, 12)}
+                      <Tag style={{ marginLeft: 8 }}>{device.ip}</Tag>
+                    </span>
+                  }
+                  description={
+                    <span style={{ fontSize: 12 }}>
+                      {(device.user_agent || '').slice(0, 80)}
+                      {device.last_active ? ` · 最近活跃：${new Date(device.last_active).toLocaleString()}` : ''}
+                    </span>
+                  }
+                />
+              </List.Item>
+            )}
+          />
+
+          <Divider />
+
+          <Title level={5}>安全</Title>
+          <Popconfirm
+            title="清除本设备保存的 E2EE 密钥？"
+            description="清除后历史加密消息将无法解密，需要重新进行密钥交换。"
+            onConfirm={() => {
+              clearLegacyKeyStore()
+              message.success('已清除本设备的 E2EE 密钥数据')
+            }}
+          >
+            <Button danger>清除本设备 E2EE 密钥</Button>
+          </Popconfirm>
         </Card>
       </Content>
     </Layout>

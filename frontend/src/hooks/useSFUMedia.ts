@@ -19,6 +19,7 @@ export function useSFUMedia({ onRemoteTrack, mediaE2EEManagerRef, localStreamRef
     roomId: number,
     userId: number,
     sfuToken: string,
+    sfuUrl?: string,
   ) => {
     try {
       const stream = await getMediaStream(false, true)
@@ -43,7 +44,8 @@ export function useSFUMedia({ onRemoteTrack, mediaE2EEManagerRef, localStreamRef
           console.error('[SFU] Error:', error)
           message.error(error)
         },
-        mediaE2EEManagerRef.current
+        mediaE2EEManagerRef.current,
+        sfuUrl || undefined
       )
 
       sfuConnectionRef.current = sfuConnection

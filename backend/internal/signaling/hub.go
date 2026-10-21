@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"sync"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"go.uber.org/zap"
@@ -40,6 +41,7 @@ const (
 	MessageTypePublicKey        MessageType = "public_key"
 	MessageTypeSenderKey        MessageType = "sender_key"
 	MessageTypeKeyRotation      MessageType = "key_rotation"
+	MessageTypeServerShutdown   MessageType = "server_shutdown"
 )
 
 type Message struct {
@@ -66,22 +68,44 @@ type Hub struct {
 	rooms map[uint]map[uint]*Client
 
 	// Channel用于序列化所有操作（不需要互斥锁）
-	register       chan *Client
-	unregister     chan *Client
-	broadcast      chan *BroadcastMessage
-	sendToUser     chan *UserMessage
-	addToRoom      chan *RoomClientAction
-	removeFromRoom chan *RoomClientAction
+	register           chan *Client
+	unregister         chan *Client
+	broadcast          chan *BroadcastMessage
+	sendToUser         chan *UserMessage
+	addToRoom          chan *RoomClientAction
+	removeFromRoom     chan *RoomClientAction
+	removeUserFromRoom chan *RoomUserAction
+	broadcastAll       chan []byte
+	presenceQueries    chan *presenceQuery
+	checkLeave         chan checkLeaveMsg
 
 	roomService    service.RoomService
 	chatService    service.ChatService
 	allowedOrigins []string
 	logger         *zap.Logger
+	// 宽限期：WS 断开后多久仍未重连则在服务端标记离开
+	presenceGrace time.Duration
 }
 
 type RoomClientAction struct {
 	Client *Client
 	RoomID uint
+}
+
+// RoomUserAction 按用户 ID 移除房间成员（显式离开接口用）
+type RoomUserAction struct {
+	UserID uint
+	RoomID uint
+}
+
+type presenceQuery struct {
+	roomID uint
+	resp   chan []uint
+}
+
+type checkLeaveMsg struct {
+	roomID uint
+	userID  uint
 }
 
 type BroadcastMessage struct {
@@ -104,19 +128,29 @@ var upgrader = websocket.Upgrader{
 }
 
 func NewHub(roomService service.RoomService, chatService service.ChatService, allowedOrigins []string, logger *zap.Logger) *Hub {
+	return NewHubWithGrace(roomService, chatService, allowedOrigins, 90*time.Second, logger)
+}
+
+// NewHubWithGrace 创建指定在线宽限期的 Hub。
+func NewHubWithGrace(roomService service.RoomService, chatService service.ChatService, allowedOrigins []string, presenceGrace time.Duration, logger *zap.Logger) *Hub {
 	return &Hub{
-		clients:        make(map[uint]*Client),
-		rooms:          make(map[uint]map[uint]*Client),
-		register:       make(chan *Client),
-		unregister:     make(chan *Client),
-		broadcast:      make(chan *BroadcastMessage),
-		sendToUser:     make(chan *UserMessage),
-		addToRoom:      make(chan *RoomClientAction),
-		removeFromRoom: make(chan *RoomClientAction),
-		roomService:    roomService,
-		chatService:    chatService,
-		allowedOrigins: allowedOrigins,
-		logger:         logger,
+		clients:            make(map[uint]*Client),
+		rooms:              make(map[uint]map[uint]*Client),
+		register:           make(chan *Client),
+		unregister:         make(chan *Client),
+		broadcast:          make(chan *BroadcastMessage),
+		sendToUser:         make(chan *UserMessage),
+		addToRoom:          make(chan *RoomClientAction),
+		removeFromRoom:     make(chan *RoomClientAction),
+		removeUserFromRoom: make(chan *RoomUserAction, 16),
+		broadcastAll:       make(chan []byte, 16),
+		presenceQueries:    make(chan *presenceQuery, 16),
+		checkLeave:         make(chan checkLeaveMsg, 64),
+		roomService:        roomService,
+		chatService:        chatService,
+		allowedOrigins:     allowedOrigins,
+		logger:             logger,
+		presenceGrace:      presenceGrace,
 	}
 }
 
@@ -219,6 +253,48 @@ func (h *Hub) RemoveClientFromRoom(client *Client, roomID uint) {
 		Client: client,
 		RoomID: roomID,
 	}
+}
+
+// RemoveUserFromRoom 按用户 ID 把连接从房间移除（显式离开接口用）。
+func (h *Hub) RemoveUserFromRoom(userID uint, roomID uint) {
+	select {
+	case h.removeUserFromRoom <- &RoomUserAction{UserID: userID, RoomID: roomID}:
+	case <-time.After(2 * time.Second):
+		h.logger.Warn("RemoveUserFromRoom timed out", zap.Uint("userID", userID), zap.Uint("roomID", roomID))
+	}
+}
+
+// OnlineUserIDs 返回房间内当前 WebSocket 在线的用户列表（实时在线状态查询）。
+func (h *Hub) OnlineUserIDs(roomID uint) []uint {
+	query := &presenceQuery{roomID: roomID, resp: make(chan []uint, 1)}
+	select {
+	case h.presenceQueries <- query:
+		select {
+		case users := <-query.resp:
+			return users
+		case <-time.After(2 * time.Second):
+			return nil
+		}
+	case <-time.After(2 * time.Second):
+		return nil
+	}
+}
+
+// BroadcastAll 向所有在线客户端发送系统通知（如停机公告）。
+func (h *Hub) BroadcastAll(message []byte) {
+	select {
+	case h.broadcastAll <- message:
+	default:
+	}
+}
+
+// NotifyShutdown 停机前通知所有在线客户端（前端提示后停止重连）。
+func (h *Hub) NotifyShutdown(reason string) {
+	msg := Message{
+		Type: MessageTypeServerShutdown,
+		Data: json.RawMessage(safeMarshal(map[string]string{"reason": reason}, h.logger)),
+	}
+	h.BroadcastAll(safeMarshal(msg, h.logger))
 }
 
 // ==================== 辅助方法（仅在Run() goroutine内部调用，无需锁） ====================

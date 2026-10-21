@@ -14,6 +14,8 @@ export function useLocalMedia({ sfuConnectionRef, currentRoomId }: UseLocalMedia
   const [screenShare, setScreenShare] = useState(false)
   const [localStream, setLocalStream] = useState<MediaStream | null>(null)
   const [screenStream, setScreenStream] = useState<MediaStream | null>(null)
+  const [cameraDevices, setCameraDevices] = useState<MediaDeviceInfo[]>([])
+  const [activeCameraId, setActiveCameraId] = useState<string>('')
 
   const localStreamRef = useRef<MediaStream | null>(null)
   const screenStreamRef = useRef<MediaStream | null>(null)
@@ -35,6 +37,9 @@ export function useLocalMedia({ sfuConnectionRef, currentRoomId }: UseLocalMedia
         localStreamRef.current = stream
         setLocalStream(stream)
         const videoTrack = stream.getVideoTracks()[0]
+        if (videoTrack) {
+          setActiveCameraId(videoTrack.getSettings().deviceId || '')
+        }
         if (sfuConnectionRef.current) {
           // 传入 stream 以携带 msid：SFU 转发后订阅端靠 msid 把流归属到对应用户
           await sfuConnectionRef.current.replaceVideoTrack(videoTrack, stream)
@@ -44,14 +49,56 @@ export function useLocalMedia({ sfuConnectionRef, currentRoomId }: UseLocalMedia
         return
       }
     } else {
-      if (sfuConnectionRef.current) {
-        sfuConnectionRef.current.muteVideo(videoOn)
+      if (videoOn) {
+        // 关闭摄像头：真正停止发布（不再发送黑帧浪费上行带宽）
+        await sfuConnectionRef.current?.unpublishCamera()
+      } else if (localStreamRef.current.getVideoTracks().length > 0) {
+        // 重新开启：恢复到同一 sender（无需重新协商）
+        const videoTrack = localStreamRef.current.getVideoTracks()[0]
+        await sfuConnectionRef.current?.replaceVideoTrack(videoTrack, localStreamRef.current)
       }
     }
     const nextVideoOn = !videoOn
     setVideoOn(nextVideoOn)
     syncMediaState(nextVideoOn, audioOn)
   }, [videoOn, audioOn, sfuConnectionRef, syncMediaState])
+
+  // 刷新可用摄像头列表（打开设备选择菜单时调用）
+  const refreshCameraDevices = useCallback(async () => {
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices()
+      setCameraDevices(devices.filter(d => d.kind === 'videoinput'))
+    } catch (error) {
+      console.error('[useLocalMedia] enumerateDevices failed:', error)
+    }
+  }, [])
+
+  // 切换摄像头设备：replaceTrack 替换轨道（SSRC 不变，SFU 无需重新协商）
+  const switchCamera = useCallback(async (deviceId: string) => {
+    if (!localStreamRef.current) return
+    try {
+      const newStream = await navigator.mediaDevices.getUserMedia({
+        video: { deviceId: { exact: deviceId } },
+        audio: false,
+      })
+      const newTrack = newStream.getVideoTracks()[0]
+      if (!newTrack) return
+      newTrack.enabled = videoOn
+      await sfuConnectionRef.current?.replaceVideoTrack(newTrack, localStreamRef.current)
+
+      // 更新本地预览流：移除旧视频轨，加入新轨
+      const oldTracks = localStreamRef.current.getVideoTracks()
+      oldTracks.forEach(t => {
+        localStreamRef.current!.removeTrack(t)
+        t.stop()
+      })
+      localStreamRef.current.addTrack(newTrack)
+      setLocalStream(new MediaStream(localStreamRef.current.getTracks()))
+      setActiveCameraId(deviceId)
+    } catch (error) {
+      console.error('[useLocalMedia] switchCamera failed:', error)
+    }
+  }, [sfuConnectionRef, videoOn])
 
   const toggleAudio = useCallback(() => {
     if (!localStreamRef.current) return
@@ -125,10 +172,14 @@ export function useLocalMedia({ sfuConnectionRef, currentRoomId }: UseLocalMedia
     screenStream,
     localStreamRef,
     screenStreamRef,
+    cameraDevices,
+    activeCameraId,
     toggleVideo,
     toggleAudio,
     toggleScreenShare,
     stopScreenShare,
     cleanupLocalMedia,
+    refreshCameraDevices,
+    switchCamera,
   }
 }

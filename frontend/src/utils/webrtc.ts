@@ -11,15 +11,15 @@ interface SSRCInfo {
   stream_id: string
   rid?: string
 }
-
 interface SFUMessage {
   type: 'join' | 'offer' | 'answer' | 'ice-candidate' | 'joined' | 'error'
-    | 'ssrc_mapping' | 'muted' | 'subscribe' | 'unsubscribe'
+    | 'ssrc_mapping' | 'muted' | 'video_state' | 'subscribe' | 'unsubscribe'
   room_id?: number
   user_id?: number
   target_user_id?: number
   kind?: string
   stream_id?: string
+  quality?: string
   sdp?: string
   candidate?: string
   sdp_m_line_index?: number
@@ -35,11 +35,16 @@ export class SFUConnection {
   private roomId: number
   private userId: number
   private sfuToken: string
+  // 集群模式：房间所在 SFU 实例的 WebSocket 地址（join 响应下发；为空时回退 VITE_SFU_HOST）
+  private sfuUrl: string
+  // 远端流元信息：streamId -> { userId, kind, rid }（用于区分摄像头/屏幕共享流）
+  private streamMeta: Map<string, { userId: number; kind: string; rid: string }> = new Map()
   private localStream: MediaStream | null = null
   private screenStream: MediaStream | null = null
   // 摄像头轨道（可能晚于 connect 发布：默认以音频入会，并机时才 replaceVideoTrack）
   private cameraTrack: MediaStreamTrack | null = null
   private cameraStream: MediaStream | null = null
+  private cameraSender: RTCRtpSender | null = null
   private remoteStreams: Map<number, MediaStream> = new Map()
   // SSRC 到 UserID 的映射表（由 SFU 信令填充）
   private ssrcToUserId: Map<number, number> = new Map()
@@ -76,7 +81,8 @@ export class SFUConnection {
     onConnected: () => void,
     onDisconnected: () => void,
     onError: (error: string) => void,
-    mediaE2EEManager?: MediaE2EEManager | null
+    mediaE2EEManager?: MediaE2EEManager | null,
+    sfuUrl?: string
   ) {
     this.roomId = roomId
     this.userId = userId
@@ -86,11 +92,14 @@ export class SFUConnection {
     this.onDisconnected = onDisconnected
     this.onError = onError
     this.mediaE2EEManager = mediaE2EEManager ?? null
+    this.sfuUrl = sfuUrl || ''
   }
 
   private getWsUrl(): string {
-    const wsProtocol = SFU_HOST.startsWith('https') ? 'wss:' : 'ws:'
-    const wsHost = SFU_HOST.replace(/^https?:\/\//, '')
+    // 集群模式下优先使用房间所在实例的地址，否则回退到全局配置
+    const host = this.sfuUrl || SFU_HOST
+    const wsProtocol = host.startsWith('https') || host.startsWith('wss') ? 'wss:' : 'ws:'
+    const wsHost = host.replace(/^wss?:\/\//, '').replace(/^https?:\/\//, '')
     return `${wsProtocol}//${wsHost}/ws?token=${encodeURIComponent(this.sfuToken)}`
   }
 
@@ -251,8 +260,16 @@ export class SFUConnection {
       this.onError('WebSocket connection error')
     }
 
-    this.ws.onclose = (event) => {
+      this.ws.onclose = (event) => {
       console.log('[WebRTC] WebSocket closed, code:', event.code, 'reason:', event.reason)
+      // 4001：同账号在其他设备/标签页入会，本连接被服务端顶替。
+      // 此时不能自动重连（会反过来顶替新连接），直接停止。
+      if (event.code === 4001) {
+        this.isManualDisconnect = true
+        this.onError('同一账号在其他设备加入了会议，本连接已被替换')
+        this.onDisconnected()
+        return
+      }
       if (!this.isManualDisconnect && event.code !== 1000) {
         this.scheduleReconnect()
       }
@@ -349,6 +366,8 @@ export class SFUConnection {
             ssrc: s.ssrc,
             userId: s.user_id,
             streamId: s.stream_id,
+            rid: s.rid,
+            kind: s.kind,
           })))
         }
         break
@@ -419,6 +438,10 @@ export class SFUConnection {
   private async refreshSFUToken() {
     const response = await api.post(`/api/v1/rooms/${this.roomId}/sfu-token`)
     this.sfuToken = response.data.sfu_token
+    // 集群模式：实例可能变化，同步更新
+    if (response.data.sfu_url) {
+      this.sfuUrl = response.data.sfu_url
+    }
   }
 
   private send(message: SFUMessage) {
@@ -429,14 +452,15 @@ export class SFUConnection {
     }
   }
 
-  subscribeToUser(targetUserId: number, kind: string, streamId?: string) {
+  subscribeToUser(targetUserId: number, kind: string, streamId?: string, quality?: string) {
     this.send({
       type: 'subscribe',
       target_user_id: targetUserId,
       kind,
       stream_id: streamId,
+      quality,
     })
-    console.log('[WebRTC] Subscribed to', targetUserId, kind, streamId || '')
+    console.log('[WebRTC] Subscribed to', targetUserId, kind, streamId || '', quality || '')
   }
 
   unsubscribeFromUser(targetUserId: number, kind: string, streamId?: string) {
@@ -449,6 +473,12 @@ export class SFUConnection {
     console.log('[WebRTC] Unsubscribed from', targetUserId, kind, streamId || '')
   }
 
+  // 手动选择某成员的视频质量层：'auto'（自适应）| 'high' | 'low'
+  setVideoQuality(targetUserId: number, quality: 'auto' | 'high' | 'low') {
+    this.subscribeToUser(targetUserId, 'video', undefined, quality)
+    console.log('[WebRTC] Quality for', targetUserId, 'set to', quality)
+  }
+
   setVideoSubscriptions(userIds: number[]) {
     const newSet = new Set(userIds)
     // 期望集合跨重连保留；WS 未连接时发送会被丢弃，joined 后会统一重发
@@ -456,7 +486,8 @@ export class SFUConnection {
     this.syncVideoSubscriptions()
   }
 
-  // 将期望订阅集与已同步集做差量同步到 SFU
+  // 将期望订阅集与已同步集做差量同步到 SFU。
+  // 退订时带上摄像头流 ID：只退订摄像头，保留自动订阅的屏幕共享流。
   private syncVideoSubscriptions() {
     const newSet = this.desiredVideoSubscriptions
     for (const id of newSet) {
@@ -466,10 +497,21 @@ export class SFUConnection {
     }
     for (const id of this.subscribedVideos) {
       if (!newSet.has(id)) {
-        this.unsubscribeFromUser(id, 'video')
+        const cameraStreamId = this.cameraStreamIdOf(id)
+        this.unsubscribeFromUser(id, 'video', cameraStreamId || undefined)
       }
     }
     this.subscribedVideos = new Set(newSet)
+  }
+
+  // 根据流元信息找到某用户的摄像头流 ID（带 rid 的视频流）；找不到返回空串。
+  private cameraStreamIdOf(userId: number): string {
+    for (const [streamId, meta] of this.streamMeta.entries()) {
+      if (meta.userId === userId && meta.kind === 'video' && meta.rid) {
+        return streamId
+      }
+    }
+    return ''
   }
 
   disconnect() {
@@ -514,12 +556,16 @@ export class SFUConnection {
         this.cameraStream.getTracks().forEach(track => track.stop())
         this.cameraStream = null
       }
+      this.cameraSender = null
     }
 
     this.iceCandidates = []
     this.remoteStreams.clear()
     this.ssrcToUserId.clear()
     this.streamIdToUserId.clear()
+    this.streamMeta.clear()
+    // PC 已销毁：sender 引用随之失效（重连后由 publishCameraTrack 重建）
+    this.cameraSender = null
     this.pendingRemoteTracks = []
     this.subscribedVideos.clear()
     this.negotiationPromise = Promise.resolve()
@@ -545,13 +591,22 @@ export class SFUConnection {
   }
 
   muteVideo(muted: boolean) {
-    this.pc?.getSenders()
-      .filter(s => s.track?.kind === 'video')
-      .forEach(s => {
-        if (s.track) s.track.enabled = !muted
-      })
     if (this.cameraTrack) {
       this.cameraTrack.enabled = !muted
+    }
+    this.pc?.getSenders().forEach(s => {
+      if (s.track?.kind === 'video') s.track.enabled = !muted
+    })
+  }
+
+  // 关闭摄像头时真正停止发布（replaceTrack(null)），不再发送黑帧浪费上行带宽；
+  // 重新开启时用 replaceTrack 恢复同一 sender/SSRC，SFU 无需重新协商。
+  async unpublishCamera(): Promise<void> {
+    if (!this.pc || !this.cameraSender || !this.cameraTrack) return
+    try {
+      await this.cameraSender.replaceTrack(null)
+    } catch (err) {
+      console.warn('[WebRTC] unpublishCamera failed:', err)
     }
   }
 
@@ -559,12 +614,16 @@ export class SFUConnection {
   async replaceVideoTrack(newTrack: MediaStreamTrack, stream?: MediaStream) {
     if (!this.pc) return
 
-    // 已存在摄像头 sender：直接替换轨道，无需重新协商
-    const existingSender = this.pc.getSenders().find((s) => s.track?.kind === 'video')
-    if (existingSender) {
+    // 已存在摄像头 sender：直接替换轨道，无需重新协商。
+    // 注：unpublishCamera 后 sender 保留（track 为 null），republish 同样走这里。
+    const existingSender = this.cameraSender
+      ?? this.pc.getSenders().find((s) => s.track?.kind === 'video')
+    if (existingSender && (existingSender.track === null || existingSender.track?.kind === 'video')) {
       await existingSender.replaceTrack(newTrack)
+      this.cameraSender = existingSender
       this.cameraTrack = newTrack
       if (stream) this.cameraStream = stream
+      this.mediaE2EEManager?.attachSender(existingSender, newTrack)
       return
     }
 
@@ -582,6 +641,7 @@ export class SFUConnection {
   private publishCameraTrack(newTrack: MediaStreamTrack, stream?: MediaStream) {
     if (!this.pc) return
 
+    let sender: RTCRtpSender | null = null
     if (this.canUseSimulcast()) {
       try {
         const transceiver = this.pc.addTransceiver(newTrack, {
@@ -592,18 +652,20 @@ export class SFUConnection {
             { rid: 'low', maxBitrate: 250_000, scaleResolutionDownBy: 4 },
           ],
         })
+        sender = transceiver.sender
         this.mediaE2EEManager?.attachSender(transceiver.sender, newTrack)
         console.log('[WebRTC] Camera track published with simulcast (high/low)')
       } catch (err) {
         console.warn('[WebRTC] addTransceiver simulcast failed, fallback to addTrack:', err)
-        const sender = this.pc.addTrack(newTrack, stream ?? new MediaStream([newTrack]))
+        sender = this.pc.addTrack(newTrack, stream ?? new MediaStream([newTrack]))
         this.mediaE2EEManager?.attachSender(sender, newTrack)
       }
     } else {
-      const sender = this.pc.addTrack(newTrack, stream ?? new MediaStream([newTrack]))
+      sender = this.pc.addTrack(newTrack, stream ?? new MediaStream([newTrack]))
       this.mediaE2EEManager?.attachSender(sender, newTrack)
     }
 
+    this.cameraSender = sender
     this.cameraTrack = newTrack
     if (stream) this.cameraStream = stream
   }
@@ -637,11 +699,12 @@ export class SFUConnection {
   }
 
   // 批量设置 SSRC / 媒体流ID 映射，并尝试归属此前未识别的远端轨道
-  setSsrcMappings(mappings: { ssrc: number; userId: number; streamId?: string }[]) {
-    mappings.forEach(({ ssrc, userId, streamId }) => {
+  setSsrcMappings(mappings: { ssrc: number; userId: number; streamId?: string; rid?: string; kind?: string }[]) {
+    mappings.forEach(({ ssrc, userId, streamId, rid, kind }) => {
       this.ssrcToUserId.set(ssrc, userId)
       if (streamId) {
         this.streamIdToUserId.set(streamId, userId)
+        this.streamMeta.set(streamId, { userId, kind: kind || 'video', rid: rid || '' })
       }
     })
     this.pendingRemoteTracks = this.pendingRemoteTracks.filter(({ ssrc, streamId, track, stream }) => {
@@ -652,6 +715,11 @@ export class SFUConnection {
       return false
     })
     console.log(`[WebRTC] Bulk SSRC mappings set: ${mappings.length} entries`)
+  }
+
+  // 查询某个远端流的元信息（kind: audio/video，rid: simulcast 层标识，空串表示屏幕共享/单层流）
+  getStreamMeta(streamId: string): { userId: number; kind: string; rid: string } | undefined {
+    return this.streamMeta.get(streamId)
   }
 
   // 设置用户名映射

@@ -1,6 +1,9 @@
 const MAGIC = new Uint8Array([0x4D, 0x45, 0x32, 0x45]) // "ME2E"
-const VERSION = 1
-const HEADER_SIZE = 4 + 1 + 4 + 12 // magic + version + epoch + iv = 21 bytes
+const VERSION = 2
+// 头部：magic(4) + version(1) + epoch(4) + counter(4) + iv(12) = 25 字节
+// counter 为发送方单调递增序号，接收方据此做重放防护（滑动窗口）
+const HEADER_SIZE = 4 + 1 + 4 + 4 + 12
+const REPLAY_WINDOW_SIZE = 128
 
 interface SendKeyState {
   epoch: number
@@ -34,7 +37,43 @@ const diagnostics: Diagnostics = {
 }
 
 let currentSendKey: SendKeyState | null = null
+let sendCounter = 0
 let diagnosticsSeq = 0
+
+// 重放滑动窗口：trackId:epoch -> { highest, bitmap }（最低位代表 highest）
+const replayWindows = new Map<string, { highest: number; bitmap: bigint }>()
+
+// 检查并更新重放窗口。返回 true 表示首次出现（接受），false 表示重放/过旧（丢弃）。
+function checkAndUpdateReplay(windowKey: string, counter: number): boolean {
+  let win = replayWindows.get(windowKey)
+  if (!win) {
+    win = { highest: counter, bitmap: 1n }
+    replayWindows.set(windowKey, win)
+    return true
+  }
+  if (counter > win.highest) {
+    const shift = counter - win.highest
+    if (shift >= REPLAY_WINDOW_SIZE) {
+      win.bitmap = 1n
+    } else {
+      win.bitmap = (win.bitmap << BigInt(shift)) | 1n
+      const mask = (1n << BigInt(REPLAY_WINDOW_SIZE)) - 1n
+      win.bitmap &= mask
+    }
+    win.highest = counter
+    return true
+  }
+  const offset = win.highest - counter
+  if (offset >= REPLAY_WINDOW_SIZE) {
+    return false
+  }
+  const bit = 1n << BigInt(offset)
+  if ((win.bitmap & bit) !== 0n) {
+    return false
+  }
+  win.bitmap |= bit
+  return true
+}
 
 function report(type: string, details: Record<string, unknown> = {}) {
   diagnosticsSeq++
@@ -47,25 +86,27 @@ function report(type: string, details: Record<string, unknown> = {}) {
   })
 }
 
-function encodeFrameHeader(epoch: number, iv: Uint8Array): Uint8Array {
+function encodeFrameHeader(epoch: number, counter: number, iv: Uint8Array): Uint8Array {
   const header = new Uint8Array(HEADER_SIZE)
   header.set(MAGIC, 0)
   header[4] = VERSION
   const view = new DataView(header.buffer)
   view.setUint32(5, epoch, false)
-  header.set(iv, 9)
+  view.setUint32(9, counter, false)
+  header.set(iv, 13)
   return header
 }
 
-function parseFrameHeader(data: ArrayBuffer): { epoch: number; iv: Uint8Array; payloadOffset: number } | null {
+function parseFrameHeader(data: ArrayBuffer): { epoch: number; counter: number; iv: Uint8Array; payloadOffset: number } | null {
   if (data.byteLength < HEADER_SIZE) return null
   const bytes = new Uint8Array(data)
   if (bytes[0] !== 0x4D || bytes[1] !== 0x45 || bytes[2] !== 0x32 || bytes[3] !== 0x45) return null
   if (bytes[4] !== VERSION) return null
   const view = new DataView(data)
   const epoch = view.getUint32(5, false)
-  const iv = bytes.slice(9, 21)
-  return { epoch, iv, payloadOffset: HEADER_SIZE }
+  const counter = view.getUint32(9, false)
+  const iv = bytes.slice(13, 25)
+  return { epoch, counter, iv, payloadOffset: HEADER_SIZE }
 }
 
 async function importAesKey(keyBase64: string): Promise<CryptoKey> {
@@ -80,7 +121,8 @@ async function encryptFrame(frameData: ArrayBuffer, key: CryptoKey, epoch: numbe
     key,
     frameData
   )
-  const header = encodeFrameHeader(epoch, iv)
+  sendCounter = (sendCounter + 1) >>> 0
+  const header = encodeFrameHeader(epoch, sendCounter, iv)
   const result = new Uint8Array(header.length + ciphertext.byteLength)
   result.set(header, 0)
   result.set(new Uint8Array(ciphertext), header.length)
@@ -138,6 +180,12 @@ onrtctransform = (event: RTCRtpTransformEvent) => {
           if (parsed) {
             const keyEntry = receiveKeys.get(`${options.trackId}:${parsed.epoch}`)
             if (keyEntry) {
+              // 重放防护：同一 (track, epoch) 内帧序号必须未见过且在窗口内
+              if (!checkAndUpdateReplay(`${options.trackId}:${parsed.epoch}`, parsed.counter)) {
+                diagnostics.unknownEpochs++
+                report('replay-detected', { trackId: options.trackId, epoch: parsed.epoch })
+                continue
+              }
               const decrypted = await decryptFrame(value.data, keyEntry.key)
               if (decrypted) {
                 value.data = decrypted
@@ -204,7 +252,9 @@ onmessage = (event: MessageEvent) => {
 
     case 'clear':
       currentSendKey = null
+      sendCounter = 0
       receiveKeys.clear()
+      replayWindows.clear()
       report('cleared')
       break
   }

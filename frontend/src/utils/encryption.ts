@@ -283,6 +283,8 @@ export const hasSavedKeyStore = (): boolean => {
 export class GroupE2EEManager {
   private identityKeyPair: KeyPair | null = null
   private pairwiseSharedKeys: Map<number, CryptoKey> = new Map()
+  // 成员原始公钥（base64）：用于计算指纹线下比对
+  private memberPublicKeys: Map<number, string> = new Map()
   private mySenderChain: SenderChain | null = null
   private peerSenderChains: Map<string, SenderChain> = new Map()
   private currentRoomMembers: Set<number> = new Set()
@@ -345,17 +347,15 @@ export class GroupE2EEManager {
   // ============= 初始化 =============
 
   async init(userId?: number): Promise<void> {
-    // 如果提供了 userId，尝试从内存缓存恢复
-    if (userId !== undefined) {
-      const restored = this.tryRestoreFromMemoryCache(userId)
-      if (restored) {
-        console.log('[E2EE] Keys restored from memory cache')
-        this.onStateChange?.(true)
-        return
-      }
+    // 1) 尝试从本设备加密存储恢复（刷新页面后继续解密历史消息、保持身份公钥稳定）
+    const restored = await this.tryRestoreFromDevice(userId)
+    if (restored) {
+      console.log('[E2EE] Keys restored from device-encrypted store')
+      this.onStateChange?.(this.isReady())
+      return
     }
 
-    // 生成新密钥对（每次页面刷新都重新生成，减少密钥暴露时间）
+    // 2) 生成新密钥对（首次在本设备使用）
     this.identityKeyPair = await generateKeyPair()
     console.log('[E2EE] New identity key pair generated')
 
@@ -367,39 +367,119 @@ export class GroupE2EEManager {
       epoch: this.currentEpoch,
     }
 
-    this.onStateChange?.(true)
+    this.onStateChange?.(this.isReady())
+    this.scheduleSave()
 
     // 通知指纹已就绪
     const fingerprint = await getPublicKeyFingerprint(this.identityKeyPair.publicKey)
     this.onFingerprintReady?.(fingerprint)
   }
 
-  /**
-   * 尝试从内存缓存恢复密钥
-   * 注意：私钥仅保留在内存中，不落地到持久化存储
-   * 页面刷新后需要重新生成密钥对并重新进行密钥交换
-   */
-  private tryRestoreFromMemoryCache(_userId: number): boolean {
-    // 当前版本：密钥仅保留在内存中，不持久化
-    // 如需跨页面恢复，可考虑用 sessionStorage + 用户密码派生密钥
-    // 但要注意：任何持久化存储都有被窃取的风险
-    return false
+  // 设备密钥：用于加密本地的 E2EE 密钥存储（随机生成，保存在 localStorage）。
+  // 注意：这只能防止直接拷贝密文，无法防御能读取 localStorage 的 XSS（文档已声明）。
+  private async getOrCreateDeviceSecret(): Promise<string> {
+    let secret = localStorage.getItem('e2ee_device_secret')
+    if (!secret) {
+      secret = arrayBufferToBase64(toArrayBuffer(crypto.getRandomValues(new Uint8Array(32))))
+      localStorage.setItem('e2ee_device_secret', secret)
+    }
+    return secret
+  }
+
+  private async tryRestoreFromDevice(_userId?: number): Promise<boolean> {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY)
+      if (!stored) return false
+      const { ciphertext, iv } = JSON.parse(stored)
+      const secret = await this.getOrCreateDeviceSecret()
+      const salt = getOrCreateSalt()
+      const encryptionKey = await pbkdf2Derive(secret, salt)
+      const encryptionKeyRaw = await crypto.subtle.exportKey('raw', encryptionKey)
+      const decrypted = await aesDecrypt(ciphertext, iv, arrayBufferToBase64(encryptionKeyRaw))
+      const data = JSON.parse(decrypted)
+
+      const privateKey = await crypto.subtle.importKey(
+        'jwk',
+        JSON.parse(data.identityPrivateKey),
+        { name: 'ECDH', namedCurve: 'P-256' },
+        true,
+        ['deriveKey']
+      )
+      this.identityKeyPair = { publicKey: data.identityPublicKey, privateKey }
+      this.currentEpoch = data.epoch ?? 0
+
+      // 恢复成员公钥并重新派生两两共享密钥（ECDH 结果与刷新前一致）
+      for (const [userIdStr, publicKey] of data.memberPublicKeys ?? []) {
+        const userId = Number(userIdStr)
+        try {
+          const sharedKey = await deriveSharedKey(privateKey, publicKey)
+          this.pairwiseSharedKeys.set(userId, sharedKey)
+          this.memberPublicKeys.set(userId, publicKey)
+          this.currentRoomMembers.add(userId)
+        } catch {
+          // 公钥损坏时跳过，等待对方重新广播
+        }
+      }
+
+      // 恢复对方的 Sender Chain（用于解密历史消息）
+      for (const entry of data.peerChains ?? []) {
+        this.peerSenderChains.set(`${entry.userId}:${entry.chain.epoch}`, entry.chain)
+      }
+
+      // 恢复自己的链后立即轮换到新 epoch：对端可能已丢失旧链，
+      // 新 epoch 的首条消息（messageNumber=0）会触发 Sender Key 重新分发
+      await this.rotateSenderChain()
+
+      const fingerprint = await getPublicKeyFingerprint(this.identityKeyPair.publicKey)
+      this.onFingerprintReady?.(fingerprint)
+      void this.refreshFingerprintCache()
+      return true
+    } catch {
+      return false
+    }
   }
 
   /**
-   * 保存当前密钥状态到内存（不持久化到存储）
-   *
-   * 安全设计原则：
-   * 1. 私钥永远不写入 localStorage/indexedDB
-   * 2. 私钥仅保留在 JS 堆内存中
-   * 3. 页面刷新或关闭后自动销毁
-   * 4. 减少密钥在内存中的暴露时间
+   * 保存当前密钥状态到本设备加密存储（PBKDF2 + 设备随机密钥）。
+   * 刷新页面后可恢复身份密钥、Sender Chain 与成员公钥，继续解密历史消息。
+   * 设计权衡：能读取 localStorage 的攻击者（XSS）本身就能窃取解密后的明文，
+   * 此处加密主要防止密文被直接拷贝复用。
    */
   async saveToStorage(_userId: number): Promise<void> {
-    // 当前不做任何持久化，仅保留在对象内存中
-    // 如果需要跨标签页支持，可以考虑用 BroadcastChannel + 临时内存共享
-    // 但永远不要把私钥写入持久化存储
-    console.log('[E2EE] Keys kept in memory only (no persistence)')
+    if (!this.identityKeyPair) return
+    try {
+      const privJwk = await crypto.subtle.exportKey('jwk', this.identityKeyPair.privateKey)
+      const data = {
+        identityPublicKey: this.identityKeyPair.publicKey,
+        identityPrivateKey: JSON.stringify(privJwk),
+        senderChain: this.mySenderChain,
+        epoch: this.currentEpoch,
+        peerChains: Array.from(this.peerSenderChains.entries()).map(([key, chain]) => ({
+          userId: Number(key.split(':')[0]),
+          chain,
+        })),
+        memberPublicKeys: Array.from(this.memberPublicKeys.entries()),
+      }
+      const secret = await this.getOrCreateDeviceSecret()
+      const salt = getOrCreateSalt()
+      const encryptionKey = await pbkdf2Derive(secret, salt)
+      const encryptionKeyRaw = await crypto.subtle.exportKey('raw', encryptionKey)
+      const { ciphertext, iv } = await aesEncrypt(JSON.stringify(data), arrayBufferToBase64(encryptionKeyRaw))
+      localStorage.setItem(STORAGE_KEY, JSON.stringify({ ciphertext, iv, version: 2 }))
+    } catch (e) {
+      console.warn('[E2EE] saveToStorage failed', e)
+    }
+  }
+
+  // 防抖保存：密钥高频变更（棘轮/成员变更）时合并写入
+  private saveTimer: ReturnType<typeof setTimeout> | null = null
+
+  private scheduleSave(): void {
+    if (this.saveTimer) clearTimeout(this.saveTimer)
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null
+      void this.saveToStorage(0)
+    }, 500)
   }
 
   getIdentityPublicKey(): string {
@@ -429,20 +509,24 @@ export class GroupE2EEManager {
 
     const sharedKey = await deriveSharedKey(this.identityKeyPair.privateKey, peerPublicKey)
     this.pairwiseSharedKeys.set(userId, sharedKey)
+    this.memberPublicKeys.set(userId, peerPublicKey)
     this.currentRoomMembers.add(userId)
 
     console.log(`[E2EE] Established shared key with user ${userId}`)
+    this.scheduleSave()
     this.checkReadyState()
   }
 
   removeMember(userId: number): void {
     this.pairwiseSharedKeys.delete(userId)
+    this.memberPublicKeys.delete(userId)
     for (const key of this.peerSenderChains.keys()) {
       if (key.startsWith(`${userId}:`)) {
         this.peerSenderChains.delete(key)
       }
     }
     this.currentRoomMembers.delete(userId)
+    this.scheduleSave()
     this.checkReadyState()
   }
 
@@ -455,10 +539,28 @@ export class GroupE2EEManager {
     return this.pairwiseSharedKeys.size > 0
   }
 
+  // 计算成员公钥指纹（SHA-256 前 8 位，格式 XXXX-XXXX）。
+  // 未与该成员建立共享密钥时返回 null（UI 据此提示等待协商）。
+  async getMemberFingerprintAsync(userId: number): Promise<string | null> {
+    const publicKey = this.memberPublicKeys.get(userId)
+    if (!publicKey) return null
+    return getPublicKeyFingerprint(publicKey)
+  }
+
   getMemberFingerprint(userId: number): string | null {
-    const chain = this.peerSenderChains.get(this.senderChainKey(userId, this.currentEpoch))
-    if (!chain) return null
-    return 'pending' // 需要对方公钥才能计算
+    const publicKey = this.memberPublicKeys.get(userId)
+    if (!publicKey) return null
+    // 同步版本：指纹计算是异步的，这里返回缓存的指纹
+    return this.fingerprintCache.get(userId) ?? null
+  }
+
+  private fingerprintCache: Map<number, string> = new Map()
+
+  private async refreshFingerprintCache(): Promise<void> {
+    for (const [userId, publicKey] of this.memberPublicKeys.entries()) {
+      const fingerprint = await getPublicKeyFingerprint(publicKey)
+      this.fingerprintCache.set(userId, fingerprint)
+    }
   }
 
   hasSharedKey(userId: number): boolean {
@@ -494,6 +596,7 @@ export class GroupE2EEManager {
       epoch: this.currentEpoch,
     }
     this.onStateChange?.(this.isReady())
+    this.scheduleSave()
     return this.currentEpoch
   }
 
@@ -552,6 +655,7 @@ export class GroupE2EEManager {
     this.tryProcessPendingMessages(senderId, epoch)
 
     console.log(`[E2EE] Installed sender key from user ${senderId}`)
+    this.scheduleSave()
   }
 
   // ============= 消息序号跳跃/丢包处理 =============
@@ -710,13 +814,14 @@ export class GroupE2EEManager {
 }
 
 /**
- * 安全清除 localStorage 中所有遗留的 E2EE 密钥数据
- * 注意：调用此方法后所有历史密钥都会被清除，需要重新进行密钥交换
+ * 安全清除 localStorage 中所有 E2EE 密钥数据（含设备密钥）。
+ * 用于显式登出或用户主动清除：调用后历史密钥全部销毁，需重新进行密钥交换。
  */
 export const clearLegacyKeyStore = (): void => {
   try {
     localStorage.removeItem(STORAGE_KEY)
     localStorage.removeItem(STORAGE_SALT)
+    localStorage.removeItem('e2ee_device_secret')
     // 清除可能存在的旧版本 key（带 user id后缀）
     const keysToRemove: string[] = []
     for (let i = 0; i < localStorage.length; i++) {
@@ -726,7 +831,7 @@ export const clearLegacyKeyStore = (): void => {
       }
     }
     keysToRemove.forEach(k => localStorage.removeItem(k))
-    console.log('[E2EE] Legacy key store cleared from localStorage')
+    console.log('[E2EE] Key store cleared from localStorage')
   } catch (e) {
     // 静默失败
   }
@@ -734,6 +839,5 @@ export const clearLegacyKeyStore = (): void => {
 
 // 全局单例
 export const groupE2EEManager = new GroupE2EEManager()
-
-// 初始化时立即清除所有旧的持久化密钥（安全最佳实践）
-clearLegacyKeyStore()
+// 注意：不再在模块加载时清除持久化密钥（saveToStorage 会写入本设备加密存储）。
+// 显式清除入口：authSlice.logout 与 Profile 页的“清除本设备 E2EE 密钥”按钮。

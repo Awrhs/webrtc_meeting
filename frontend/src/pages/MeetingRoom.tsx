@@ -5,6 +5,7 @@ import { Layout, Button, Space, Tag, message, Modal, Dropdown, MenuProps, Tabs }
 import {
   VideoCameraOutlined,
   VideoCameraFilled,
+  VideoCameraAddOutlined,
   AudioOutlined,
   AudioMutedOutlined,
   StopOutlined,
@@ -12,14 +13,16 @@ import {
   UnlockOutlined,
   DeleteOutlined,
   LogoutOutlined,
+  FileSearchOutlined,
 } from '@ant-design/icons'
 import { RootState, AppDispatch } from '@/store'
-import { joinRoom, getRoomMessages, addMessage, setConnected, clearCurrentRoom, updateMember, removeMember, lockRoom, deleteRoom } from '@/store/slices/roomSlice'
+import { joinRoom, getRoomMessages, addMessage, setConnected, clearCurrentRoom, updateMember, removeMember, lockRoom, deleteRoom, getAuditLogs } from '@/store/slices/roomSlice'
 import { MediaE2EEState, MediaE2EEManager } from '@/utils/mediaE2EE'
-import VideoGrid from '@/components/VideoGrid'
+import { api } from '@/utils/api'
+import VideoGrid, { RemoteStreamMeta } from '@/components/VideoGrid'
 import Chat from '@/components/Chat'
 import MemberList from '@/components/MemberList'
-import { JoinRoomResponse, RoomMember } from '@/types'
+import { JoinRoomResponse, RoomMember, AuditLog } from '@/types'
 import { useRemoteStreams } from '@/hooks/useRemoteStreams'
 import { useLocalMedia } from '@/hooks/useLocalMedia'
 import { useMeetingSignaling } from '@/hooks/useMeetingSignaling'
@@ -37,6 +40,14 @@ export default function MeetingRoom() {
 
   const [loading, setLoading] = useState(false)
   const [mediaE2EEState, setMediaE2EEState] = useState<MediaE2EEState>('disabled')
+  // 远端流元信息（streamId -> kind/rid），用于区分摄像头流与屏幕共享流
+  const [remoteStreamMeta, setRemoteStreamMeta] = useState<Map<string, RemoteStreamMeta>>(new Map())
+  // 私聊目标（null = 群聊视图）
+  const [privateTarget, setPrivateTarget] = useState<RoomMember | null>(null)
+  // 审计日志弹窗
+  const [auditLogsVisible, setAuditLogsVisible] = useState(false)
+  const [auditLogs, setAuditLogs] = useState<AuditLog[]>([])
+  const [auditLogsLoading, setAuditLogsLoading] = useState(false)
 
   const membersRef = useRef<RoomMember[]>([])
   const localStreamRef = useRef<MediaStream | null>(null)
@@ -67,6 +78,16 @@ export default function MeetingRoom() {
       if (userId !== 0) {
         removeRemoteStream(0, stream)
       }
+      // 记录流元信息（kind/rid）：VideoGrid 由此区分摄像头流与屏幕共享流
+      const meta = sfuConnectionRef.current?.getStreamMeta(stream.id)
+      if (meta) {
+        setRemoteStreamMeta(prev => {
+          if (prev.get(stream.id) === meta) return prev
+          const next = new Map(prev)
+          next.set(stream.id, meta)
+          return next
+        })
+      }
       addRemoteStream(userId, stream)
     },
     mediaE2EEManagerRef,
@@ -92,15 +113,52 @@ export default function MeetingRoom() {
     toggleAudio,
     toggleScreenShare,
     cleanupLocalMedia,
+    cameraDevices,
+    activeCameraId,
+    refreshCameraDevices,
+    switchCamera,
   } = useLocalMedia({ sfuConnectionRef, currentRoomId: currentRoom?.id })
 
   const signalingDisconnectRef = useRef<(() => void) | null>(null)
+
+  // 服务端记录离开：显式离开按钮 + 页面卸载（keepalive 请求会存活到页面关闭）。
+  // 断线未重连的用户由 Hub 宽限期机制自动补记。
+  const notifyServerLeave = useCallback(() => {
+    const roomId = currentRoom?.id || (id ? parseInt(id) : 0)
+    if (!roomId) return
+    const token = localStorage.getItem('token')
+    if (!token) return
+    try {
+      void fetch(`${api.defaults.baseURL}/api/v1/rooms/${roomId}/leave`, {
+        method: 'POST',
+        keepalive: true,
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+      })
+    } catch {
+      // 忽略：宽限期机制会兑底
+    }
+  }, [currentRoom?.id, id])
+
+  useEffect(() => {
+    const onHide = () => {
+      notifyServerLeave()
+    }
+    window.addEventListener('pagehide', onHide)
+    return () => {
+      window.removeEventListener('pagehide', onHide)
+    }
+  }, [notifyServerLeave])
 
   const leaveMeeting = useCallback(() => {
     cleanupLocalMedia()
     sfuDisconnect()
     signalingDisconnectRef.current?.()
     clearRemoteStreams()
+    setRemoteStreamMeta(new Map())
+    setPrivateTarget(null)
     setMediaE2EEState('disabled')
   }, [cleanupLocalMedia, sfuDisconnect, clearRemoteStreams])
 
@@ -149,10 +207,11 @@ export default function MeetingRoom() {
       })
 
     return () => {
+      notifyServerLeave()
       leaveMeetingRef.current?.()
       dispatch(clearCurrentRoom())
     }
-  }, [id, dispatch])
+  }, [id, dispatch, notifyServerLeave])
 
   const startMeeting = async (joinResult: JoinRoomResponse) => {
     await signaling.connectAndJoin(
@@ -166,6 +225,7 @@ export default function MeetingRoom() {
       parseInt(id!),
       currentUserId,
       joinResult.sfu_token,
+      joinResult.sfu_url,
     )
   }
 
@@ -174,10 +234,25 @@ export default function MeetingRoom() {
       title: '确认离开会议',
       content: '你确定要离开本次会议吗？',
       onOk: () => {
+        notifyServerLeave()
         leaveMeeting()
         navigate('/')
       },
     })
+  }
+
+  const handleShowAuditLogs = async () => {
+    if (!currentRoom) return
+    setAuditLogsVisible(true)
+    setAuditLogsLoading(true)
+    try {
+      const result = await dispatch(getAuditLogs({ roomId: currentRoom.id, limit: 50 })).unwrap()
+      setAuditLogs(result)
+    } catch (error: any) {
+      message.error(error || '获取审计日志失败')
+    } finally {
+      setAuditLogsLoading(false)
+    }
   }
 
   const handleLockRoom = async () => {
@@ -239,6 +314,17 @@ export default function MeetingRoom() {
       })
     }
 
+    // owner/admin 可查看审计日志
+    const currentMember = members.find(m => m.user_id === currentUserId)
+    if (currentMember && (currentMember.role === 'owner' || currentMember.role === 'admin')) {
+      items.push({
+        key: 'audit',
+        icon: <FileSearchOutlined />,
+        label: '审计日志',
+        onClick: handleShowAuditLogs,
+      })
+    }
+
     if (items.length > 0) {
       items.push({ type: 'divider' })
     }
@@ -254,6 +340,29 @@ export default function MeetingRoom() {
   }
 
   const items = buildMenuItems()
+
+  // 摄像头设备切换菜单
+  const cameraMenuItems: MenuProps['items'] = [
+    ...cameraDevices.map(d => ({
+      key: d.deviceId,
+      label: d.label || `摄像头 ${d.deviceId.slice(0, 8)}`,
+      disabled: d.deviceId === activeCameraId,
+    })),
+    { type: 'divider' as const },
+    { key: '__refresh', label: '刷新设备列表' },
+  ]
+
+  const auditActionText: Record<string, string> = {
+    kick: '踢出成员',
+    mute: '禁言',
+    unmute: '解除禁言',
+    set_admin: '设置管理员',
+    remove_admin: '撤销管理员',
+    transfer_owner: '转让房主',
+    lock_room: '锁定房间',
+    unlock_room: '解锁房间',
+    delete_room: '解散房间',
+  }
 
   const mediaE2EETag = () => {
     switch (mediaE2EEState) {
@@ -273,6 +382,37 @@ export default function MeetingRoom() {
   if (loading) {
     return <div>加载中...</div>
   }
+
+  const auditModal = (
+    <Modal
+      title="房间审计日志"
+      open={auditLogsVisible}
+      onCancel={() => setAuditLogsVisible(false)}
+      footer={[
+        <Button key="close" onClick={() => setAuditLogsVisible(false)}>关闭</Button>,
+      ]}
+      width={720}
+    >
+      {auditLogsLoading ? (
+        <div style={{ textAlign: 'center', padding: 24 }}>加载中...</div>
+      ) : auditLogs.length === 0 ? (
+        <div style={{ textAlign: 'center', padding: 24, color: '#999' }}>暂无审计记录</div>
+      ) : (
+        <div style={{ maxHeight: 400, overflowY: 'auto' }}>
+          {auditLogs.map((log: AuditLog) => (
+            <div key={log.id} style={{ padding: '6px 0', borderBottom: '1px solid #f0f0f0', fontSize: 13 }}>
+              <span style={{ color: '#888' }}>{new Date(log.created_at).toLocaleString()}</span>
+              {' '}
+              <Tag>{auditActionText[log.action] || log.action}</Tag>
+              <span>操作人 #{log.user_id}</span>
+              {log.target_id && <span> → 对象 #{log.target_id}</span>}
+              {log.ip_address && <span style={{ color: '#bbb' }}> ({log.ip_address})</span>}
+            </div>
+          ))}
+        </div>
+      )}
+    </Modal>
+  )
 
   return (
     <Layout style={{ height: '100vh' }}>
@@ -311,6 +451,7 @@ export default function MeetingRoom() {
             localStream={getMyRemoteStream()}
             screenStream={screenShare ? screenStream : null}
             remoteStreams={remoteStreams}
+            remoteStreamMeta={remoteStreamMeta}
           />
         </Content>
         <div
@@ -325,8 +466,25 @@ export default function MeetingRoom() {
           <Tabs
             defaultActiveKey="members"
             items={[
-              { key: 'members', label: '成员列表', children: <MemberList roomId={parseInt(id!)} members={members} currentUserId={currentUserId} permissions={myPermissions} /> },
-              { key: 'chat', label: '聊天', children: <Chat roomId={parseInt(id!)} messages={messages} signaling={signaling.signalingRef.current} /> },
+              { key: 'members', label: '成员列表', children: (
+                <MemberList
+                  roomId={parseInt(id!)}
+                  members={members}
+                  currentUserId={currentUserId}
+                  permissions={myPermissions}
+                  onStartPrivateChat={(member) => setPrivateTarget(member)}
+                  onSetVideoQuality={(userId, quality) => sfuConnectionRef.current?.setVideoQuality(userId, quality)}
+                />
+              ) },
+              { key: 'chat', label: privateTarget ? `私聊：${privateTarget.nickname}` : '聊天', children: (
+                <Chat
+                  roomId={parseInt(id!)}
+                  messages={messages}
+                  signaling={signaling.signalingRef.current}
+                  privateTarget={privateTarget}
+                  onClosePrivate={() => setPrivateTarget(null)}
+                />
+              ) },
             ]}
           />
           <div style={{ padding: 16, borderTop: '1px solid #f0f0f0' }}>
@@ -338,6 +496,24 @@ export default function MeetingRoom() {
                 icon={videoOn ? <VideoCameraFilled /> : <VideoCameraOutlined />}
                 onClick={toggleVideo}
               />
+              <Dropdown
+                menu={{
+                  items: cameraMenuItems,
+                  onClick: ({ key }) => {
+                    if (key === '__refresh') {
+                      void refreshCameraDevices()
+                    } else {
+                      void switchCamera(key)
+                    }
+                  },
+                }}
+                trigger={['click']}
+                onOpenChange={(open) => {
+                  if (open) void refreshCameraDevices()
+                }}
+              >
+                <Button shape="circle" size="large" icon={<VideoCameraAddOutlined />} title="切换摄像头" />
+              </Dropdown>
               <Button
                 type={audioOn ? 'primary' : 'default'}
                 danger={!audioOn}
@@ -358,6 +534,7 @@ export default function MeetingRoom() {
           </div>
         </div>
       </Layout>
+      {auditModal}
     </Layout>
   )
 }

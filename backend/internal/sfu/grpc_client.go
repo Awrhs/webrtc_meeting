@@ -86,6 +86,24 @@ func (c *ControlClient) MuteUser(roomID, userID uint, isMuted bool) error {
 	return nil
 }
 
+// SetVideoEnabled 启用/禁用用户视频轨道转发
+func (c *ControlClient) SetVideoEnabled(roomID, userID uint, enabled bool) error {
+	ctx, cancel := c.controlContext(5 * time.Second)
+	defer cancel()
+
+	_, err := c.client.SetVideoEnabled(ctx, &sfupb.SetVideoEnabledRequest{
+		RoomId:  uint32(roomID),
+		UserId:  uint32(userID),
+		Enabled: enabled,
+	})
+	if err != nil {
+		c.logger.Error("Failed to call SetVideoEnabled via gRPC", zap.Error(err))
+		return err
+	}
+
+	return nil
+}
+
 func (c *ControlClient) ClosePeerConnection(roomID, userID uint) error {
 	ctx, cancel := c.controlContext(5 * time.Second)
 	defer cancel()

@@ -81,4 +81,39 @@ export interface JoinRoomResponse {
   members: RoomMember[]
   my_permissions: Permission[]
   sfu_token: string
+  sfu_url?: string
+}
+
+// 审计日志
+export interface AuditLog {
+  id: number
+  room_id: number
+  user_id: number
+  target_id: number | null
+  action: string
+  details: string
+  ip_address: string
+  user_agent: string
+  created_at: string
+}
+
+// 登录设备记录
+export interface Device {
+  id: number
+  user_id: number
+  device_id: string
+  device_name: string
+  device_type: string
+  user_agent: string
+  ip: string
+  last_active: string
+  created_at: string
+}
+
+// 文件上传响应
+export interface UploadResult {
+  url: string
+  name: string
+  size: number
+  type: 'image' | 'file' | 'text' | 'system'
 }

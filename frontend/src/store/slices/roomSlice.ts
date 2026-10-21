@@ -82,6 +82,21 @@ export const getRoomMessages = createAsyncThunk(
   }
 )
 
+// 查询审计日志（owner/admin）
+export const getAuditLogs = createAsyncThunk(
+  'room/getAuditLogs',
+  async ({ roomId, limit }: { roomId: number; limit?: number }, { rejectWithValue }) => {
+    try {
+      const response = await api.get(`/api/v1/rooms/${roomId}/audit-logs`, {
+        params: { limit: limit || 50 },
+      })
+      return response.data.audit_logs
+    } catch (error: any) {
+      return rejectWithValue(error.response?.data?.error || '获取审计日志失败')
+    }
+  }
+)
+
 // 踢出成员
 export const kickMember = createAsyncThunk(
   'room/kickMember',
