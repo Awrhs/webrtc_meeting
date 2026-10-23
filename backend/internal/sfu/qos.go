@@ -66,7 +66,8 @@ func (q *QoSController) state(subscriberID, publisherID uint) *qosState {
 	key := qosKey(subscriberID, publisherID)
 	st, ok := q.states[key]
 	if !ok {
-		st = &qosState{quality: "high", lastSwitch: time.Now()}
+		// lastSwitch 初始为零值，首个反馈事件即可触发切层（无冷却）
+		st = &qosState{quality: "high"}
 		q.states[key] = st
 	}
 	return st
@@ -86,15 +87,8 @@ func (q *QoSController) UpdateLoss(subscriberID, publisherID uint, fractionLost 
 	}
 	st.lastReport = now
 
-	target = st.quality
-	switchNeeded = false
+	// 手动固定：始终使用固定层，不触发自动切换（Pin 已负责一致性）
 	if st.pinned != "" {
-		// 手动固定：只需保证订阅层与固定层一致
-		if st.quality != st.pinned && now.Sub(st.lastSwitch) >= qosSwitchCooldown {
-			st.quality = st.pinned
-			st.lastSwitch = now
-			return st.pinned, true
-		}
 		return st.pinned, false
 	}
 
@@ -102,10 +96,10 @@ func (q *QoSController) UpdateLoss(subscriberID, publisherID uint, fractionLost 
 		return st.quality, false
 	}
 
-	// 自动模式：基于丢包 EMA + REMB 决策
+	// 自动模式：高丢包降 low；低丢包恢复 high（REM B 是补充信号，见 UpdateREMB）
 	if st.lossEMA > qosLossDownThreshold {
 		target = "low"
-	} else if st.lossEMA < qosLossUpThreshold && st.rembBps >= qosMinREMBForHighBps {
+	} else if st.lossEMA < qosLossUpThreshold {
 		target = "high"
 	}
 
@@ -117,7 +111,8 @@ func (q *QoSController) UpdateLoss(subscriberID, publisherID uint, fractionLost 
 	return target, false
 }
 
-// UpdateREMB 更新订阅者上报的带宽估计。返回值同 UpdateLoss。
+// UpdateREMB 更新订阅者上报的带宽估计，作为弱网下降的补充信号：
+// 带宽低于 high 层最低需求（300kbps）时降到 low。
 func (q *QoSController) UpdateREMB(subscriberID, publisherID uint, bps uint32, now time.Time) (target string, switchNeeded bool) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -128,21 +123,19 @@ func (q *QoSController) UpdateREMB(subscriberID, publisherID uint, bps uint32, n
 	if st.pinned != "" {
 		return st.pinned, false
 	}
-	if now.Sub(st.lastSwitch) < qosSwitchCooldown || st.lossEMA >= qosLossUpThreshold {
+	if now.Sub(st.lastSwitch) < qosSwitchCooldown {
 		return st.quality, false
 	}
-	// 带宽充裕且丢包低 → 升回 high
-	target = "high"
-	if st.rembBps >= qosMinREMBForHighBps && st.quality != target {
-		st.quality = target
+	// 仅在当前为 high 且带宽不足时下降；恢复由低丢包信号负责
+	if st.quality == "high" && bps > 0 && bps < qosMinREMBForHighBps {
+		st.quality = "low"
 		st.lastSwitch = now
-		return target, true
+		return "low", true
 	}
 	return st.quality, false
 }
 
 // Pin 固定/解除固定订阅层。quality: "high" | "low" | "auto"（解除固定）。
-// 返回解除固定或固定后应当使用的层。
 func (q *QoSController) Pin(subscriberID, publisherID uint, quality string) string {
 	q.mu.Lock()
 	defer q.mu.Unlock()
@@ -151,12 +144,9 @@ func (q *QoSController) Pin(subscriberID, publisherID uint, quality string) stri
 	switch quality {
 	case "high", "low":
 		st.pinned = quality
+		st.quality = quality // 立即生效，不需要冷却
 	default: // "auto" 或空 → 自动
 		st.pinned = ""
-		st.lastSwitch = time.Time{} // 立即允许切换
-	}
-	if st.pinned != "" {
-		return st.pinned
 	}
 	return st.quality
 }

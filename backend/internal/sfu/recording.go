@@ -69,7 +69,7 @@ func parseVP8FrameInfo(frame []byte) (uint16, uint16) {
 	if len(frame) < 10 {
 		return 0, 0
 	}
-	if frame[3] != 0x9d || frame[4] != 0x01 || frame[5] != 0x23 {
+	if frame[3] != 0x9d || frame[4] != 0x01 || frame[5] != 0x2a {
 		return 0, 0
 	}
 	w := uint16(frame[6]&0x3f)<<8 | uint16(frame[7])

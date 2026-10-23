@@ -78,6 +78,9 @@ services:
       COTURN_PASSWORD: ${COTURN_PASSWORD:-password}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080,http://localhost,http://127.0.0.1}
       SFU_ALLOW_UNAUTHENTICATED_DEV: ${SFU_ALLOW_UNAUTHENTICATED_DEV:-false}
+      UPLOAD_DIR: /data/uploads
+      UPLOAD_MAX_BYTES: ${UPLOAD_MAX_BYTES:-20971520}
+      PRESENCE_GRACE_SECONDS: ${PRESENCE_GRACE_SECONDS:-90}
       HTTP_READ_TIMEOUT_SECONDS: ${HTTP_READ_TIMEOUT_SECONDS:-10}
       HTTP_WRITE_TIMEOUT_SECONDS: ${HTTP_WRITE_TIMEOUT_SECONDS:-10}
       SHUTDOWN_TIMEOUT_SECONDS: ${SHUTDOWN_TIMEOUT_SECONDS:-15}
@@ -88,6 +91,8 @@ services:
       RATE_LIMIT_SFU_MSG_PER_MINUTE: ${RATE_LIMIT_SFU_MSG_PER_MINUTE:-120}
     ports:
       - "8080:8080"
+    volumes:
+      - uploads_data:/data/uploads
     depends_on:
       - postgres
       - redis
@@ -121,8 +126,12 @@ services:
       SFU_ALLOW_UNAUTHENTICATED_DEV: ${SFU_ALLOW_UNAUTHENTICATED_DEV:-false}
       RATE_LIMIT_SFU_WS_PER_MINUTE: ${RATE_LIMIT_SFU_WS_PER_MINUTE:-20}
       RATE_LIMIT_SFU_MSG_PER_MINUTE: ${RATE_LIMIT_SFU_MSG_PER_MINUTE:-120}
+      SFU_PUBLIC_WS_URL: ${SFU_PUBLIC_WS_URL:-ws://localhost:8081}
+      SFU_RECORDING_DIR: ${SFU_RECORDING_DIR:-}
     ports:
       - "8081:8081"
+    volumes:
+      - sfu_recordings:/data/recordings
     depends_on:
       - postgres
       - redis
@@ -169,3 +178,5 @@ networks:
 
 volumes:
   postgres_data:
+  uploads_data:
+  sfu_recordings:

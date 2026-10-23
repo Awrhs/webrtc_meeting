@@ -513,6 +513,7 @@ export class GroupE2EEManager {
     this.currentRoomMembers.add(userId)
 
     console.log(`[E2EE] Established shared key with user ${userId}`)
+    void this.refreshFingerprintCache()
     this.scheduleSave()
     this.checkReadyState()
   }

@@ -323,10 +323,9 @@ func (s *roomService) LeaveRoom(roomID uint, userID uint) error {
 	s.redis.DeleteRoom(roomID)
 	s.redis.DeleteUserRooms(userID)
 
-	if count == 0 && !room.IsPermanent {
-		return s.roomRepo.Delete(roomID)
-	}
-
+	// 注意：临时房间在人数归零时不自动删除——断线宽限期场景下，
+	// 最后一个用户断线（宽限期内未重连）不应销毁房间，否则其他用户
+	// 短暂掉线后无法重新加入。房间仅在房主“解散房间”时删除。
 	return nil
 }
 

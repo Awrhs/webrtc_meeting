@@ -199,3 +199,59 @@ html, body, #root {
   background: #52c41a;
   color: white;
 }
+
+/* ==================== 移动端响应式（PWA） ==================== */
+
+/* 小屏幕（手机）：会议页改为上下布局，侧面板改为底部区域 */
+@media (max-width: 768px) {
+  .meeting-main-layout {
+    flex-direction: column !important;
+  }
+
+  /* 会议页右侧的成员/聊天面板：移动端改为底部固定区域 */
+  .meeting-side-panel {
+    width: 100% !important;
+    max-height: 45vh;
+    border-left: none !important;
+    border-top: 1px solid #f0f0f0 !important;
+  }
+
+  /* 屏幕共享大屏与侧栏也纵向排列 */
+  .video-grid-with-screen {
+    flex-direction: column !important;
+  }
+
+  .screen-share-sidebar {
+    width: 100% !important;
+    display: flex !important;
+    overflow-x: auto;
+  }
+
+  .screen-share-sidebar .video-container {
+    min-width: 140px;
+  }
+
+  /* 网格在窄屏上最多两列 */
+  .video-grid {
+    gap: 4px !important;
+    padding: 4px !important;
+  }
+
+  .ant-message-notice-content {
+    max-width: 90vw;
+  }
+}
+
+/* 超小屏：视频网格单列 */
+@media (max-width: 420px) {
+  .video-grid {
+    grid-template-columns: 1fr !important;
+  }
+}
+
+/* 安全区域适配（刘海屏 Home Indicator） */
+@supports (padding: env(safe-area-inset-bottom)) {
+  .meeting-control-bar {
+    padding-bottom: env(safe-area-inset-bottom);
+  }
+}

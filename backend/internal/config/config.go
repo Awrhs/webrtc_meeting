@@ -21,6 +21,8 @@ type Config struct {
 	SFUPort                    string
 	SFUGRPCPort                string
 	SFUAddr                    string
+	SFUInstanceID              string
+	SFUGRPCAddr                string
 	SFUPublicWSURL             string
 	SFURecordingDir            string
 	DatabaseDSN                string
@@ -109,6 +111,8 @@ func Load() *Config {
 		SFUPort:                    sfuPort,
 		SFUGRPCPort:                getEnv("SFU_GRPC_PORT", "50051"),
 		SFUAddr:                    getEnv("SFU_ADDR", "localhost:50051"),
+		SFUInstanceID:              getEnv("SFU_INSTANCE_ID", ""),
+		SFUGRPCAddr:                getEnv("SFU_GRPC_ADDR", ""),
 		SFUPublicWSURL:             getEnv("SFU_PUBLIC_WS_URL", "ws://localhost:"+sfuPort),
 		SFURecordingDir:            getEnv("SFU_RECORDING_DIR", ""),
 		DatabaseDSN:                dsn,

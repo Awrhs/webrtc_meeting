@@ -443,7 +443,7 @@ export default function MeetingRoom() {
           <Button type="primary">房间操作</Button>
         </Dropdown>
       </Header>
-      <Layout>
+      <Layout className="meeting-main-layout">
         <Content style={{ background: '#000', overflow: 'hidden' }}>
           <VideoGrid
             members={members}
@@ -455,6 +455,7 @@ export default function MeetingRoom() {
           />
         </Content>
         <div
+          className="meeting-side-panel"
           style={{
             width: 350,
             background: 'white',
@@ -487,7 +488,7 @@ export default function MeetingRoom() {
               ) },
             ]}
           />
-          <div style={{ padding: 16, borderTop: '1px solid #f0f0f0' }}>
+          <div className="meeting-control-bar" style={{ padding: 16, borderTop: '1px solid #f0f0f0' }}>
             <Space size="middle" style={{ width: '100%', justifyContent: 'center' }}>
               <Button
                 type={videoOn ? 'primary' : 'default'}

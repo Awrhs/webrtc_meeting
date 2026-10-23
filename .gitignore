@@ -133,3 +133,16 @@ config/local.yaml
 config/local.yml
 */config/local.yaml
 */config/local.yml
+
+# Node / frontend
+node_modules/
+frontend/dist/
+frontend/playwright-report/
+frontend/test-results/
+
+# Uploads / recordings (runtime data)
+uploads/
+recordings/
+*.ivf
+*.ogg
+*.rtp

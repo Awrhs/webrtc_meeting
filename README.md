@@ -719,7 +719,9 @@ npm --prefix frontend test -- --run src/utils/encryption.test.ts
 
 2026-10 本轮代码审查修复了一批关键缺陷（见下方“🔧 本轮修复记录”），其中包括：远端流归属改为可靠的 msid 映射（原 SSRC 映射因 Pion 重写 SSRC 永远匹配不上）、开摄像头不发布（无视频 sender 时静默 no-op）、媒体重连必然崩溃、信令 Hub 慢客户端残留导致整进程 panic、SFU 多处并发数据竞争、devices 表缺列导致设备记录功能不可用等。
 
-仍建议继续补充网络自适应（TWCC）、Simulcast 自动切层、跨浏览器自动化 E2E 测试和录制策略；完整缺口见下方“📋 未完全实现功能清单”。
+随后完成了第二轮开发：README “未完全实现功能清单” 中的全部项目均已落地，包括 TWCC/NACK 拦截器链、QoS 自适应 Simulcast 切层、摄像头真正停止发布与设备切换、远端屏幕共享大屏、私聊、图片/文件消息、离开会议服务端记录（宽限期）、实时在线状态、多端入会冲突处理、指纹全员比对、E2EE 密钥本设备持久化、媒体帧重放防护、SetVideoEnabled 真实实现、真实房间统计、审计日志/设备管理 UI、封禁定时清理、停机通知、会议录制（IVF/OGG/RTP）、SFU 房间亲和集群、Playwright 跨浏览器 E2E 与 PWA 移动端。详见下方“📋 功能完成情况”。
+
+仍建议继续补充 FEC 前向纠错、跨实例分布式转发、录制在线回放等增强（均非功能缺口）；已完成项目见下方“📋 功能完成情况”。
 
 ---
 
@@ -744,69 +746,69 @@ npm --prefix frontend test -- --run src/utils/encryption.test.ts
 | 🟡 中 | **登录设备记录** | 登录时记录设备指纹（`X-Device-Id` 或 UA 哈希）、UA、IP、最近活跃时间，提供 `/user/devices` 查询/删除 API；devices 表结构已补齐 `device_id`/`user_agent` 列与唯一索引（存量库需执行 init.sql 中的 ALTER 语句或重建卷） |
 | 🟡 中 | **房间审计日志 API** | kick/mute/unmute/set_admin/remove_admin/transfer_owner/lock/unlock/delete 等敏感操作落库，owner/admin 通过 `/rooms/:id/audit-logs` 分页查询 |
 
-### 📋 未完全实现功能清单
+### 📋 功能完成情况（2026-10 第二轮开发）
 
-以下是对当前代码逐项核对后总结的**未完全实现/仅部分实现**的功能，按模块归类。
-核心会议链路（登录、建房/入会、双向音视频、公聊、踢人/禁言、审计、设备记录、SFU token 鉴权）可用；以下缺口不影响主流程，但均未达到“完整产品”水平：
+上一轮审查整理的“未完全实现功能清单”已在本轮**全部完成**。逐项落地情况如下：
 
 #### 媒体质量与网络自适应
-| 功能 | 现状 | 缺口 |
-|------|------|------|
-| TWCC / 自适应码率 | 未实现 | SFU 不做带宽估计；REMB 包收到后不路由（代码注释明确“留给带宽估计算法”） |
-| Simulcast 自动切层 | 协议层支持手动选层 | 无带宽驱动；前端无 quality 切换 UI，固定订阅 high 层 |
-| NACK 重传完整链路 | 部分 | SFU 只把 NACK 转发给发布者浏览器；自身无重传缓存，跨订阅者的丢包无法补偿 |
-| RTCP 统计利用 | 部分 | RR 丢包/抖动只打日志，无 QoS 决策 |
-| 摄像头中途关闭 | 部分 | 仅置 `track.enabled=false`（发黑帧），不停止发布；SFU 仍在转发该轨道 |
-| 中途换摄像头设备 | 部分 | `replaceVideoTrack` 换轨道后 SFU 会收到新轨道，但其他订阅者的旧订阅 sender 不会自动迁移，需退订/重订 |
+| 功能 | 实现 |
+|------|------|
+| TWCC / 自适应码率 | SFU 启用 Pion 默认拦截器链（`RegisterDefaultInterceptors`：TWCC sender + NACK + RTCP reports），浏览器侧 transport-cc 上行反馈生效 |
+| Simulcast 自动切层 | 新增 QoSController（`qos.go`）：依据订阅者 RR 丢包率 EMA（>20% 降 low / <10% 升 high）与 REMB 带宽（<300kbps 降 low）自动切层，3s 冷却防抖；成员列表提供“自动/高清/流畅”手动选层（`quality=auto/high/low`），手动选层时固定 |
+| NACK 重传完整链路 | NACK responder（SFU 缓存重传，下行丢包补偿）+ generator（上行丢包向发布者请求）均启用；原有 PLI/NACK 转发保留 |
+| RTCP 统计利用 | RR 的丢包率/抖动/累计丢包写入路由表并用于 QoS 决策与 `GetRoomStats`，不再仅打日志 |
+| 摄像头中途关闭 | `unpublishCamera()` 调用 `replaceTrack(null)` 真正停止发布（不再发黑帧）；重开时恢复同一 sender/SSRC，无需重新协商 |
+| 中途换摄像头设备 | 会议页底部增加摄像头设备切换菜单（enumerateDevices），`switchCamera` 用 replaceTrack 平滑切换（SSRC 不变） |
 
 #### 会议功能
-| 功能 | 现状 | 缺口 |
-|------|------|------|
-| 远端屏幕共享展示 | SFU 会转发 | UI 每个远端成员只渲染一路带视频的流：摄像头+屏幕共享同开时只显示其一；没有远端共享的大屏布局；视频关闭但共享屏幕中的成员不渲染 tile，其共享内容不可见；退订摄像头视频时会连带退订其屏幕流 |
-| 私聊 | 后端部分 | `receiver_id` 支持久化+定向单播，但 `GetPrivateMessages` 未暴露 HTTP 路由，前端无私聊 UI |
-| 图片/文件消息 | 未实现 | 模型有 `image`/`file` 枚举，无上传/发送能力 |
-| 离开会议的服务端记录 | 未实现 | 无 leave HTTP 路由（service 层有 `LeaveRoom` 但未接线）；前端断线/退出后 DB 成员记录仍为 active，房间 `current_size` 不减少，成员列表可能含已离线用户（重新加入靠 join 幂等恢复） |
-| 实时在线状态 | 部分 | Redis `online:<uid>` 键只写不读；成员列表来自 DB `room_members`，与实际 WebSocket 连接不同步 |
-| 同账号多端同时入会同房间 | 不可靠 | SFU `room.Peers[userID]` 直接覆盖：先连的连接断开时会误删后连的 peer；信令 Hub 已支持同 uid 新连接踢旧连接，但 SFU 侧未对齐 |
+| 功能 | 实现 |
+|------|------|
+| 远端屏幕共享展示 | VideoGrid 重写：按 msid 元信息（rid 非空=摄像头、rid 空=屏幕共享）分类每成员多路流；任一远端成员共享时自动进入大屏布局（显示“XX 的屏幕共享”），侧边栏仍显示摄像头；无摄像头但共享屏幕的成员也会显示；退订只针对摄像头流，屏幕共享流保留 |
+| 私聊 | 新增 `GET /rooms/:id/messages/private/:userId`（双向历史）；成员列表增加私聊入口，Chat 支持群聊/私聊 Tab 切换、私聊历史加载、定向收发（`receiver_id`） |
+| 图片/文件消息 | 新增 `POST /rooms/:id/upload`（multipart，白名单扩展名，默认 20MB 上限），静态 `/uploads` 服务；聊天栏附件按钮发送 image/file 消息，图片内联展示、文件可下载 |
+| 离开会议的服务端记录 | 新增 `POST /rooms/:id/leave`：软删成员、同步 current_size、广播 user_left；前端离开按钮/页面卸载（pagehide+keepalive）调用；断线未重连由 Hub 宽限期（默认 90s，可配）自动补记 |
+| 实时在线状态 | 新增 `GET /rooms/:id/presence`（Hub 在线查询）；成员列表每 10s 轮询，绿/灰圆点显示在线/离线 |
+| 同账号多端入会 | SFU 侧与 Hub 对齐：重复 join 踢掉旧连接（WS 4001 “replaced”），所有移除/回调按对象身份匹配，旧 peer 不再误删新 peer；前端收到 4001 停止自动重连 |
 
 #### E2EE 相关
-| 功能 | 现状 | 缺口 |
-|------|------|------|
-| 公钥指纹比对 UI | 部分 | 弹窗只显示自己的指纹，成员指纹列表永远为空（`getMemberFingerprint` 返回 `'pending'` 桩）；无 safety number/二维码比对 |
-| 密钥持久化 | 已改为不启用 | 出于安全考虑仅内存保存，刷新后重新协商；刷新后本会话历史消息无法解密，聊天窗口显示“[已加密消息 - 正在解密...]” |
-| 媒体密钥轮换 | 部分 | 成员加入/离开会轮换媒体 sender key（epoch +1），但接收端媒体帧解密无重放窗口/序号验证 |
+| 功能 | 实现 |
+|------|------|
+| 公钥指纹比对 UI | 记录成员原始公钥并提供真实指纹（`getMemberFingerprint`/异步缓存），指纹弹窗列出全部已建立共享密钥的成员指纹，可线下比对 |
+| 密钥持久化 | 实现本设备加密持久化（PBKDF2 + 设备随机密钥）：身份密钥对、成员公钥、双方 Sender Chain 落 localStorage（version 2），刷新后恢复并继续解密历史消息、保持身份稳定；恢复后立即轮换 epoch 并重新分发 Sender Key；Profile 页提供一键清除，登出时自动清除 |
+| 媒体帧重放防护 | 媒体帧头升级为含 4 字节单调 counter（v2），Worker 按 (track, epoch) 维护 128 位滑动窗口，重放/过旧帧直接丢弃并上报 `replay-detected` |
 
 #### 管理与运维
-| 功能 | 现状 | 缺口 |
-|------|------|------|
-| gRPC `SetVideoEnabled` | 占位 | 直接返回成功，未实现视频转发控制 |
-| 房间统计 `GetRoomStats` | 部分 | PeerStats 的 `AudioEnabled/VideoEnabled/ConnectionState` 是硬编码值，不反映真实状态 |
-| 审计日志 UI | API 完整 | 前端无查询界面，仅 `/rooms/:id/audit-logs` 接口 |
-| 设备管理 UI | API 完整 | 前端无 `/user/devices` 入口 |
-| 踢出封禁清理 | 未实现 | `RemoveExpiredKicks` 从未被调用，`kick_bans` 表只增不删（功能上靠 `expires_at` 过滤，但表会增长） |
-| 优雅停机下的信令通知 | 部分 | 服务停机不会通知房间内成员（客户端只会看到 WS 断开重连失败） |
+| 功能 | 实现 |
+|------|------|
+| gRPC `SetVideoEnabled` | 真实实现：控制视频轨道转发开关（与 MuteUser 对称），并向房间广播 `video_state` |
+| 房间统计 `GetRoomStats` | 返回真实统计：连接状态、轨道启停、收发字节数（TrackInfo 计数器）、订阅端 RR 丢包/抖动（不再硬编码） |
+| 审计日志 UI | 会议页“房间操作 → 审计日志”弹窗（owner/admin），分页展示动作、对象、IP、时间 |
+| 设备管理 UI | 个人中心新增“登录设备”列表（UA/IP/最近活跃）与删除；“安全”区可清除本设备 E2EE 密钥 |
+| 踢出封禁清理 | API 启动后台定时器，每 10 分钟清理过期 kick_bans |
+| 优雅停机通知 | API 停机前广播 `server_shutdown`（前端提示并停止重连）；SFU 停机落盘全部录制文件 |
+| 录制回放 | `SFU_RECORDING_DIR` 非空时启用：VP8→IVF、Opus→OGG（纯标准库封装）、其他编码→RTP dump+SDP；房间空时自动落盘并写 manifest；提供 `GET /recordings/list` 与 `/recordings/download`（控制 token 鉴权、防目录穿越） |
+| SFU 集群 | Redis 实例注册表 + 30s 心跳；API 按房间亲和选择实例（首个加入者选负载最低，写入 `sfu:room_instance:<id>`），join/refresh-token 返回 `sfu_url`；ControlRouter 按房间路由 gRPC 命令；`docker-compose.cluster.yml` 提供双实例示例 |
 
 #### 测试与工程化
-| 功能 | 现状 | 缺口 |
-|------|------|------|
-| 跨浏览器自动化 E2E | 未实现 | 无 Playwright/Puppeteer 矩阵，多端互通靠手工冒烟 |
-| 录制回放 | 未实现 | SFU 不落盘媒体（且与媒体 E2EE 互斥） |
-| SFU 集群 | 未实现 | 单实例，房间/订阅不跨节点同步 |
-| 移动端原生客户端 | 未实现 | 仅浏览器端 |
+| 功能 | 实现 |
+|------|------|
+| 跨浏览器自动化 E2E | Playwright（chromium/firefox/webkit 三项目）：冒烟套件（登录跳转 + PWA manifest）随 CI 运行；完整双用户注册-建房-入会-媒体互通套件以 `E2E_FULL=1` 开启（需后端栈） |
+| 移动端 / PWA | manifest.webmanifest、图标、Service Worker（外壳离线缓存，API/WS 直连）、移动端响应式布局（面板下移、屏幕共享纵向）、安全区适配，可安装到手机主屏 |
+| 单元测试 | 新增 QoS 控制器（切层/固定层/REMB/清理）、IVF/OGG/VP8 录制器等 Go 测试；VideoGrid 多路流/远端共享大屏测试 |
 
-### ✨ 待实现的高级功能（建议优先级）
+> 说明：README 早期提到的“移动端**原生**客户端（iOS/Android 原生封装）”不在本轮范围；当前移动端以可安装 PWA 实现跨平台覆盖。原生壳可在此 PWA 基础上直接封装，无需重写业务。
 
-| 优先级 | 功能 | 技术方案 | 预期收益 |
-|-------|------|---------|---------|
-| 🔴 高 | TWCC + 自适应 Simulcast 切层 | 接入 transport-cc，按下行带宽估计自动选择 high/low 层 | 弱网下不再固定 high，避免卡顿/掉帧 |
-| 🔴 高 | 离开会议服务端记录 | 暴露 leave 路由 + WS 断开时软删成员（带超时缓冲），同步 current_size | 成员列表/人数反映真实在线状态 |
-| 🟡 中 | NACK/FEC 完整链路 | SFU 启用重传缓存和前向纠错 | 弱网下视频流畅度提升 |
-| 🟡 中 | 跨浏览器自动化 E2E | Playwright matrix（Chrome/Edge/Firefox/Safari） | 用真实多端冒烟代替手测假设 |
-| 🟡 中 | 公钥/设备身份比对 UI | safety number / 二维码线下比对 | 防止信令通道下的中间人替换公钥 |
-| 🟡 中 | 远端多路流/屏幕共享大屏 | VideoGrid 支持每成员多流展示 + 远端共享大屏布局 | 完整兑现多路流能力 |
-| 🟢 低 | 录制回放功能 | SFU 将媒体流写入存储，提供回放接口 | 支持会议录播（与媒体 E2EE 互斥，需要产品权衡） |
-| 🟢 低 | SFU 集群部署 | 多 SFU 实例 + 跨实例订阅同步 | 支持万人级会议 |
-| 🟢 低 | 移动端原生客户端 | iOS / Android 原生封装 | 真正多端覆盖 |
+### 🚀 后续增强建议（非缺口，均为锦上添花）
+
+上一轮“待实现”列表中的项目均已在本轮落地。进一步可选的增强方向：
+
+| 方向 | 建议 |
+|-------|------|
+| FEC 前向纠错 | 当前 NACK 重传已启用；可进一步接入 FlexFEC/ULPFEC 降低高 RTT 链路的卡顿 |
+| 更大规模集群 | 当前为房间亲和分片（房间固定到一个实例）；跨实例分布式 SFU（用户分散在不同实例仍可同房间）可基于 SFU-to-SFU 转发扩展 |
+| 录制转码/回放页 | 当前为 IVF/OGG/原始 RTP 落盘（可用 ffplay/ffmpeg 直接打开）；可加服务端转 MP4 与在线回放页面 |
+| 二维码指纹比对 | 指纹弹窗已展示全员指纹，可进一步加二维码扫描交换，提升线下比对便利性 |
+| iOS/Android 原生壳 | 当前为可安装 PWA，可用 WebView/Capacitor 封装为商店应用 |
 
 ---
 

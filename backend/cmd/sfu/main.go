@@ -8,6 +8,7 @@ import (
 	"conference-sfu/backend/pkg/logger"
 	"context"
 	"net/http"
+	"os"
 	"os/signal"
 	"syscall"
 	"time"
@@ -57,10 +58,22 @@ func main() {
 	// 集群模式：向共享 Redis 心跳注册本实例（API 服务器据此做房间亲和路由）。
 	// Redis 不可用时不注册，API 自动回退到单机默认实例。
 	if replayChecker != nil {
-		instanceID := sfu.DefaultInstanceID(cfg.SFUGRPCPort)
+		instanceID := cfg.SFUInstanceID
+		if instanceID == "" {
+			instanceID = sfu.DefaultInstanceID(cfg.SFUGRPCPort)
+		}
+		// 集群内 gRPC 广播地址：默认 hostname:grpcPort；SFU_GRPC_ADDR 可覆盖
+		grpcAddr := cfg.SFUGRPCAddr
+		if grpcAddr == "" {
+			host, err := os.Hostname()
+			if err != nil || host == "" {
+				host = "sfu"
+			}
+			grpcAddr = host + ":" + cfg.SFUGRPCPort
+		}
 		stopRegistration := sfu.StartInstanceRegistration(redisClient, repository.SFUInstance{
 			ID:        instanceID,
-			GRPCAddr:  cfg.SFUAddr,
+			GRPCAddr:  grpcAddr,
 			WSURL:     cfg.SFUPublicWSURL,
 			StartedAt: time.Now().Unix(),
 		}, log)
