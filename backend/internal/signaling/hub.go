@@ -212,6 +212,70 @@ func (h *Hub) Run() {
 		case action := <-h.removeFromRoom:
 			h.removeClientFromRoomNoLock(action.Client, action.RoomID)
 			h.logger.Info("Client removed from room", zap.Uint("userID", action.Client.userID), zap.Uint("roomID", action.RoomID))
+
+		case action := <-h.removeUserFromRoom:
+			// 显式离开：按用户 ID 把连接从房间移除（用户可能还在其他房间）
+			if client, ok := h.clients[action.UserID]; ok {
+				h.removeClientFromRoomNoLock(client, action.RoomID)
+				h.logger.Info("User removed from room by API", zap.Uint("userID", action.UserID), zap.Uint("roomID", action.RoomID))
+			}
+
+		case data := <-h.broadcastAll:
+			// 服务端全局通知（如停机公告）：发送给所有在线客户端
+			for _, client := range h.clients {
+				select {
+				case client.send <- data:
+				default:
+				}
+			}
+
+		case query := <-h.presenceQueries:
+			users := make([]uint, 0)
+			if room, ok := h.rooms[query.roomID]; ok {
+				for userID := range room {
+					users = append(users, userID)
+				}
+			}
+			query.resp <- users
+
+		case msg := <-h.checkLeave:
+			h.handleCheckLeave(msg)
+		}
+	}
+}
+
+// handleCheckLeave 宽限期结束仍未重连：服务端把成员标记为已离开并广播 user_left。
+// 已显式离开/被踢（DB 已软删）或已重新上线的成员无需处理。
+// 【注意】本方法在 Run goroutine 内调用，广播必须直接遍历，不能再走 h.broadcast
+// 通道（向无缓冲通道发送会与自身死锁）。
+func (h *Hub) handleCheckLeave(msg checkLeaveMsg) {
+	if room, ok := h.rooms[msg.roomID]; ok {
+		if _, stillOnline := room[msg.userID]; stillOnline {
+			return
+		}
+	}
+	if _, err := h.roomService.GetMemberRole(msg.roomID, msg.userID); err != nil {
+		return // 已不是房间成员（显式离开/被踢），无需处理
+	}
+	if err := h.roomService.LeaveRoom(msg.roomID, msg.userID); err != nil {
+		h.logger.Warn("Grace-period leave failed",
+			zap.Uint("roomID", msg.roomID), zap.Uint("userID", msg.userID), zap.Error(err))
+		return
+	}
+	h.logger.Info("Member marked left after grace period",
+		zap.Uint("roomID", msg.roomID), zap.Uint("userID", msg.userID))
+	leaveMsg := Message{
+		Type:   MessageTypeUserLeft,
+		RoomID: msg.roomID,
+		UserID: msg.userID,
+	}
+	raw := safeMarshal(leaveMsg, h.logger)
+	if room, ok := h.rooms[msg.roomID]; ok {
+		for _, client := range room {
+			select {
+			case client.send <- raw:
+			default:
+			}
 		}
 	}
 }

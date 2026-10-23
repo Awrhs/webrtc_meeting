@@ -7,9 +7,11 @@ interface UseSFUMediaOptions {
   onRemoteTrack: (userId: number, track: MediaStreamTrack, stream: MediaStream) => void
   mediaE2EEManagerRef: React.MutableRefObject<MediaE2EEManager | null>
   localStreamRef: React.MutableRefObject<MediaStream | null>
+  // 入会取得麦克风流后的回调（供 useLocalMedia 复用，避免重复申请麦克风）
+  onInitialStream?: (stream: MediaStream) => void
 }
 
-export function useSFUMedia({ onRemoteTrack, mediaE2EEManagerRef, localStreamRef }: UseSFUMediaOptions) {
+export function useSFUMedia({ onRemoteTrack, mediaE2EEManagerRef, localStreamRef, onInitialStream }: UseSFUMediaOptions) {
   const sfuConnectionRef = useRef<SFUConnection | null>(null)
   // 期望的视频订阅集合：MeetingRoom 的订阅 effect 可能在 SFU 连接建立前就执行，
   // 先记录下来，连接创建后统一同步给 SFUConnection（joined 后重发）
@@ -26,6 +28,7 @@ export function useSFUMedia({ onRemoteTrack, mediaE2EEManagerRef, localStreamRef
       localStreamRef.current = stream
       localStreamRef.current.getVideoTracks().forEach(track => { track.enabled = false })
       localStreamRef.current.getAudioTracks().forEach(track => { track.enabled = true })
+      onInitialStream?.(stream)
 
       const sfuConnection = new SFUConnection(
         roomId,

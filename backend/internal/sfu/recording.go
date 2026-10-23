@@ -42,9 +42,11 @@ func newIVFWriter(f *os.File, width, height uint16) (*ivfWriter, error) {
 	copy(header[12:], "VP80")
 	binary.LittleEndian.PutUint16(header[16:], width)
 	binary.LittleEndian.PutUint16(header[18:], height)
-	binary.LittleEndian.PutUint32(header[20:], 30) // 时基 denominator（30fps 近似）
-	binary.LittleEndian.PutUint32(header[24:], 1)  // numerator
-	binary.LittleEndian.PutUint32(header[28:], 0)  // frame count（结尾不回写也可播放）
+	// 时基使用 VP8 RTP 时钟 90kHz（numerator=1, denominator=90000），
+	// 这样 IVF 帧时间戳直接使用 RTP timestamp，播放速度正确
+	binary.LittleEndian.PutUint32(header[20:], 90000) // 时基 denominator
+	binary.LittleEndian.PutUint32(header[24:], 1)     // numerator
+	binary.LittleEndian.PutUint32(header[28:], 0)     // frame count（结尾不回写也可播放）
 	if _, err := f.Write(header); err != nil {
 		return nil, err
 	}
@@ -63,7 +65,7 @@ func (w *ivfWriter) writeFrame(data []byte, ts uint64) error {
 	return err
 }
 
-// parseVP8FrameInfo 从 VP8 关键帧的未压缩数据块解析宽高（0 表示解析失败）。
+// parseVP8FrameInfo 从 VP8 关键帧的未压缩数据块解析宽高（0 表示解析失败/非关键帧）。
 func parseVP8FrameInfo(frame []byte) (uint16, uint16) {
 	// frame tag(3) + start code(3) + width(2) + height(2)
 	if len(frame) < 10 {
@@ -77,21 +79,36 @@ func parseVP8FrameInfo(frame []byte) (uint16, uint16) {
 	return w, h
 }
 
+// vp8IsKeyframe 判断重组后的完整 VP8 帧是否为关键帧。
+func vp8IsKeyframe(frame []byte) bool {
+	if len(frame) < 3 {
+		return false
+	}
+	// 帧 tag 第一字节最低位 P=0 表示关键帧；再确认 start code
+	if frame[0]&0x01 != 0 {
+		return false
+	}
+	return len(frame) >= 6 && frame[3] == 0x9d && frame[4] == 0x01 && frame[5] == 0x2a
+}
+
 // vp8Depacketize 去掉 RTP 载荷头的 VP8 描述符，返回纯 VP8 数据。
-func vp8Depacketize(payload []byte) []byte {
+// RFC 7741 §4.2：每个 VP8 RTP 包都带至少 1 字节 Payload Descriptor。
+// 返回值第二位（isStart）反映 S 位（是否为帧的起始包），供录制时做帧重组。
+func vp8Depacketize(payload []byte) (data []byte, isStart bool) {
 	if len(payload) == 0 {
-		return nil
+		return nil, false
 	}
 	b0 := payload[0]
+	isStart = b0&0x10 != 0 // S bit
 	descLen := 1
 	if b0&0x80 != 0 { // X bit
 		if len(payload) < 2 {
-			return nil
+			return nil, false
 		}
 		b1 := payload[1]
 		if b1&0x80 != 0 { // I：PictureID（1 或 2 字节）
 			if len(payload) < descLen+1 {
-				return nil
+				return nil, false
 			}
 			descLen++
 			if payload[descLen]&0x80 != 0 {
@@ -106,9 +123,9 @@ func vp8Depacketize(payload []byte) []byte {
 		}
 	}
 	if len(payload) <= descLen {
-		return nil
+		return nil, false
 	}
-	return payload[descLen:]
+	return payload[descLen:], isStart
 }
 
 // ==================== OGG（Opus） ====================
@@ -169,8 +186,37 @@ func newOGGWriter(f *os.File, channels uint8, sampleRate uint32, serial uint32) 
 	return w, nil
 }
 
+// writePage 写入只含一个包且包长 < 255 字节的页（OpusHead/OpusTags 用）。
 func (w *oggWriter) writePage(data []byte, lastPacketInPage bool) error {
-	page := make([]byte, 0, 27+1+len(data))
+	if len(data) > 254 {
+		return w.writePacket(data)
+	}
+	return w.writePageWithSegments(data, []byte{byte(len(data))}, lastPacketInPage)
+}
+
+// writePacket 写入一个 Opus 包。正确处理 OGG 分节（lacing）：
+// 每段 255 字节，用多个 255 + 一个余数分节值表示大包。
+// 单个 OGG 页分节表上限 255，单包不超过 ~64KB（Opus 帧远小于此）。
+func (w *oggWriter) writePacket(opus []byte) error {
+	// Opus 默认 20ms 一包 @48kHz → 960 采样
+	w.samples += 960
+	w.granule = w.samples
+
+	var segments []byte
+	n := len(opus)
+	for n >= 255 {
+		segments = append(segments, 255)
+		n -= 255
+	}
+	segments = append(segments, byte(n))
+	if len(segments) > 255 {
+		return fmt.Errorf("opus packet too large for single ogg page")
+	}
+	return w.writePageWithSegments(opus, segments, false)
+}
+
+func (w *oggWriter) writePageWithSegments(data []byte, lacing []byte, lastPacketInPage bool) error {
+	page := make([]byte, 0, 27+len(lacing)+len(data))
 	page = append(page, 'O', 'g', 'g', 'S')
 	page = append(page, 0) // version
 	var hdrType byte
@@ -191,21 +237,14 @@ func (w *oggWriter) writePage(data []byte, lastPacketInPage bool) error {
 	binary.LittleEndian.PutUint32(pn, w.pageNo)
 	page = append(page, pn...)
 	page = append(page, 0, 0, 0, 0) // CRC 占位
-	page = append(page, 1)           // segment count
-	page = append(page, byte(len(data))) // lacing value（<=255）
+	page = append(page, byte(len(lacing)))
+	page = append(page, lacing...)
 	page = append(page, data...)
 
 	binary.LittleEndian.PutUint32(page[22:], oggCRC(page))
 	w.pageNo++
 	_, err := w.f.Write(page)
 	return err
-}
-
-func (w *oggWriter) writePacket(opus []byte) error {
-	// Opus 默认 20ms 一包 @48kHz → 960 采样
-	w.samples += 960
-	w.granule = w.samples
-	return w.writePage(opus, false)
 }
 
 // ==================== 原始 RTP dump（其他编码回退） ====================
@@ -301,15 +340,27 @@ func (r *trackRecorder) writeRTP(pkt *rtp.Packet) {
 
 	switch r.kind {
 	case "ivf":
-		payload := vp8Depacketize(pkt.Payload)
+		payload, isStart := vp8Depacketize(pkt.Payload)
 		if payload == nil {
 			return
 		}
+		if isStart {
+			// 新帧起始：丢弃上一未完成帧（丢包/录制中途加入），重新累积
+			r.frameBuf = append(r.frameBuf[:0], payload...)
+			r.frameTS = uint64(pkt.Timestamp)
+		} else if len(r.frameBuf) > 0 {
+			// 续包：只有在已收到起始包时才追加
+			r.frameBuf = append(r.frameBuf, payload...)
+		}
 		if pkt.Marker {
 			// 帧最后一个分片
-			r.frameBuf = append(r.frameBuf, payload...)
 			if !r.ivfNotInit {
-				// 首帧：从关键帧解析宽高并写 IVF 头（VP8 首帧必为关键帧）
+				// 只接受关键帧作为首帧（录制中途加入时会先收到 P 帧，跳过直到关键帧）
+				if !vp8IsKeyframe(r.frameBuf) {
+					r.frameBuf = r.frameBuf[:0]
+					return
+				}
+				// 从其未压缩数据头解析宽高并写 IVF 头
 				w, h := parseVP8FrameInfo(r.frameBuf)
 				if w > 0 && h > 0 {
 					r.gotWidth, r.gotHeight = w, h
@@ -322,15 +373,10 @@ func (r *trackRecorder) writeRTP(pkt *rtp.Packet) {
 				}
 			}
 			if r.ivf != nil {
-				_ = r.ivf.writeFrame(r.frameBuf, uint64(pkt.Timestamp))
+				_ = r.ivf.writeFrame(r.frameBuf, r.frameTS)
 				r.bytesWritten += uint64(len(r.frameBuf))
 			}
 			r.frameBuf = r.frameBuf[:0]
-		} else {
-			if len(r.frameBuf) == 0 {
-				r.frameTS = uint64(pkt.Timestamp)
-			}
-			r.frameBuf = append(r.frameBuf, payload...)
 		}
 	case "ogg":
 		if r.ogg != nil {

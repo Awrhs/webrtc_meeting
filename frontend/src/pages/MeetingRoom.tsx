@@ -42,6 +42,8 @@ export default function MeetingRoom() {
   const [mediaE2EEState, setMediaE2EEState] = useState<MediaE2EEState>('disabled')
   // 远端流元信息（streamId -> kind/rid），用于区分摄像头流与屏幕共享流
   const [remoteStreamMeta, setRemoteStreamMeta] = useState<Map<string, RemoteStreamMeta>>(new Map())
+  // 由 useLocalMedia 提供：注入入会时的麦克风流，供开启摄像头时复用
+  const initialStreamSetterRef = useRef<((s: MediaStream) => void) | null>(null)
   // 私聊目标（null = 群聊视图）
   const [privateTarget, setPrivateTarget] = useState<RoomMember | null>(null)
   // 审计日志弹窗
@@ -92,6 +94,7 @@ export default function MeetingRoom() {
     },
     mediaE2EEManagerRef,
     localStreamRef,
+    onInitialStream: (s) => initialStreamSetterRef.current?.(s),
   })
 
   // 视频选择性订阅策略：最多订阅前 6 个开启视频的用户
@@ -117,7 +120,12 @@ export default function MeetingRoom() {
     activeCameraId,
     refreshCameraDevices,
     switchCamera,
+    setInitialStream,
   } = useLocalMedia({ sfuConnectionRef, currentRoomId: currentRoom?.id })
+
+  useEffect(() => {
+    initialStreamSetterRef.current = setInitialStream
+  }, [setInitialStream])
 
   const signalingDisconnectRef = useRef<(() => void) | null>(null)
 

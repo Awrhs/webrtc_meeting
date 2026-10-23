@@ -22,14 +22,24 @@ func vp8Keyframe() []byte {
 }
 
 func TestVP8Depacketize(t *testing.T) {
-	// 无扩展位的起始包：描述符长度 1
+	// 起始包（S=1，无扩展位）：描述符长度 1
 	payload := vp8Keyframe()
-	got := vp8Depacketize(payload)
+	got, isStart := vp8Depacketize(payload)
 	if len(got) != len(payload)-1 {
 		t.Fatalf("depacketized length = %d, want %d", len(got), len(payload)-1)
 	}
+	if !isStart {
+		t.Fatal("expected S bit set on start packet")
+	}
 	if got[0] != 0x30 {
 		t.Fatalf("depacketized first byte = %#x, want VP8 frame tag", got[0])
+	}
+
+	// 续包（S=0）：仍剥离 1 字节描述符，isStart 为 false
+	cont := append([]byte{0x00}, 0xaa, 0xbb)
+	got2, isStart2 := vp8Depacketize(cont)
+	if isStart2 || len(got2) != 2 || got2[0] != 0xaa {
+		t.Fatalf("continuation depacketize = (%v,%v)", got2, isStart2)
 	}
 }
 
@@ -116,6 +126,44 @@ func TestTrackRecorder_IVFKeyframeFirst(t *testing.T) {
 	}
 	if !bytes.HasPrefix(data, []byte("DKIF")) {
 		t.Fatalf("recorder output is not IVF, first bytes: % x", data[:min(8, len(data))])
+	}
+}
+
+func TestTrackRecorder_IVFReassemblyAndDeltaWait(t *testing.T) {
+	dir := t.TempDir()
+	rec, err := newTrackRecorder(dir, "cam", webrtcCodecVP8(), "video", "stream")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 先到一个 P 帧（起始标记但非关键帧）：必须被丢弃，不能初始化 IVF
+	delta := append([]byte{0x11}, 0x00, 0x00, 0x00) // S=1, P=1
+	rec.writeRTP(&rtp.Packet{Header: rtp.Header{Marker: true, Timestamp: 9000, PayloadType: 96}, Payload: delta})
+	rec.mu.Lock()
+	deltaWrote := rec.ivf != nil
+	rec.mu.Unlock()
+	if deltaWrote {
+		t.Fatal("IVF must not be initialized from a non-keyframe")
+	}
+
+	// 分片的关键帧（两包）：start + continuation，验证 S 位重组
+	keyPayload, _ := vp8Depacketize(vp8Keyframe())
+	part1 := append([]byte{0x10}, keyPayload[:3]...) // S=1, no marker
+	part2 := append([]byte{0x00}, keyPayload[3:]...) // continuation, marker
+	rec.writeRTP(&rtp.Packet{Header: rtp.Header{Marker: false, Timestamp: 0, PayloadType: 96, SequenceNumber: 10}, Payload: part1})
+	rec.writeRTP(&rtp.Packet{Header: rtp.Header{Marker: true, Timestamp: 0, PayloadType: 96, SequenceNumber: 11}, Payload: part2})
+	rec.close()
+
+	data, err := os.ReadFile(rec.filePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.HasPrefix(data, []byte("DKIF")) {
+		t.Fatal("IVF should be initialized after keyframe")
+	}
+	// 重组后的帧数据应包含完整 start code
+	if !bytes.Contains(data, []byte{0x9d, 0x01, 0x2a}) {
+		t.Fatal("reassembled VP8 keyframe payload missing")
 	}
 }
 

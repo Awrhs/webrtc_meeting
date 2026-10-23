@@ -133,13 +133,14 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
   }, [messages, decryptedMessages, user?.id])
 
   const showFingerprintModal = async () => {
-    // 列出全部成员的指纹（自己的 + 已建立共享密钥的成员），支持线下比对防中间人
+    // 列出全部成员的指纹（自己的 + 已建立共享密钥的成员），支持线下比对防中间人。
+    // 使用异步方法实时计算，避免同步缓存未刷新时列表为空。
     const fingerprints: Array<{ userId: number; name: string; fingerprint: string }> = [
       { userId: user?.id || 0, name: '你', fingerprint: myFingerprint },
     ]
     for (const member of members) {
       if (member.user_id === user?.id) continue
-      const fingerprint = groupE2EEManager.getMemberFingerprint(member.user_id)
+      const fingerprint = await groupE2EEManager.getMemberFingerprintAsync(member.user_id)
       if (fingerprint) {
         fingerprints.push({ userId: member.user_id, name: member.nickname || `用户 ${member.user_id}`, fingerprint })
       }

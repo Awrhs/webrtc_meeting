@@ -20,6 +20,14 @@ export function useLocalMedia({ sfuConnectionRef, currentRoomId }: UseLocalMedia
   const localStreamRef = useRef<MediaStream | null>(null)
   const screenStreamRef = useRef<MediaStream | null>(null)
 
+  // 由 useSFUMedia 在入会取得麦克风流后注入，供开启摄像头时合并轨道使用
+  const setInitialStream = useCallback((stream: MediaStream) => {
+    if (!localStreamRef.current) {
+      localStreamRef.current = stream
+      setLocalStream(stream)
+    }
+  }, [])
+
   const syncMediaState = useCallback((videoEnabled: boolean, audioEnabled: boolean) => {
     if (!currentRoomId) return
     api.put(`/api/v1/rooms/${currentRoomId}/media-state`, {
@@ -31,18 +39,24 @@ export function useLocalMedia({ sfuConnectionRef, currentRoomId }: UseLocalMedia
   }, [currentRoomId])
 
   const toggleVideo = useCallback(async () => {
-    if (!localStreamRef.current) {
+    const existing: MediaStream | null = localStreamRef.current
+    if (!existing) {
       try {
-        const stream = await getMediaStream(true, audioOn)
-        localStreamRef.current = stream
-        setLocalStream(stream)
-        const videoTrack = stream.getVideoTracks()[0]
+        // 入会时的 stream 只含麦克风轨道。这里只申请摄像头视频（audio:false），
+        // 再把已有麦克风轨道合入同一个 MediaStream，避免重复 getUserMedia 麦克风。
+        const videoStream = await getMediaStream(true, false)
+        const initialMic: MediaStream | null = (localStreamRef as React.MutableRefObject<MediaStream | null>).current
+        const audioTracks: MediaStreamTrack[] = initialMic ? initialMic.getAudioTracks() : []
+        const merged = new MediaStream([...audioTracks, ...videoStream.getVideoTracks()])
+        localStreamRef.current = merged
+        setLocalStream(merged)
+        const videoTrack = videoStream.getVideoTracks()[0]
         if (videoTrack) {
           setActiveCameraId(videoTrack.getSettings().deviceId || '')
         }
-        if (sfuConnectionRef.current) {
-          // 传入 stream 以携带 msid：SFU 转发后订阅端靠 msid 把流归属到对应用户
-          await sfuConnectionRef.current.replaceVideoTrack(videoTrack, stream)
+        if (sfuConnectionRef.current && videoTrack) {
+          // 传入 merged stream 以携带 msid：SFU 转发后订阅端靠 msid 把流归属到对应用户
+          await sfuConnectionRef.current.replaceVideoTrack(videoTrack, merged)
         }
       } catch (error) {
         console.error('[useLocalMedia] Camera error:', error)
@@ -52,10 +66,10 @@ export function useLocalMedia({ sfuConnectionRef, currentRoomId }: UseLocalMedia
       if (videoOn) {
         // 关闭摄像头：真正停止发布（不再发送黑帧浪费上行带宽）
         await sfuConnectionRef.current?.unpublishCamera()
-      } else if (localStreamRef.current.getVideoTracks().length > 0) {
+      } else if (existing.getVideoTracks().length > 0) {
         // 重新开启：恢复到同一 sender（无需重新协商）
-        const videoTrack = localStreamRef.current.getVideoTracks()[0]
-        await sfuConnectionRef.current?.replaceVideoTrack(videoTrack, localStreamRef.current)
+        const videoTrack = existing.getVideoTracks()[0]
+        await sfuConnectionRef.current?.replaceVideoTrack(videoTrack, existing)
       }
     }
     const nextVideoOn = !videoOn
@@ -181,5 +195,6 @@ export function useLocalMedia({ sfuConnectionRef, currentRoomId }: UseLocalMedia
     cleanupLocalMedia,
     refreshCameraDevices,
     switchCamera,
+    setInitialStream,
   }
 }
