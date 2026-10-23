@@ -9,9 +9,14 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.2.0
 	github.com/google/uuid v1.6.0
 	github.com/gorilla/websocket v1.5.0
+	github.com/pion/interceptor v0.1.25
+	github.com/pion/rtcp v1.2.12
+	github.com/pion/rtp v1.8.3
 	github.com/pion/webrtc/v3 v3.2.26
 	go.uber.org/zap v1.24.0
 	golang.org/x/crypto v0.47.0
+	google.golang.org/grpc v1.80.0
+	google.golang.org/protobuf v1.36.11
 	gorm.io/driver/postgres v1.5.2
 	gorm.io/gorm v1.25.5
 )
@@ -43,12 +48,9 @@ require (
 	github.com/pion/datachannel v1.5.5 // indirect
 	github.com/pion/dtls/v2 v2.2.7 // indirect
 	github.com/pion/ice/v2 v2.3.13 // indirect
-	github.com/pion/interceptor v0.1.25 // indirect
 	github.com/pion/logging v0.2.2 // indirect
 	github.com/pion/mdns v0.0.12 // indirect
 	github.com/pion/randutil v0.1.0 // indirect
-	github.com/pion/rtcp v1.2.12 // indirect
-	github.com/pion/rtp v1.8.3 // indirect
 	github.com/pion/sctp v1.8.8 // indirect
 	github.com/pion/sdp/v3 v3.0.6 // indirect
 	github.com/pion/srtp/v2 v2.0.18 // indirect
@@ -67,7 +69,5 @@ require (
 	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260120221211-b8f7ae30c516 // indirect
-	google.golang.org/grpc v1.80.0 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

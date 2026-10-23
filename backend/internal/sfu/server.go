@@ -71,6 +71,7 @@ type Peer struct {
 	Subscriptions map[uint][]*webrtc.RTPSender // key: fromUserID
 	addedTracks   map[string]bool              // key: fromUserID|trackKey
 	renegoPending bool                         // 是否有待处理的 renegotiation
+	negotiated    atomic.Bool                  // 初始协商（首个 offer/answer 交换）是否已完成；未完成时 AddTrack 不触发 renegotiation
 }
 
 // 订阅相关的事件类型已定义在 peerEventType 中
@@ -649,7 +650,14 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 		}
 
 		if added {
-			s.triggerRenegotiation(peer)
+			// 初始协商完成前不触发 renegotiation：
+			// 此时已 AddTrack 的轨道会自然包含在对端初始 offer 生成的 answer 里。
+			// 若在初始协商前抢先 CreateOffer，SFU 会进入 have-local-offer 状态，
+			// 与浏览器随后发来的初始 offer 冲突（SetRemoteDescription 失败），
+			// 导致新用户永远收不到 answer、无法协商。
+			if peer.negotiated.Load() {
+				s.triggerRenegotiation(peer)
+			}
 		}
 		if evt.respCh != nil {
 			evt.respCh <- peerResp{err: nil, result: map[string]interface{}{"added": added, "tracks": addedTracks}}
@@ -750,6 +758,9 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 		if completeAnswer == nil {
 			completeAnswer = &answer
 		}
+
+		// 初始协商完成：此后 AddTrack 需要通过 renegotiation 推送给浏览器
+		peer.negotiated.Store(true)
 
 		if evt.respCh != nil {
 			evt.respCh <- peerResp{err: nil, result: completeAnswer}

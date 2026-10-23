@@ -72,6 +72,8 @@ export class SFUConnection {
   private subscribedVideos: Set<number> = new Set()
   // 期望的视频订阅集合（跨重连保留，joined 后重新同步）
   private desiredVideoSubscriptions: Set<number> = new Set()
+  // WebSocket 未 open 时的消息缓冲：避免 join 前的 subscribe 等消息被静默丢弃
+  private pendingMessages: SFUMessage[] = []
 
   constructor(
     roomId: number,
@@ -239,6 +241,8 @@ export class SFUConnection {
         room_id: this.roomId,
         user_id: this.userId,
       })
+      // 刷新 join 前缓存的消息（如提前下发的 subscribe），join 优先已先入队
+      this.flushPendingMessages()
       // 发送缓存的 ICE 候选
       while (this.iceCandidates.length > 0) {
         const candidate = this.iceCandidates.shift()!
@@ -447,8 +451,21 @@ export class SFUConnection {
   private send(message: SFUMessage) {
     if (this.ws && this.ws.readyState === WebSocket.OPEN) {
       this.ws.send(JSON.stringify(message))
+    } else if (this.ws && this.ws.readyState === WebSocket.CONNECTING) {
+      // 连接建立中：缓存消息，onopen 后统一刷新（防止订阅消息在 join 前丢失）
+      this.pendingMessages.push(message)
     } else {
       console.warn('[WebRTC] WebSocket not ready, message not sent:', message.type)
+    }
+  }
+
+  private flushPendingMessages() {
+    while (this.pendingMessages.length > 0) {
+      const msg = this.pendingMessages.shift()!
+      // join 已由 onopen 自行发送，这里只刷新其余消息（如提前下发的 subscribe）
+      if (msg.type !== 'join' && this.ws?.readyState === WebSocket.OPEN) {
+        this.ws.send(JSON.stringify(msg))
+      }
     }
   }
 
