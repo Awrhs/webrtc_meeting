@@ -146,3 +146,5 @@ recordings/
 *.ivf
 *.ogg
 *.rtp
+*.exe
+backend/server

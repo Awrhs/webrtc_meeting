@@ -9,6 +9,10 @@ export default defineConfig({
       '@': path.resolve(__dirname, './src'),
     },
   },
+  esbuild: {
+    // 生产构建仅移除 console.log/debug（保留 warn/error 用于线上问题诊断）
+    pure: process.env.NODE_ENV === 'production' ? ['console.log', 'console.debug'] : [],
+  },
   server: {
     port: 3000,
     host: '0.0.0.0',

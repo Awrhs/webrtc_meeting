@@ -128,10 +128,17 @@ export default function MeetingRoom() {
   }, [setInitialStream])
 
   const signalingDisconnectRef = useRef<(() => void) | null>(null)
+  // 稳定引用：入会 effect 只依赖 [id, dispatch]，避免 currentRoom 更新
+  // 触发 effect 重建 → 清理函数离会 → 再次入会的无限循环
+  const notifyServerLeaveRef = useRef<() => void>(() => {})
 
   // 服务端记录离开：显式离开按钮 + 页面卸载（keepalive 请求会存活到页面关闭）。
   // 断线未重连的用户由 Hub 宽限期机制自动补记。
   const notifyServerLeave = useCallback(() => {
+    notifyServerLeaveRef.current()
+  }, [])
+
+  notifyServerLeaveRef.current = () => {
     const roomId = currentRoom?.id || (id ? parseInt(id) : 0)
     if (!roomId) return
     const token = localStorage.getItem('token')
@@ -148,7 +155,7 @@ export default function MeetingRoom() {
     } catch {
       // 忽略：宽限期机制会兑底
     }
-  }, [currentRoom?.id, id])
+  }
 
   useEffect(() => {
     const onHide = () => {
@@ -219,7 +226,7 @@ export default function MeetingRoom() {
       leaveMeetingRef.current?.()
       dispatch(clearCurrentRoom())
     }
-  }, [id, dispatch, notifyServerLeave])
+  }, [id, dispatch])
 
   const startMeeting = async (joinResult: JoinRoomResponse) => {
     await signaling.connectAndJoin(

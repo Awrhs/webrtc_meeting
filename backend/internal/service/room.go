@@ -194,12 +194,25 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 		return nil, errors.New("you are kicked from this room, please try again later")
 	}
 
-	count, err := s.roomRepo.CountMembers(room.ID)
+	// 先判断用户是否已在房间（未离开）：已在房间的成员（如刷新页面重新入会）
+	// 不应受满员限制，直接幂等返回。
+	activeMember, err := s.roomRepo.GetMember(room.ID, userID)
 	if err != nil {
-		return nil, err
+		s.logger.Warn("Failed to get active member, falling back to new member creation",
+			zap.Uint("roomID", room.ID),
+			zap.Uint("userID", userID),
+			zap.Error(err))
 	}
-	if int(count) >= room.MaxMembers {
-		return nil, errors.New("room is full")
+
+	// 满员检查：只对真正的新加入成员生效
+	if activeMember == nil {
+		count, err := s.roomRepo.CountMembers(room.ID)
+		if err != nil {
+			return nil, err
+		}
+		if int(count) >= room.MaxMembers {
+			return nil, errors.New("room is full")
+		}
 	}
 
 	switch room.AuthType {
@@ -217,16 +230,8 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 		}
 	}
 
-	// 先检查用户是否在房间中（未离开）
-	activeMember, err := s.roomRepo.GetMember(room.ID, userID)
-	if err != nil {
-		s.logger.Warn("Failed to get active member, falling back to new member creation",
-			zap.Uint("roomID", room.ID),
-			zap.Uint("userID", userID),
-			zap.Error(err))
-	}
+	// 成员记录创建/恢复
 	if activeMember == nil {
-		// 用户不在房间中，检查是否有历史记录
 		existingMember, err := s.roomRepo.GetAnyMember(room.ID, userID)
 		if err != nil {
 			s.logger.Warn("Failed to get existing member",
@@ -235,7 +240,14 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 				zap.Error(err))
 		}
 		if existingMember == nil {
-			// 新成员，创建记录
+			// 新成员：插入前二次校验人数，缩小并发超员窗口
+			count, err := s.roomRepo.CountMembers(room.ID)
+			if err != nil {
+				return nil, err
+			}
+			if int(count) >= room.MaxMembers {
+				return nil, errors.New("room is full")
+			}
 			member := &models.RoomMember{
 				RoomID:    room.ID,
 				UserID:    userID,
@@ -246,19 +258,21 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 				JoinedAt:  time.Now(),
 			}
 			err = s.roomRepo.AddMember(member)
+			if err != nil {
+				return nil, err
+			}
 		} else {
 			// 用户曾经加入过，更新记录
 			now := time.Now()
 			existingMember.LeftAt = nil
 			existingMember.JoinedAt = now
 			err = s.roomRepo.UpdateMember(existingMember)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	// 如果用户已经在房间中（activeMember != nil），不做任何操作
-
-	if err != nil {
-		return nil, err
-	}
 
 	// 重新统计当前房间人数，确保计数正确
 	newCount, err := s.roomRepo.CountMembers(room.ID)
@@ -449,8 +463,24 @@ func (s *roomService) KickMember(roomID uint, requesterID uint, targetID uint) e
 }
 
 func (s *roomService) MuteMember(roomID uint, requesterID uint, targetID uint, muted bool) error {
+	if requesterID == targetID {
+		return errors.New("cannot mute yourself")
+	}
 	hasPerm, err := s.CheckPermission(roomID, requesterID, models.RoleAdmin)
 	if err != nil || !hasPerm {
+		return errors.New("permission denied")
+	}
+
+	// 角色层级检查（与踢人对齐）：不能禁言房主；管理员之间不能互相禁言
+	requesterRole, err := s.GetMemberRole(roomID, requesterID)
+	if err != nil {
+		return errors.New("permission denied")
+	}
+	targetRole, err := s.GetMemberRole(roomID, targetID)
+	if err != nil {
+		return errors.New("member not found")
+	}
+	if targetRole == models.RoleOwner || (targetRole == models.RoleAdmin && requesterRole != models.RoleOwner) {
 		return errors.New("permission denied")
 	}
 

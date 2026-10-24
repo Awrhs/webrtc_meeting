@@ -136,7 +136,7 @@ func Load() *Config {
 		RateLimitAPIPerMinute:      getEnvAsInt("RATE_LIMIT_API_PER_MINUTE", 120),
 		RateLimitWSPerMinute:       getEnvAsInt("RATE_LIMIT_WS_PER_MINUTE", 20),
 		RateLimitSFUWSPerMinute:    getEnvAsInt("RATE_LIMIT_SFU_WS_PER_MINUTE", 20),
-		RateLimitSFUMsgPerMinute:   getEnvAsInt("RATE_LIMIT_SFU_MSG_PER_MINUTE", 120),
+		RateLimitSFUMsgPerMinute:   getEnvAsInt("RATE_LIMIT_SFU_MSG_PER_MINUTE", 600),
 		UploadDir:                  getEnv("UPLOAD_DIR", "./uploads"),
 		UploadMaxBytes:             getEnvAsInt("UPLOAD_MAX_BYTES", 20<<20),
 		PresenceGraceSeconds:       getEnvAsInt("PRESENCE_GRACE_SECONDS", 90),

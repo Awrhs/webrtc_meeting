@@ -230,7 +230,7 @@ export class SFUConnection {
     }
 
     const wsUrl = this.getWsUrl()
-    console.log('[WebRTC] Connecting to SFU WebSocket:', wsUrl)
+    console.log('[WebRTC] Connecting to SFU WebSocket:', wsUrl.replace(/token=[^&]+/, 'token=***'))
     this.ws = new WebSocket(wsUrl)
 
     this.ws.onopen = () => {
@@ -335,6 +335,8 @@ export class SFUConnection {
             type: 'answer',
             sdp: message.sdp,
           })
+          // 远端描述已设置：刷新此前缓存的 ICE 候选
+          await this.flushPendingIceCandidates()
           console.log('[WebRTC] Remote description set')
         }
         break
@@ -347,14 +349,20 @@ export class SFUConnection {
       case 'ice-candidate':
         console.log('[WebRTC] Received ICE candidate from SFU')
         if (message.candidate && this.pc) {
-          try {
-            await this.pc.addIceCandidate({
-              candidate: message.candidate,
-              sdpMLineIndex: message.sdp_m_line_index,
-              sdpMid: message.sdp_mid,
-            })
-          } catch (error) {
-            console.warn('[WebRTC] Failed to add ICE candidate:', error)
+          const cand = {
+            candidate: message.candidate,
+            sdpMLineIndex: message.sdp_m_line_index,
+            sdpMid: message.sdp_mid,
+          }
+          // 远端描述未设置前候选无法应用：缓存，待 answer 设置后刷新
+          if (!this.pc.remoteDescription) {
+            this.pendingIceCandidates.push(cand)
+          } else {
+            try {
+              await this.pc.addIceCandidate(cand)
+            } catch (error) {
+              console.warn('[WebRTC] Failed to add ICE candidate:', error)
+            }
           }
         }
         break
@@ -402,12 +410,35 @@ export class SFUConnection {
     })
   }
 
+  // 远端描述设置前到达的 ICE 候选缓存（浏览器要求先有 remote description 才能应用候选）
+  private pendingIceCandidates: RTCIceCandidateInit[] = []
+
+  private async flushPendingIceCandidates() {
+    const pending = this.pendingIceCandidates
+    this.pendingIceCandidates = []
+    for (const cand of pending) {
+      try {
+        await this.pc?.addIceCandidate(cand)
+      } catch (error) {
+        console.warn('[WebRTC] Failed to add buffered ICE candidate:', error)
+      }
+    }
+  }
+
   private async handleRemoteOffer(sdp: string) {
     return this.queueNegotiation(async () => {
       if (!this.pc) return
+      // glare 保护：若我方刚发出 offer（have-local-offer），先回滚再应用远端 offer。
+      // 正常流程 SFU 不会与我方同时 offer，此分支仅在重连竞态下兜底。
+      if (this.pc.signalingState === 'have-local-offer') {
+        console.warn('[WebRTC] Glare detected, rolling back local offer')
+        await this.pc.setRemoteDescription({ type: 'rollback' })
+      }
       await this.pc.setRemoteDescription({ type: 'offer', sdp })
       const answer = await this.pc.createAnswer()
       await this.pc.setLocalDescription(answer)
+      // answer 之前缓存的候选现在可以应用了
+      await this.flushPendingIceCandidates()
       this.send({
         type: 'answer',
         room_id: this.roomId,
@@ -584,6 +615,7 @@ export class SFUConnection {
     // PC 已销毁：sender 引用随之失效（重连后由 publishCameraTrack 重建）
     this.cameraSender = null
     this.pendingRemoteTracks = []
+    this.pendingIceCandidates = []
     this.subscribedVideos.clear()
     this.negotiationPromise = Promise.resolve()
     if (stopLocalMedia) {

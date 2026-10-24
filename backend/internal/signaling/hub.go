@@ -59,6 +59,8 @@ type Client struct {
 	userID  uint
 	roomIDs map[uint]bool
 	mu      sync.RWMutex
+	// writeMu 保护 conn 的并发写（WritePump 与 pingPump 各自写连接）
+	writeMu sync.Mutex
 }
 
 type Hub struct {
@@ -105,7 +107,7 @@ type presenceQuery struct {
 
 type checkLeaveMsg struct {
 	roomID uint
-	userID  uint
+	userID uint
 }
 
 type BroadcastMessage struct {
@@ -166,14 +168,18 @@ func (h *Hub) Run() {
 				h.removeClientNoLock(existing)
 			}
 			h.clients[client.userID] = client
-			h.logger.Info("Client registered", zap.Uint("userID", client.userID))
+			if h.logger != nil {
+				h.logger.Info("Client registered", zap.Uint("userID", client.userID))
+			}
 
 		case client := <-h.unregister:
 			// 幂等且按对象身份匹配：只有当前注册的还是这个 client 才清理。
 			// （client 可能已被慢消费者清理路径移除，或已被新连接顶替）
 			if current, ok := h.clients[client.userID]; ok && current == client {
 				h.removeClientNoLock(client)
-				h.logger.Info("Client unregistered", zap.Uint("userID", client.userID))
+				if h.logger != nil {
+					h.logger.Info("Client unregistered", zap.Uint("userID", client.userID))
+				}
 			}
 
 		case msg := <-h.broadcast:
@@ -253,6 +259,10 @@ func (h *Hub) handleCheckLeave(msg checkLeaveMsg) {
 		if _, stillOnline := room[msg.userID]; stillOnline {
 			return
 		}
+	}
+	// roomService 为 nil（测试/轻量部署）时直接跳过 DB 状态检查
+	if h.roomService == nil {
+		return
 	}
 	if _, err := h.roomService.GetMemberRole(msg.roomID, msg.userID); err != nil {
 		return // 已不是房间成员（显式离开/被踢），无需处理
@@ -367,13 +377,34 @@ func (h *Hub) NotifyShutdown(reason string) {
 // 关闭 send 会让 WritePump 退出并关闭底层连接，进而触发 ReadPump 的 Unregister（幂等）。
 // 【注意】仅在 Run() goroutine 内部调用，无需锁。
 func (h *Hub) removeClientNoLock(client *Client) {
-	for _, roomID := range client.joinedRoomIDs() {
+	rooms := client.joinedRoomIDs()
+	for _, roomID := range rooms {
 		h.removeClientFromRoomNoLock(client, roomID)
 	}
 	if current, ok := h.clients[client.userID]; ok && current == client {
 		delete(h.clients, client.userID)
 	}
 	close(client.send)
+	// 为每个受影响房间调度宽限期离线检查：用户若在宽限期内未重新上线，
+	// 服务端把成员标记为已离开并广播 user_left（成员列表/人数自动收敛）。
+	for _, roomID := range rooms {
+		h.scheduleLeaveCheck(roomID, client.userID)
+	}
+}
+
+// scheduleLeaveCheck 在宽限期后向 Run 循环投递离线检查任务。
+func (h *Hub) scheduleLeaveCheck(roomID, userID uint) {
+	grace := h.presenceGrace
+	if grace <= 0 {
+		grace = 90 * time.Second
+	}
+	time.AfterFunc(grace, func() {
+		select {
+		case h.checkLeave <- checkLeaveMsg{roomID: roomID, userID: userID}:
+		default:
+			// 队列满（Hub 已停止或堆积），丢弃
+		}
+	})
 }
 
 func (h *Hub) removeClientFromRoomNoLock(client *Client, roomID uint) {
@@ -545,20 +576,43 @@ func (h *Hub) BroadcastMessage(roomID uint, message *models.Message, receiverID 
 
 // ==================== Client 读写循环 ====================
 
+const (
+	// pongWait 等待对端 pong 的最长时间，超时视为连接死亡。
+	pongWait = 60 * time.Second
+	// pingPeriod 向对端发 ping 的间隔（必须小于 pongWait）。
+	pingPeriod = 25 * time.Second
+	// maxMessageSize 单条信令消息上限（防止恶意超大帧占用内存/CPU）。
+	maxMessageSize = 64 * 1024 // 64KB 足够容纳 E2EE 消息/公钥/密钥分发
+)
+
 func (c *Client) ReadPump() {
 	defer func() {
 		c.hub.Unregister(c)
 		c.conn.Close()
 	}()
 
+	// 连接存活保活：读超时 + ping/pong。
+	// 每收到 pong 刷新读超时；写侧由 pingPump 定时发 ping。
+	c.conn.SetReadLimit(maxMessageSize)
+	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetPongHandler(func(string) error {
+		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	})
+
+	// 启动该客户端的 ping 定时器
+	stopPing := make(chan struct{})
+	go c.pingPump(stopPing)
+
 	for {
 		_, message, err := c.conn.ReadMessage()
 		if err != nil {
-			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
+			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
 				c.hub.logger.Error("Read error", zap.Error(err))
 			}
-			break
+			close(stopPing)
+			return
 		}
+		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
 
 		var msg Message
 		if err = json.Unmarshal(message, &msg); err != nil {
@@ -567,6 +621,26 @@ func (c *Client) ReadPump() {
 		}
 
 		c.handleMessage(&msg)
+	}
+}
+
+// pingPump 定时向客户端发 ping 保活。
+func (c *Client) pingPump(stop <-chan struct{}) {
+	ticker := time.NewTicker(pingPeriod)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			c.writeMu.Lock()
+			_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+			err := c.conn.WriteMessage(websocket.PingMessage, nil)
+			c.writeMu.Unlock()
+			if err != nil {
+				return
+			}
+		}
 	}
 }
 

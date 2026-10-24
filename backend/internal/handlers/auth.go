@@ -35,14 +35,14 @@ func NewHandler(userService service.UserService, userRepo repository.UserReposit
 	return &Handler{
 		userService:      userService,
 		userRepo:         userRepo,
-		roomService:       roomService,
-		chatService:       chatService,
-		hub:               hub,
-		sfuRouter:         sfuRouter,
-		logger:            logger,
-		sfuCallbackToken:  sfuCallbackToken,
-		uploadDir:         uploadDir,
-		uploadMaxBytes:    uploadMaxBytes,
+		roomService:      roomService,
+		chatService:      chatService,
+		hub:              hub,
+		sfuRouter:        sfuRouter,
+		logger:           logger,
+		sfuCallbackToken: sfuCallbackToken,
+		uploadDir:        uploadDir,
+		uploadMaxBytes:   uploadMaxBytes,
 	}
 }
 

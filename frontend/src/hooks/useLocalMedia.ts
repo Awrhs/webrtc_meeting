@@ -39,14 +39,16 @@ export function useLocalMedia({ sfuConnectionRef, currentRoomId }: UseLocalMedia
   }, [currentRoomId])
 
   const toggleVideo = useCallback(async () => {
+    // 【关键】入会时 localStreamRef 已被注入仅含麦克风的流，
+    // 所以不能用 !existing 判断，必须看是否已有视频轨道：
+    // 无视频轨 → 申请摄像头；有视频轨 → 切换开关。
     const existing: MediaStream | null = localStreamRef.current
-    if (!existing) {
+    const hasVideoTrack = !!existing && existing.getVideoTracks().length > 0
+    if (!hasVideoTrack) {
       try {
-        // 入会时的 stream 只含麦克风轨道。这里只申请摄像头视频（audio:false），
-        // 再把已有麦克风轨道合入同一个 MediaStream，避免重复 getUserMedia 麦克风。
+        // 只申请摄像头视频（audio:false），复用已有麦克风流，避免重复采集冲突
         const videoStream = await getMediaStream(true, false)
-        const initialMic: MediaStream | null = (localStreamRef as React.MutableRefObject<MediaStream | null>).current
-        const audioTracks: MediaStreamTrack[] = initialMic ? initialMic.getAudioTracks() : []
+        const audioTracks: MediaStreamTrack[] = existing ? existing.getAudioTracks() : []
         const merged = new MediaStream([...audioTracks, ...videoStream.getVideoTracks()])
         localStreamRef.current = merged
         setLocalStream(merged)
@@ -66,10 +68,12 @@ export function useLocalMedia({ sfuConnectionRef, currentRoomId }: UseLocalMedia
       if (videoOn) {
         // 关闭摄像头：真正停止发布（不再发送黑帧浪费上行带宽）
         await sfuConnectionRef.current?.unpublishCamera()
-      } else if (existing.getVideoTracks().length > 0) {
+      } else {
         // 重新开启：恢复到同一 sender（无需重新协商）
-        const videoTrack = existing.getVideoTracks()[0]
-        await sfuConnectionRef.current?.replaceVideoTrack(videoTrack, existing)
+        const videoTrack = existing!.getVideoTracks()[0]
+        if (videoTrack) {
+          await sfuConnectionRef.current?.replaceVideoTrack(videoTrack, existing)
+        }
       }
     }
     const nextVideoOn = !videoOn

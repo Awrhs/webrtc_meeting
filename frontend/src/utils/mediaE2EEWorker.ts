@@ -116,13 +116,15 @@ async function importAesKey(keyBase64: string): Promise<CryptoKey> {
 
 async function encryptFrame(frameData: ArrayBuffer, key: CryptoKey, epoch: number): Promise<ArrayBuffer> {
   const iv = crypto.getRandomValues(new Uint8Array(12))
+  sendCounter = (sendCounter + 1) >>> 0
+  const header = encodeFrameHeader(epoch, sendCounter, iv)
+  // 帧头前 13 字节（magic+version+epoch+counter，不含 IV）作为 AAD 参与认证
+  const aad = header.slice(0, 13)
   const ciphertext = await crypto.subtle.encrypt(
-    { name: 'AES-GCM', iv: iv.buffer as ArrayBuffer },
+    { name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 },
     key,
     frameData
   )
-  sendCounter = (sendCounter + 1) >>> 0
-  const header = encodeFrameHeader(epoch, sendCounter, iv)
   const result = new Uint8Array(header.length + ciphertext.byteLength)
   result.set(header, 0)
   result.set(new Uint8Array(ciphertext), header.length)
@@ -135,8 +137,11 @@ async function decryptFrame(frameData: ArrayBuffer, key: CryptoKey): Promise<Arr
 
   const ciphertext = new Uint8Array(frameData, parsed.payloadOffset)
   try {
+    // AAD 必须与加密侧一致：帧头前 13 字节（magic+version+epoch+counter，不含 IV）
+    const ivBuf = new Uint8Array(parsed.iv)
+    const aad = new Uint8Array(frameData.slice(0, 13))
     return await crypto.subtle.decrypt(
-      { name: 'AES-GCM', iv: parsed.iv.buffer as ArrayBuffer },
+      { name: 'AES-GCM', iv: ivBuf, additionalData: aad, tagLength: 128 },
       key,
       ciphertext
     )
@@ -180,14 +185,15 @@ onrtctransform = (event: RTCRtpTransformEvent) => {
           if (parsed) {
             const keyEntry = receiveKeys.get(`${options.trackId}:${parsed.epoch}`)
             if (keyEntry) {
-              // 重放防护：同一 (track, epoch) 内帧序号必须未见过且在窗口内
-              if (!checkAndUpdateReplay(`${options.trackId}:${parsed.epoch}`, parsed.counter)) {
-                diagnostics.unknownEpochs++
-                report('replay-detected', { trackId: options.trackId, epoch: parsed.epoch })
-                continue
-              }
+              // 先解密认证（AAD 覆盖帧头），认证通过后再做重放窗口检查：
+              // 解密失败的帧不污染重放窗口。
               const decrypted = await decryptFrame(value.data, keyEntry.key)
-              if (decrypted) {
+              if (decrypted !== null) {
+                if (!checkAndUpdateReplay(`${options.trackId}:${parsed.epoch}`, parsed.counter)) {
+                  diagnostics.unknownEpochs++
+                  report('replay-detected', { trackId: options.trackId, epoch: parsed.epoch })
+                  continue // 丢弃重放帧，不写入解码器
+                }
                 value.data = decrypted
                 diagnostics.decryptedFrames++
                 if (diagnostics.decryptedFrames === 1 || diagnostics.decryptedFrames % 300 === 0) {
@@ -196,15 +202,32 @@ onrtctransform = (event: RTCRtpTransformEvent) => {
               } else {
                 diagnostics.decryptFailures++
                 report('frame-decrypt-failed', { trackId: options.trackId, epoch: parsed.epoch })
+                continue // 认证失败：丢弃，不将密文下发给解码器
               }
             } else {
+              // fail-closed：E2EE 会话中缺密钥的帧直接丢弃，
+              // 绝不把未加密/未认证内容下发给解码器（防降级攻击）；
+              // 密钥分发到达（set-receive-key）后媒体自动恢复。
               diagnostics.missingReceiveKeys++
               diagnostics.unknownEpochs++
               if (diagnostics.missingReceiveKeys === 1 || diagnostics.missingReceiveKeys % 300 === 0) {
                 report('missing-receive-key', { trackId: options.trackId, epoch: parsed.epoch })
               }
+              continue
             }
+          } else {
+            // 无有效帧头：E2EE 会话中不允许明文帧，丢弃
+            diagnostics.missingReceiveKeys++
+            report('missing-receive-key', { trackId: options.trackId })
+            continue
           }
+        } else {
+          // 发送方向但未设置发送密钥：fail-closed，丢弃帧不发明文
+          if (diagnostics.missingReceiveKeys % 300 === 0) {
+            report('send-key-missing', { trackId: options.trackId })
+          }
+          diagnostics.missingReceiveKeys++
+          continue
         }
 
         await writer.write(value)

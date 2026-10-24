@@ -36,12 +36,12 @@ func newTestSFUServer(t *testing.T) *SFUServer {
 		webrtc.WithSettingEngine(settingEngineLoopback()),
 	)
 	s := &SFUServer{
-		rooms:     make(map[uint]*Room),
-		api:       api,
-		logger:    zap.NewNop(),
+		rooms:      make(map[uint]*Room),
+		api:        api,
+		logger:     zap.NewNop(),
 		rtcpRouter: NewRTCPRouter(),
-		qos:       NewQoSController(),
-		recorders: newRecorderManager(""),
+		qos:        NewQoSController(),
+		recorders:  newRecorderManager(""),
 	}
 	return s
 }

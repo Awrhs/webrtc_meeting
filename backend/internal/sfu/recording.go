@@ -155,11 +155,11 @@ func oggCRC(p []byte) uint32 {
 }
 
 type oggWriter struct {
-	f        *os.File
-	serial   uint32
-	pageNo   uint32
-	granule  uint64
-	samples  uint64 // 累计采样（Opus 每包 20ms → 960 采样 @48k）
+	f       *os.File
+	serial  uint32
+	pageNo  uint32
+	granule uint64
+	samples uint64 // 累计采样（Opus 每包 20ms → 960 采样 @48k）
 }
 
 func newOGGWriter(f *os.File, channels uint8, sampleRate uint32, serial uint32) (*oggWriter, error) {
@@ -269,18 +269,18 @@ type trackRecorder struct {
 	kind     string // "ivf" | "ogg" | "rtp"
 	filePath string
 
-	ivf     *ivfWriter
-	ogg     *oggWriter
-	raw     *rawRTPWriter
-	file    *os.File
+	ivf  *ivfWriter
+	ogg  *oggWriter
+	raw  *rawRTPWriter
+	file *os.File
 
 	// VP8 帧重组
-	frameBuf    []byte
-	frameTS     uint64
-	frameKey    bool
-	gotWidth    uint16
-	gotHeight   uint16
-	ivfNotInit  bool
+	frameBuf   []byte
+	frameTS    uint64
+	frameKey   bool
+	gotWidth   uint16
+	gotHeight  uint16
+	ivfNotInit bool
 
 	bytesWritten uint64
 }
@@ -413,9 +413,9 @@ type roomRecorder struct {
 
 // recorderManager 管理所有房间的录制器。
 type recorderManager struct {
-	mu       sync.Mutex
-	baseDir  string
-	rooms    map[uint]*roomRecorder
+	mu      sync.Mutex
+	baseDir string
+	rooms   map[uint]*roomRecorder
 }
 
 func newRecorderManager(baseDir string) *recorderManager {

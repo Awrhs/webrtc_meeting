@@ -33,13 +33,13 @@ type Room struct {
 type TrackInfo struct {
 	Track     *webrtc.TrackLocalStaticRTP
 	SSRC      uint32
-	Kind      string // "audio" or "video"
-	StreamID  string // 发布者浏览器 MediaStream 的 msid（GUID）
-	IsEnabled atomic.Bool // 原子操作，转发 goroutine 中无需锁即可读写
-	RID       string      // simulcast layer rid: "" / "low" / "high"
+	Kind      string                    // "audio" or "video"
+	StreamID  string                    // 发布者浏览器 MediaStream 的 msid（GUID）
+	IsEnabled atomic.Bool               // 原子操作，转发 goroutine 中无需锁即可读写
+	RID       string                    // simulcast layer rid: "" / "low" / "high"
 	Codec     webrtc.RTPCodecParameters // 录制用：轨道编码（含 PayloadType）
-	bytesIn   atomic.Uint64 // 从发布者收到的字节数
-	bytesOut  atomic.Uint64 // 成功转发给所有订阅者的字节数
+	bytesIn   atomic.Uint64             // 从发布者收到的字节数
+	bytesOut  atomic.Uint64             // 成功转发给所有订阅者的字节数
 }
 
 type Peer struct {
@@ -70,7 +70,6 @@ type Peer struct {
 	Tracks        map[string]*TrackInfo        // key: kind-streamID/RID
 	Subscriptions map[uint][]*webrtc.RTPSender // key: fromUserID
 	addedTracks   map[string]bool              // key: fromUserID|trackKey
-	renegoPending bool                         // 是否有待处理的 renegotiation
 	negotiated    atomic.Bool                  // 初始协商（首个 offer/answer 交换）是否已完成；未完成时 AddTrack 不触发 renegotiation
 }
 
@@ -85,15 +84,15 @@ type Peer struct {
 type peerEventType string
 
 const (
-	peerEvtTrackAdded     peerEventType = "trackAdded"     // 新轨道到达（onTrack）
-	peerEvtTrackRemoved   peerEventType = "trackRemoved"   // 轨道移除
-	peerEvtSubscribe      peerEventType = "subscribe"      // 订阅轨道
-	peerEvtUnsubscribe    peerEventType = "unsubscribe"    // 取消订阅
-	peerEvtMuteTrack      peerEventType = "muteTrack"      // 启用/禁用轨道转发
-	peerEvtCleanupPeer    peerEventType = "cleanupPeer"    // 用户离开时清理订阅
-	peerEvtHandleOffer    peerEventType = "handleOffer"    // 处理 SDP Offer
-	peerEvtHandleAnswer   peerEventType = "handleAnswer"   // 处理 SDP Answer
-	peerEvtHandleIce      peerEventType = "handleIce"      // 处理 ICE 候选
+	peerEvtTrackAdded   peerEventType = "trackAdded"   // 新轨道到达（onTrack）
+	peerEvtTrackRemoved peerEventType = "trackRemoved" // 轨道移除
+	peerEvtSubscribe    peerEventType = "subscribe"    // 订阅轨道
+	peerEvtUnsubscribe  peerEventType = "unsubscribe"  // 取消订阅
+	peerEvtMuteTrack    peerEventType = "muteTrack"    // 启用/禁用轨道转发
+	peerEvtCleanupPeer  peerEventType = "cleanupPeer"  // 用户离开时清理订阅
+	peerEvtHandleOffer  peerEventType = "handleOffer"  // 处理 SDP Offer
+	peerEvtHandleAnswer peerEventType = "handleAnswer" // 处理 SDP Answer
+	peerEvtHandleIce    peerEventType = "handleIce"    // 处理 ICE 候选
 )
 
 // peerEvent 所有状态变更都通过此事件发送到 peerEventLoop
@@ -132,10 +131,10 @@ type cleanupPeerEvent struct {
 
 // subscribeEvent 订阅轨道事件
 type subscribeEvent struct {
-	targetUserID uint          // 目标发布者
-	kind         string        // "audio" or "video"
-	streamID     string        // "camera" or "screen"
-	tracks       []*TrackInfo  // 已选好的 track 列表
+	targetUserID uint         // 目标发布者
+	kind         string       // "audio" or "video"
+	streamID     string       // "camera" or "screen"
+	tracks       []*TrackInfo // 已选好的 track 列表
 }
 
 // unsubscribeEvent 取消订阅事件
@@ -187,14 +186,14 @@ type TokenReplayChecker interface {
 // ===== 标准化错误变量 =====
 // 使用 errors.Is() 断言这些错误，便于上层处理
 var (
-	ErrRoomNotFound      = errors.New("sfu: room not found")
-	ErrPeerNotFound      = errors.New("sfu: peer not found")
-	ErrTrackNotFound     = errors.New("sfu: track not found")
-	ErrPeerClosed        = errors.New("sfu: peer is closed")
-	ErrSubscribeTimeout  = errors.New("sfu: subscribe timeout")
-	ErrEventQueueFull    = errors.New("sfu: event queue is full")
-	ErrInvalidMessage    = errors.New("sfu: invalid message format")
-	ErrUnauthorized      = errors.New("sfu: unauthorized access")
+	ErrRoomNotFound     = errors.New("sfu: room not found")
+	ErrPeerNotFound     = errors.New("sfu: peer not found")
+	ErrTrackNotFound    = errors.New("sfu: track not found")
+	ErrPeerClosed       = errors.New("sfu: peer is closed")
+	ErrSubscribeTimeout = errors.New("sfu: subscribe timeout")
+	ErrEventQueueFull   = errors.New("sfu: event queue is full")
+	ErrInvalidMessage   = errors.New("sfu: invalid message format")
+	ErrUnauthorized     = errors.New("sfu: unauthorized access")
 )
 
 type SSRC struct {
@@ -405,6 +404,8 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 	if s.recorders.enabled() {
 		recorder = s.recorders.trackRecorderFor(room.ID, trackKey, track.Codec(), trackKind, streamID)
 	}
+	const maxConsecutiveWriteErrors = 300 // 约 10 秒（30fps）连续失败才判定轨道失效
+	writeErrCount := 0
 	go func() {
 		for {
 			// 读取已解析的 RTP 包，避免后续 Write 时二次解析
@@ -424,9 +425,27 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 			// 只有启用的轨道才转发（被 MuteUser 禁用的轨道会跳过）
 			if trackInfo.IsEnabled.Load() {
 				if err := localTrack.WriteRTP(pkt); err != nil {
-					return
+					// 【不能直接 return】WriteRTP 是向所有订阅者广播；
+					// 单个订阅者异常不应停掉对其它订阅者的转发。
+					// 常见错误是某个订阅侧连接关闭（io.ErrClosedPipe），
+					// Pion 会在下一次 Unbind 后自动跳过该订阅者。
+					// 连续大量错误才视为轨道失效，退出转发。
+					writeErrCount++
+					s.logger.Debug("Track write error",
+						zap.Uint("userID", peer.UserID),
+						zap.String("trackKey", trackKey),
+						zap.Int("consecutive", writeErrCount),
+						zap.Error(err))
+					if writeErrCount >= maxConsecutiveWriteErrors {
+						s.logger.Warn("Track forwarding aborted after repeated write errors",
+							zap.Uint("userID", peer.UserID),
+							zap.String("trackKey", trackKey))
+						return
+					}
+				} else {
+					writeErrCount = 0
+					trackInfo.bytesOut.Add(uint64(len(pkt.Raw)))
 				}
-				trackInfo.bytesOut.Add(uint64(len(pkt.Raw)))
 			}
 		}
 	}()
@@ -446,7 +465,6 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 		},
 	}
 
-
 	for _, otherPeer := range peersToNotify {
 		// 给所有用户（包括发布者自己）发送 SSRC/流映射，方便前端做流归属。
 		// 【注意】必须使用上面加锁获取的 peersToNotify 快照：直接遍历 room.Peers
@@ -459,7 +477,6 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 	// 音频与无 RID 的视频（屏幕共享/非 simulcast 回退）自动订阅；
 	// 带 RID 的摄像头视频（simulcast 层）由前端按需 subscribe。
 }
-
 
 // renegotiate 当已连接的 PeerConnection 需要增加新接收轨道时触发重新协商
 // 预期正确逻辑：
@@ -522,15 +539,11 @@ func (s *SFUServer) writerLoop(peer *Peer) {
 	}
 }
 
-
 // ===== Peer 统一事件循环 =====
 // 所有状态变更在此 goroutine 串行处理，从根本上消除竞态条件。
 // 无需 mutex 保护内部状态，此函数是唯一可以直接读写 peer.Tracks、
 // peer.Subscriptions、peer.addedTracks 的地方。
 func (s *SFUServer) peerEventLoop(peer *Peer) {
-	renegoTicker := time.NewTicker(10 * time.Millisecond)
-	defer renegoTicker.Stop()
-
 	for {
 		select {
 		case <-peer.ctx.Done():
@@ -539,12 +552,6 @@ func (s *SFUServer) peerEventLoop(peer *Peer) {
 
 		case evt := <-peer.eventCh:
 			s.handlePeerEvent(peer, evt)
-
-		case <-renegoTicker.C:
-			if peer.renegoPending {
-				peer.renegoPending = false
-				go s.doRenegotiate(peer)
-			}
 		}
 	}
 }
@@ -645,8 +652,8 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 
 			s.logger.Info("Subscribed to track via event loop",
 				zap.Uint("subscriber", peer.UserID),
-			zap.Uint("publisher", data.targetUserID),
-			zap.String("trackKey", trackKey))
+				zap.Uint("publisher", data.targetUserID),
+				zap.String("trackKey", trackKey))
 		}
 
 		if added {
@@ -884,6 +891,7 @@ func (p *Peer) hasSubscriptionFor(fromUserID uint, kind, streamID string) bool {
 	}
 	return false
 }
+
 // 这些函数封装了 event loop 的通信细节，外部调用只需关注业务逻辑
 
 // SubscribeTracks 订阅指定用户的轨道（异步）
@@ -968,7 +976,7 @@ func (s *SFUServer) sendToPeer(peer *Peer, msg SignalingMessage) {
 // 因此天然单线程，不会与自身并发；SignalingState 检查作为防御性兜底。
 func (s *SFUServer) doRenegotiate(peer *Peer) {
 	// 【架构说明】此处无需 peer.mu 保护
-	// 1. doRenegotiate 仅在 peerEventLoop 的 ticker 中被触发，串行执行
+	// 1. doRenegotiate 仅由 renegotiationWorker goroutine 调用（每个 peer 一个 worker），串行执行
 	// 2. 仅访问 peer.PC 的方法（Pion 内部已同步）
 	// 3. 不访问 peer.Tracks/Subscriptions/addedTracks 等状态
 
@@ -1026,7 +1034,8 @@ func (s *SFUServer) doRenegotiate(peer *Peer) {
 type RTCPTarget struct {
 	Publisher  *Peer  // 轨道发布者
 	Subscriber *Peer  // 订阅者（startRTCPReadLoop 注册时非空；onTrack 注册时为 nil）
-	TrackSSRC  uint32 // 发布者的原始 SSRC（浏览器发送的）
+	TrackSSRC  uint32 // 发布者的原始 SSRC（浏览器发送的）；订阅侧注册时必须填写，
+	// PLI 转发时需要把订阅侧出站 SSRC 改写回此值，否则发布者浏览器无法识别
 	TrackKey   string // 轨道唯一标识
 	FromUserID uint   // 发布者用户ID
 
@@ -1113,8 +1122,13 @@ func (r *RTCPRouter) UnregisterByUser(userID uint) {
 	}
 }
 
-// Route 将 RTCP 包路由到对应的 publisher
-// 返回是否成功路由
+// Route 将订阅端发来的 RTCP 反馈路由到对应的 publisher。
+// 【关键】订阅端 PLI/NACK 携带的是订阅侧出站轨道的 SSRC（Pion 为每个订阅者
+// 生成新 SSRC），发布者浏览器只认识自己的原始 SSRC，因此转发 PLI 前必须把
+// MediaSSRC 改写回发布者原始 SSRC（target.TrackSSRC），否则发布者不会响应，
+// 表现为黑屏/花屏要等很久。
+// 订阅端 NACK 不在此转发：下行丢包重传由 SFU 内置的 NACK responder
+// 拦截器（RegisterDefaultInterceptors）负责（SFU 缓存有出站 RTP）。
 func (r *RTCPRouter) Route(pkt rtcp.Packet) bool {
 	var mediaSSRC uint32
 	var target *RTCPTarget
@@ -1123,10 +1137,8 @@ func (r *RTCPRouter) Route(pkt rtcp.Packet) bool {
 	case *rtcp.PictureLossIndication:
 		mediaSSRC = p.MediaSSRC
 	case *rtcp.ReceiverEstimatedMaximumBitrate:
-		// REMB 没有 MediaSSRC，通常是整个连接的
+		// REMB 描述的是订阅者下行带宽，由 QoSController 消费，不转发
 		return false
-	case *rtcp.TransportLayerNack:
-		mediaSSRC = p.MediaSSRC
 	case *rtcp.ReceiverReport:
 		if len(p.Reports) > 0 {
 			mediaSSRC = p.Reports[0].SSRC
@@ -1134,7 +1146,7 @@ func (r *RTCPRouter) Route(pkt rtcp.Packet) bool {
 			return false
 		}
 	default:
-		// 其他类型的 RTCP 包不处理
+		// TransportLayerNack 等其它类型不转发（NACK 由 SFU 拦截器处理）
 		return false
 	}
 
@@ -1142,35 +1154,63 @@ func (r *RTCPRouter) Route(pkt rtcp.Packet) bool {
 	target, ok := r.ssrcMap[mediaSSRC]
 	r.mu.RUnlock()
 
-	if !ok || target.Publisher == nil {
+	if !ok || target.Publisher == nil || target.TrackSSRC == 0 {
 		return false
 	}
 
-	// 写入 publisher 的接收端，Pion 会自动将 RTCP 发送给浏览器
-	err := target.Publisher.PC.WriteRTCP([]rtcp.Packet{pkt})
-	if err != nil {
-		return false
+	// PLI：改写 MediaSSRC 为发布者原始 SSRC 后转发
+	if pli, ok := pkt.(*rtcp.PictureLossIndication); ok {
+		rewritten := &rtcp.PictureLossIndication{
+			SenderSSRC: pli.SenderSSRC,
+			MediaSSRC:  target.TrackSSRC,
+		}
+		err := target.Publisher.PC.WriteRTCP([]rtcp.Packet{rewritten})
+		return err == nil
 	}
-	return true
+
+	// ReceiverReport：SSRC 语义是"报告的是谁的流"，同样需要改写
+	if rr, ok := pkt.(*rtcp.ReceiverReport); ok {
+		rewritten := *rr
+		rewritten.Reports = make([]rtcp.ReceptionReport, len(rr.Reports))
+		for i, rep := range rr.Reports {
+			rep.SSRC = target.TrackSSRC
+			rewritten.Reports[i] = rep
+		}
+		err := target.Publisher.PC.WriteRTCP([]rtcp.Packet{&rewritten})
+		return err == nil
+	}
+	return false
 }
 
 // startRTCPReadLoop 启动 RTCP 读取和转发 goroutine
 // 从订阅者读取 RTCP 反馈，解析后路由到对应的 publisher
 // 这是视频质量自适应的关键：PLI 请求关键帧、NACK 请求重传、REMB 码率估计
 func (s *SFUServer) startRTCPReadLoop(peer *Peer, sender *webrtc.RTPSender, fromUserID uint, trackKey string) {
-	// 在订阅时注册 SSRC 映射，确保 RTCP 能路由回去
-	// 注意：sender.GetParameters().Encodings[0].SSRC 就是本订阅侧出站轨道的 SSRC
+	// 在订阅时注册 SSRC 映射，确保 RTCP 能路由回去。
+	// 注意：sender.GetParameters().Encodings[0].SSRC 是本订阅侧出站轨道的 SSRC（路由 key），
+	// TrackSSRC 必须填发布者原始 SSRC（路由目标），PLI 转发时靠它改写 MediaSSRC。
 	params := sender.GetParameters()
 	if len(params.Encodings) > 0 {
 		ssrc := uint32(params.Encodings[0].SSRC)
 		publisher := s.getPeerByID(peer.RoomID, fromUserID)
 		if publisher != nil {
+			publisherSSRC := s.lookupPublisherSSRC(publisher, trackKey)
 			s.rtcpRouter.Register(ssrc, &RTCPTarget{
 				Publisher:  publisher,
 				Subscriber: peer,
+				TrackSSRC:  publisherSSRC,
 				FromUserID: fromUserID,
 				TrackKey:   trackKey,
 			})
+			// 新订阅建立时立即向发布者请求一个关键帧，
+			// 否则订阅者要等发布者自然发下一个关键帧才能出图（黑屏数秒）。
+			if publisherSSRC != 0 {
+				pli := &rtcp.PictureLossIndication{MediaSSRC: publisherSSRC}
+				if err := publisher.PC.WriteRTCP([]rtcp.Packet{pli}); err != nil {
+					s.logger.Warn("Failed to request initial keyframe",
+						zap.Uint("publisher", fromUserID), zap.String("trackKey", trackKey), zap.Error(err))
+				}
+			}
 		}
 	}
 
@@ -1208,21 +1248,24 @@ func (s *SFUServer) startRTCPReadLoop(peer *Peer, sender *webrtc.RTPSender, from
 						zap.Uint("toUser", fromUserID),
 						zap.Uint32("ssrc", p.MediaSSRC),
 						zap.String("trackKey", trackKey))
+					// Route 会把 MediaSSRC 改写为发布者原始 SSRC 后转发
 					s.rtcpRouter.Route(pkt)
 
 				case *rtcp.TransportLayerNack:
-					// NACK：接收端请求重传特定丢包
+					// NACK：接收端请求重传下行丢包。
+					// 由 SFU 内置的 NACK responder 拦截器（RegisterDefaultInterceptors）
+					// 从出站缓存直接重传，无需转发给发布者（订阅侧出站 SSRC 与
+					// 发布者原始 SSRC 不同，转发的 NACK 序号也无法对上）。
 					nackCount++
 					lostPackets := make([]uint16, 0, len(p.Nacks))
 					for _, nack := range p.Nacks {
 						lostPackets = append(lostPackets, nack.PacketList()...)
 					}
-					s.logger.Debug("RTCP NACK received",
+					s.logger.Debug("RTCP NACK handled by SFU responder",
 						zap.Uint("fromUser", peer.UserID),
 						zap.Uint("toUser", fromUserID),
 						zap.Int("lostPackets", len(lostPackets)),
 						zap.String("trackKey", trackKey))
-					s.rtcpRouter.Route(pkt)
 
 				case *rtcp.ReceiverEstimatedMaximumBitrate:
 					// REMB：接收端估计的可用下行带宽。
@@ -1273,6 +1316,16 @@ func (s *SFUServer) startRTCPReadLoop(peer *Peer, sender *webrtc.RTPSender, from
 			}
 		}
 	}()
+}
+
+// lookupPublisherSSRC 按 trackKey 查找发布者轨道的原始 SSRC。
+func (s *SFUServer) lookupPublisherSSRC(publisher *Peer, trackKey string) uint32 {
+	publisher.mu.Lock()
+	defer publisher.mu.Unlock()
+	if ti, ok := publisher.Tracks[trackKey]; ok {
+		return ti.SSRC
+	}
+	return 0
 }
 
 // getPeerByID 根据用户ID查找 peer，线程安全
@@ -1429,7 +1482,7 @@ func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessag
 			})
 		}
 		s.sendToPeer(peer, SignalingMessage{
-			Type: "ssrc_mapping",
+			Type:  "ssrc_mapping",
 			SSRCs: ssrcs,
 		})
 	}
@@ -1578,33 +1631,46 @@ func (s *SFUServer) closePeer(peer *Peer) {
 
 // deleteRoomIfEmpty 房间没人时删除房间并落盘录制文件。
 // 调用方必须已持有 room.mu。
-func (s *SFUServer) deleteRoomIfEmpty(room *Room) {
-	if len(room.Peers) != 0 {
-		return
-	}
+// deleteRoomIfEmpty 房间没人时删除房间并落盘录制文件。
+// 【锁顺序】必须在未持有 room.mu 时调用（本函数拿 s.mu；全局锁序统一为
+// s.mu → room.mu，若持 room.mu 再拿 s.mu 会与 HandleMetrics/ListRooms 等
+// 反序导致死锁）。调用方负责确认房间已空。
+func (s *SFUServer) deleteRoomIfEmpty(roomID uint) {
 	s.mu.Lock()
-	delete(s.rooms, room.ID)
+	room, ok := s.rooms[roomID]
+	if ok && len(room.Peers) == 0 {
+		delete(s.rooms, roomID)
+	} else {
+		ok = false
+	}
 	s.mu.Unlock()
-	s.recorders.stopRoom(room.ID)
+	if ok {
+		s.recorders.stopRoom(roomID)
+	}
 }
 
 func (s *SFUServer) onConnectionStateChange(room *Room, peer *Peer, state webrtc.PeerConnectionState) {
 	if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
+		roomEmpty := false
 		room.mu.Lock()
-		defer room.mu.Unlock()
 		// 按对象身份匹配：同账号多端入会时新 peer 已覆盖同 userID 的表项，
 		// 旧 peer 的连接状态回调不能误删新 peer。
-		if current, ok := room.Peers[peer.UserID]; !ok || current != peer {
-			return
+		if current, ok := room.Peers[peer.UserID]; ok && current == peer {
+			s.cleanupPeerSubscriptions(room, peer.UserID)
+			s.rtcpRouter.UnregisterByUser(peer.UserID)
+			s.qos.RemoveAllForUser(peer.UserID)
+			delete(room.Peers, peer.UserID)
+			s.closePeer(peer)
+			roomEmpty = len(room.Peers) == 0
 		}
-		s.cleanupPeerSubscriptions(room, peer.UserID)
-		s.rtcpRouter.UnregisterByUser(peer.UserID)
-		s.qos.RemoveAllForUser(peer.UserID)
-		delete(room.Peers, peer.UserID)
-		s.closePeer(peer)
+		room.mu.Unlock()
 
-		s.deleteRoomIfEmpty(room)
+		// 锁外清理（锁序统一为 s.mu → room.mu，避免反序死锁）
+		if roomEmpty {
+			s.deleteRoomIfEmpty(room.ID)
+		}
 
+		// 锁外回调 API（HTTP 请求不持锁）
 		if state == webrtc.PeerConnectionStateFailed {
 			s.logger.Warn("Peer connection failed (ICE negotiation failed)",
 				zap.Uint("roomID", room.ID),
@@ -1618,7 +1684,9 @@ func (s *SFUServer) notifyConnectionFailed(roomID uint, userID uint) {
 	apiHost := getAPIHost()
 	url := apiHost + "/api/v1/sfu/callback/" + strconv.Itoa(int(roomID)) + "/" + strconv.Itoa(int(userID)) + "/connection-failed"
 
-	client := &http.Client{}
+	// 必须带超时：该回调可能由连接失败路径触发，
+	// 若 API 服务卡住而无超时，会无限占用 goroutine。
+	client := &http.Client{Timeout: 5 * time.Second}
 	req, err := http.NewRequest("POST", url, nil)
 	if err != nil {
 		s.logger.Error("Failed to create request for connection failed notification",
@@ -1725,12 +1793,14 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	for {
 		if !limiter.Allow() {
+			// 超限不直接断开（ICE 候选+订阅消息在大房间可能瞬时超阈值），
+			// 丢弃本条消息并提示；连接保活，窗口重置后自动恢复。
 			if peer != nil {
 				s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "rate_limited"})
 			} else {
 				sendError(conn, "rate_limited", "too many messages")
 			}
-			break
+			continue
 		}
 
 		_, message, err := conn.ReadMessage()
@@ -1875,7 +1945,7 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 		addedTracks:   make(map[string]bool),
 		renegoCh:      make(chan struct{}, 1),
 		sendCh:        make(chan SignalingMessage, 64),
-		eventCh:       make(chan peerEvent, 32),         // buffer=32，统一状态变更事件队列
+		eventCh:       make(chan peerEvent, 32), // buffer=32，统一状态变更事件队列
 		ctx:           ctx,
 		cancel:        cancel,
 	}
@@ -2051,24 +2121,24 @@ func (s *SFUServer) removePeer(peer *Peer) {
 		return
 	}
 
+	roomEmpty := false
 	room.mu.Lock()
-	defer room.mu.Unlock()
-
 	// 按对象身份匹配：同账号多端场景下，被顶替的旧 peer 断开时
 	// 不能误删新 peer 的表项。
-	current, ok := room.Peers[peer.UserID]
-	if !ok || current != peer {
-		return
+	if current, ok := room.Peers[peer.UserID]; ok && current == peer {
+		s.cleanupPeerSubscriptions(room, peer.UserID)
+		s.closePeer(peer)
+		delete(room.Peers, peer.UserID)
+		// 清理该用户相关的 RTCP 路由（发布侧 + 订阅侧）与 QoS 状态
+		s.rtcpRouter.UnregisterByUser(peer.UserID)
+		s.qos.RemoveAllForUser(peer.UserID)
+		roomEmpty = len(room.Peers) == 0
 	}
+	room.mu.Unlock()
 
-	s.cleanupPeerSubscriptions(room, peer.UserID)
-	s.closePeer(peer)
-	delete(room.Peers, peer.UserID)
-	// 清理该用户相关的 RTCP 路由（发布侧 + 订阅侧）与 QoS 状态
-	s.rtcpRouter.UnregisterByUser(peer.UserID)
-	s.qos.RemoveAllForUser(peer.UserID)
-
-	s.deleteRoomIfEmpty(room)
+	if roomEmpty {
+		s.deleteRoomIfEmpty(peer.RoomID)
+	}
 
 	s.logger.Info("Peer removed", zap.Uint("room", peer.RoomID), zap.Uint("user", peer.UserID))
 }
@@ -2204,10 +2274,9 @@ func (s *SFUServer) KickUser(roomID, userID uint, reason string) error {
 	}
 
 	room.mu.Lock()
-	defer room.mu.Unlock()
-
 	peer, ok := room.Peers[userID]
 	if !ok {
+		room.mu.Unlock()
 		return errors.New("peer not found in room")
 	}
 
@@ -2217,9 +2286,13 @@ func (s *SFUServer) KickUser(roomID, userID uint, reason string) error {
 	// 清理该用户相关的 RTCP 路由（发布侧 + 订阅侧）与 QoS 状态
 	s.rtcpRouter.UnregisterByUser(userID)
 	s.qos.RemoveAllForUser(userID)
+	roomEmpty := len(room.Peers) == 0
+	room.mu.Unlock()
 
-	// Clean up empty room
-	s.deleteRoomIfEmpty(room)
+	// 锁外清理（锁序统一）
+	if roomEmpty {
+		s.deleteRoomIfEmpty(roomID)
+	}
 
 	s.logger.Info("User kicked from room",
 		zap.Uint("roomID", roomID),

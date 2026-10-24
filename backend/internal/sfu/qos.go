@@ -18,11 +18,11 @@ import (
 
 // QoS 判定阈值（fractionLost 为 8bit 定点，0~255 对应 0%~100%）
 const (
-	qosLossDownThreshold  = 51.0 // ≈20% 丢包 → 降层
-	qosLossUpThreshold    = 26.0 // ≈10% 丢包 → 允许升层
-	qosMinREMBForHighBps  = 300_000
-	qosSwitchCooldown     = 3 * time.Second
-	qosLossEMAAlpha       = 0.3 // 新样本权重
+	qosLossDownThreshold = 51.0 // ≈20% 丢包 → 降层
+	qosLossUpThreshold   = 26.0 // ≈10% 丢包 → 允许升层
+	qosMinREMBForHighBps = 300_000
+	qosSwitchCooldown    = 3 * time.Second
+	qosLossEMAAlpha      = 0.3 // 新样本权重
 )
 
 type qosState struct {

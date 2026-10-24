@@ -382,6 +382,23 @@ func TestRealServerAudioVideo(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("A did not receive B's audio RTP — renegotiation for existing users broken")
 	}
+
+	// ===== 回归：订阅侧路由条目必须填发布者原始 SSRC（PLI 转发改写依赖）=====
+	s.rtcpRouter.mu.RLock()
+	okTrackSSRC := false
+	for _, target := range s.rtcpRouter.ssrcMap {
+		if target.Subscriber != nil && target.Subscriber.UserID == 2 && target.FromUserID == 1 {
+			if target.TrackSSRC == 0 {
+				t.Errorf("B subscription route has zero TrackSSRC — PLI forwarding would fail")
+			} else {
+				okTrackSSRC = true
+			}
+		}
+	}
+	s.rtcpRouter.mu.RUnlock()
+	if !okTrackSSRC {
+		t.Fatal("no B-subscriber route entry for A found")
+	}
 }
 
 // pumpSamples 持续向音频/视频轨道写入样本（模拟真实摄像头/麦克风）。

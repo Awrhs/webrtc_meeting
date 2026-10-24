@@ -119,6 +119,25 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
         return
       }
 
+      // 私聊加密消息（pairwise E2EE）：{v:1, ciphertext, iv}
+      if (message.receiver_id !== null && message.receiver_id !== undefined) {
+        try {
+          const payload = JSON.parse(message.content) as { v: number; ciphertext: string; iv: string }
+          if (payload.v === 1 && payload.ciphertext && payload.iv) {
+            groupE2EEManager.decryptFromMember(message.sender_id, payload.ciphertext, payload.iv)
+              .then(plaintext => {
+                setDecryptedMessages(prev => ({ ...prev, [message.id]: plaintext }))
+              })
+              .catch(() => {
+                setDecryptedMessages(prev => ({ ...prev, [message.id]: '[无法解密]' }))
+              })
+            return
+          }
+        } catch {
+          // 格式不符，继续尝试群聊解密
+        }
+      }
+
       try {
         const encryptedData = JSON.parse(message.content) as EncryptedMessage
         groupE2EEManager.decryptMessage(encryptedData)
@@ -175,8 +194,18 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
       let encrypted = false
       let encryptionData: EncryptedMessage | null = null
 
-      // 群聊文本启用 E2EE；私聊/文件消息不加密（密钥链仅覆盖群聊成员间文本）
-      if (e2eeReady && !privateTarget) {
+      // 群聊文本用 Sender Keys E2EE；私聊文本用双方 pairwise 共享密钥 E2EE
+      if (privateTarget) {
+        if (e2eeReady) {
+          try {
+            const wrapped = await groupE2EEManager.encryptForMember(privateTarget.user_id, content)
+            content = JSON.stringify({ v: 1, ...wrapped })
+            encrypted = true
+          } catch (err) {
+            console.warn('[Chat] private E2EE unavailable, sending plaintext:', err)
+          }
+        }
+      } else if (e2eeReady) {
         encryptionData = await groupE2EEManager.encryptMessage(content, user.id)
         content = JSON.stringify(encryptionData)
         encrypted = true
@@ -441,9 +470,9 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
           <h4 style={{ marginBottom: 12 }}>其他成员：</h4>
           {memberFingerprints.filter(item => item.userId !== user?.id).length > 0 ? (
             memberFingerprints.filter(item => item.userId !== user?.id).map(item => (
-              <div key={item.userId} style={{ marginBottom: 8 }}>
-                <span>{item.name}</span>
-                <Tag style={{ marginLeft: 8 }}>{item.fingerprint}</Tag>
+              <div key={item.userId} style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8 }}>
+                <span style={{ minWidth: 80 }}>{item.name}</span>
+                <Tag style={{ fontFamily: 'monospace', fontSize: 12, margin: 0, userSelect: 'all' }}>{item.fingerprint}</Tag>
               </div>
             ))
           ) : (

@@ -128,15 +128,15 @@ export const deriveSharedKey = async (
 // ==================== 公钥指纹验证 ====================
 
 /**
- * 生成公钥指纹（用于线下验证，防止中间人攻击）
- * 格式：XXXX-XXXX  8位可读字符串
+ * 生成公钥指纹（用于线下验证，防止中间人攻击）。
+ * SHA-256 前 16 字节的 32 位 hex（128 bit 安全强度，分 4 组展示）。
  */
 export const getPublicKeyFingerprint = async (publicKey: string): Promise<string> => {
   const publicKeyRaw = base64ToArrayBuffer(publicKey)
   const hash = await crypto.subtle.digest('SHA-256', publicKeyRaw)
-  const hashBase64 = arrayBufferToBase64(hash)
-  const fingerprint = hashBase64.slice(0, 8).toUpperCase()
-  return `${fingerprint.slice(0, 4)}-${fingerprint.slice(4, 8)}`
+  const bytes = new Uint8Array(hash).slice(0, 16)
+  const hex = Array.from(bytes).map(b => b.toString(16).padStart(2, '0')).join('').toUpperCase()
+  return `${hex.slice(0, 8)}-${hex.slice(8, 16)}-${hex.slice(16, 24)}-${hex.slice(24, 32)}`
 }
 
 // ==================== HKDF 棘轮算法 ====================

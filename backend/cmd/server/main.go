@@ -12,6 +12,8 @@ import (
 	"context"
 	"net/http"
 	"os/signal"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -130,8 +132,17 @@ func main() {
 		c.String(http.StatusOK, "ok")
 	})
 
-	// 聊天图片/文件的静态目录
-	r.Static("/uploads", cfg.UploadDir)
+	// 上传文件需要登录才能访问（鉴权后按需返回）；
+	// 聊天图片/文件内容只对登录用户开放，防止目录被任意抓取。
+	r.GET("/uploads/:name", handlers.AuthMiddleware(cfg.JWTSecret), func(c *gin.Context) {
+		name := c.Param("name")
+		// 只允许纯文件名，防目录穿越
+		if name == "" || strings.Contains(name, "/") || strings.Contains(name, "\\") || strings.Contains(name, "..") {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file name"})
+			return
+		}
+		c.File(filepath.Join(cfg.UploadDir, name))
+	})
 	r.GET("/readyz", func(c *gin.Context) {
 		sqlDB, err := db.DB()
 		if err != nil || sqlDB.Ping() != nil || redisClient.Ping() != nil {
