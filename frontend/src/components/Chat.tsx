@@ -13,6 +13,59 @@ import { Message, RoomMember, UploadResult } from '@/types'
 import { groupE2EEManager, EncryptedMessage } from '@/utils/encryption'
 import { api } from '@/utils/api'
 
+// 上传文件只允许本站上传路径：防止消息内容携带外链（axios 遇到绝对 URL
+// 会绕过 baseURL，把 Authorization 头发往外部域名）。
+const UPLOAD_PATH_RE = /^\/(?:api\/v1\/rooms\/\d+\/uploads|uploads)\/[A-Za-z0-9._-]+$/
+
+const fetchUploadBlob = async (path: string): Promise<Blob> => {
+  if (!UPLOAD_PATH_RE.test(path)) throw new Error('invalid upload path')
+  const res = await api.get(path, { responseType: 'blob', timeout: 60000 })
+  return res.data as Blob
+}
+
+// 上传接口需要 Authorization 头，<img src> 无法携带，因此先拉取为 blob URL
+function AuthedImage({ path, alt }: { path: string; alt: string }) {
+  const [src, setSrc] = useState<string | null>(null)
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let objectUrl: string | null = null
+    let cancelled = false
+    fetchUploadBlob(path)
+      .then(blob => {
+        if (cancelled) return
+        objectUrl = URL.createObjectURL(blob)
+        setSrc(objectUrl)
+      })
+      .catch(() => {
+        if (!cancelled) setFailed(true)
+      })
+    return () => {
+      cancelled = true
+      if (objectUrl) URL.revokeObjectURL(objectUrl)
+    }
+  }, [path])
+
+  if (failed) return <>[图片加载失败]</>
+  if (!src) return <>图片加载中…</>
+  return <img src={src} alt={alt} style={{ maxWidth: 240, maxHeight: 180, borderRadius: 8, display: 'block' }} />
+}
+
+// 文件按需下载：点击时才拉取，避免聊天列表预加载大文件
+const downloadUpload = async (path: string, name: string) => {
+  try {
+    const blob = await fetchUploadBlob(path)
+    const objectUrl = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = objectUrl
+    a.download = name
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(objectUrl), 0)
+  } catch {
+    message.error('文件下载失败')
+  }
+}
+
 interface ChatProps {
   roomId: number
   messages: Message[]
@@ -306,13 +359,7 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
     if (m.type === 'image') {
       try {
         const payload = JSON.parse(m.content) as { url: string; name: string }
-        return (
-          <img
-            src={`${api.defaults.baseURL}${payload.url}`}
-            alt={payload.name}
-            style={{ maxWidth: 240, maxHeight: 180, borderRadius: 8, display: 'block' }}
-          />
-        )
+        return <AuthedImage path={payload.url} alt={payload.name} />
       } catch {
         return '[图片消息格式错误]'
       }
@@ -321,7 +368,13 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
       try {
         const payload = JSON.parse(m.content) as { url: string; name: string; size: number }
         return (
-          <a href={`${api.defaults.baseURL}${payload.url}`} download={payload.name} target="_blank" rel="noreferrer">
+          <a
+            href="#"
+            onClick={(e) => {
+              e.preventDefault()
+              void downloadUpload(payload.url, payload.name)
+            }}
+          >
             {payload.name}（{(payload.size / 1024).toFixed(1)} KB）点击下载
           </a>
         )

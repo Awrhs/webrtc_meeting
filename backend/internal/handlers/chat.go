@@ -153,14 +153,16 @@ func (h *Handler) UploadFile(c *gin.Context) {
 		return
 	}
 
-	// 安全文件名：时间戳 + 随机后缀，保留原始扩展名
+	// 安全文件名：时间戳 + 随机后缀，保留原始扩展名。
+	// 按房间分目录存放，下载时据此校验房间成员身份。
 	safeExt := strings.TrimPrefix(ext, ".")
 	name := fmt.Sprintf("%d_%s.%s", time.Now().UnixNano(), randHex(8), safeExt)
-	if err := os.MkdirAll(h.uploadDir, 0o755); err != nil {
+	roomDir := filepath.Join(h.uploadDir, strconv.Itoa(roomID))
+	if err := os.MkdirAll(roomDir, 0o755); err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage unavailable"})
 		return
 	}
-	out, err := os.Create(filepath.Join(h.uploadDir, name))
+	out, err := os.Create(filepath.Join(roomDir, name))
 	if err != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "storage unavailable"})
 		return
@@ -179,11 +181,53 @@ func (h *Handler) UploadFile(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{
-		"url":  "/uploads/" + name,
+		"url":  fmt.Sprintf("/api/v1/rooms/%d/uploads/%s", roomID, name),
 		"name": filepath.Base(header.Filename),
 		"size": written,
 		"type": msgType,
 	})
+}
+
+// GetUploadedFile 下载房间内上传的图片/文件：仅房间成员可访问。
+// 浏览器的 <img>/<a> 不会携带 Authorization 头，前端需经 axios 拉取为 blob 再展示。
+func (h *Handler) GetUploadedFile(c *gin.Context) {
+	userID := GetUserID(c)
+	roomID, err := strconv.Atoi(c.Param("id"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid room id"})
+		return
+	}
+	if _, err := h.roomService.GetMemberRole(uint(roomID), userID); err != nil {
+		c.JSON(http.StatusForbidden, gin.H{"error": "permission denied"})
+		return
+	}
+	name := c.Param("name")
+	if !IsSafeUploadName(name) {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file name"})
+		return
+	}
+	ServeUpload(c, filepath.Join(h.uploadDir, strconv.Itoa(roomID), name), name)
+}
+
+// IsSafeUploadName 只允许 UploadFile 生成的纯文件名，防目录穿越。
+func IsSafeUploadName(name string) bool {
+	if name == "" || name != filepath.Base(name) || strings.Contains(name, "..") || strings.ContainsAny(name, "/\\") {
+		return false
+	}
+	return allowedUploadExts[strings.ToLower(filepath.Ext(name))]
+}
+
+// ServeUpload 返回上传文件；非图片强制作为附件下载，并禁止 MIME 嗅探。
+func ServeUpload(c *gin.Context, path, name string) {
+	if _, err := os.Stat(path); err != nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "file not found"})
+		return
+	}
+	c.Header("X-Content-Type-Options", "nosniff")
+	if !imageExts[strings.ToLower(filepath.Ext(name))] {
+		c.Header("Content-Disposition", "attachment")
+	}
+	c.File(path)
 }
 
 var allowedUploadExts = map[string]bool{

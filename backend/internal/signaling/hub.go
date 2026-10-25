@@ -59,8 +59,6 @@ type Client struct {
 	userID  uint
 	roomIDs map[uint]bool
 	mu      sync.RWMutex
-	// writeMu 保护 conn 的并发写（WritePump 与 pingPump 各自写连接）
-	writeMu sync.Mutex
 }
 
 type Hub struct {
@@ -581,6 +579,8 @@ const (
 	pongWait = 60 * time.Second
 	// pingPeriod 向对端发 ping 的间隔（必须小于 pongWait）。
 	pingPeriod = 25 * time.Second
+	// writeWait 单次写操作的超时。
+	writeWait = 10 * time.Second
 	// maxMessageSize 单条信令消息上限（防止恶意超大帧占用内存/CPU）。
 	maxMessageSize = 64 * 1024 // 64KB 足够容纳 E2EE 消息/公钥/密钥分发
 )
@@ -592,16 +592,12 @@ func (c *Client) ReadPump() {
 	}()
 
 	// 连接存活保活：读超时 + ping/pong。
-	// 每收到 pong 刷新读超时；写侧由 pingPump 定时发 ping。
+	// 每收到 pong 刷新读超时；ping 由 WritePump 定时发送（conn 的所有写都在 WritePump 中）。
 	c.conn.SetReadLimit(maxMessageSize)
 	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	c.conn.SetPongHandler(func(string) error {
 		return c.conn.SetReadDeadline(time.Now().Add(pongWait))
 	})
-
-	// 启动该客户端的 ping 定时器
-	stopPing := make(chan struct{})
-	go c.pingPump(stopPing)
 
 	for {
 		_, message, err := c.conn.ReadMessage()
@@ -609,7 +605,6 @@ func (c *Client) ReadPump() {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure, websocket.CloseNormalClosure) {
 				c.hub.logger.Error("Read error", zap.Error(err))
 			}
-			close(stopPing)
 			return
 		}
 		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
@@ -621,26 +616,6 @@ func (c *Client) ReadPump() {
 		}
 
 		c.handleMessage(&msg)
-	}
-}
-
-// pingPump 定时向客户端发 ping 保活。
-func (c *Client) pingPump(stop <-chan struct{}) {
-	ticker := time.NewTicker(pingPeriod)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-stop:
-			return
-		case <-ticker.C:
-			c.writeMu.Lock()
-			_ = c.conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			err := c.conn.WriteMessage(websocket.PingMessage, nil)
-			c.writeMu.Unlock()
-			if err != nil {
-				return
-			}
-		}
 	}
 }
 
@@ -680,13 +655,33 @@ func (c *Client) handleMessage(msg *Message) {
 	}
 }
 
+// WritePump 是 conn 唯一的写 goroutine：业务消息与 ping 都在这里串行写出。
+// gorilla/websocket 不允许并发调用 WriteMessage，另起 goroutine 写 ping
+// 会触发 "concurrent write to websocket connection" panic 并使整个进程退出。
 func (c *Client) WritePump() {
-	defer c.conn.Close()
-	for message := range c.send {
-		err := c.conn.WriteMessage(websocket.TextMessage, message)
-		if err != nil {
-			c.hub.logger.Error("Write error", zap.Error(err))
-			break
+	ticker := time.NewTicker(pingPeriod)
+	defer func() {
+		ticker.Stop()
+		c.conn.Close()
+	}()
+	for {
+		select {
+		case message, ok := <-c.send:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if !ok {
+				// Hub 关闭了 send 通道
+				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				return
+			}
+			if err := c.conn.WriteMessage(websocket.TextMessage, message); err != nil {
+				c.hub.logger.Error("Write error", zap.Error(err))
+				return
+			}
+		case <-ticker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				return
+			}
 		}
 	}
 }

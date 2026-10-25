@@ -13,7 +13,6 @@ import (
 	"net/http"
 	"os/signal"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 
@@ -110,6 +109,7 @@ func main() {
 			auth.POST("/rooms/:id/messages", handler.SendMessage)
 			auth.GET("/rooms/:id/messages/private/:userId", handler.GetPrivateMessages)
 			auth.POST("/rooms/:id/upload", handler.UploadFile)
+			auth.GET("/rooms/:id/uploads/:name", handler.GetUploadedFile)
 
 			auth.GET("/rooms/:id/audit-logs", handler.GetAuditLogs)
 
@@ -132,16 +132,15 @@ func main() {
 		c.String(http.StatusOK, "ok")
 	})
 
-	// 上传文件需要登录才能访问（鉴权后按需返回）；
-	// 聊天图片/文件内容只对登录用户开放，防止目录被任意抓取。
+	// 兼容旧消息里的 /uploads/<name> 链接（按房间分目录之前上传的文件）：仅登录可访问。
+	// 新上传文件走 /api/v1/rooms/:id/uploads/:name，额外校验房间成员身份。
 	r.GET("/uploads/:name", handlers.AuthMiddleware(cfg.JWTSecret), func(c *gin.Context) {
 		name := c.Param("name")
-		// 只允许纯文件名，防目录穿越
-		if name == "" || strings.Contains(name, "/") || strings.Contains(name, "\\") || strings.Contains(name, "..") {
+		if !handlers.IsSafeUploadName(name) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file name"})
 			return
 		}
-		c.File(filepath.Join(cfg.UploadDir, name))
+		handlers.ServeUpload(c, filepath.Join(cfg.UploadDir, name), name)
 	})
 	r.GET("/readyz", func(c *gin.Context) {
 		sqlDB, err := db.DB()

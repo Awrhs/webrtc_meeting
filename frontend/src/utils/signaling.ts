@@ -48,9 +48,15 @@ export class SignalingClient {
       console.log('[Signaling] Connecting to:', wsUrl.replace(/token=([^&]+)/, 'token=***'))
       this.ws = new WebSocket(wsUrl)
 
+      // 自动重连（而非首次连接）时需要重新入会：服务端的房间映射随旧连接一起清除，
+      // 不重发 join_room 的话，宽限期到期后服务端会把仍在会议中的用户标记为离开。
+      const isReconnect = this.reconnectAttempts > 0
       this.ws.onopen = () => {
         console.log('[Signaling] WebSocket connected')
         this.reconnectAttempts = 0
+        if (isReconnect && this.currentRoomId) {
+          void this.rejoinRoom()
+        }
         resolve()
       }
 
@@ -97,6 +103,7 @@ export class SignalingClient {
     this.roomMembers.clear()
     this.pendingSenderKeyTargets.clear()
     this.reconnectAttempts = 0
+    this.currentRoomId = 0
     void this.deletePublicKey()
   }
 
@@ -127,6 +134,24 @@ export class SignalingClient {
     await this.fetchPublicKeysForMembers(Array.from(this.roomMembers))
     this.initMediaE2EE()
     await this.distributeMediaKeys(Array.from(this.roomMembers))
+  }
+
+  // 重连后重新入会：沿用现有 E2EE 身份与密钥链（不重新 init），
+  // 只重发 join_room 并重新广播公钥、分发媒体密钥，补上断线期间错过的密钥交换。
+  private async rejoinRoom() {
+    console.log('[Signaling] Rejoining room after reconnect:', this.currentRoomId)
+    this.send({
+      type: 'join_room',
+      room_id: this.currentRoomId,
+      user_id: this.currentUserId,
+      data: null,
+    })
+    try {
+      this.broadcastPublicKey()
+      await this.distributeMediaKeys(Array.from(this.roomMembers))
+    } catch (error) {
+      console.warn('[Signaling] Key redistribution after rejoin failed:', error)
+    }
   }
 
   broadcastPublicKey() {

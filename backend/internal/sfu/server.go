@@ -1783,6 +1783,7 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 
 	var peer *Peer
 	limiter := newRateLimiter(s.messageRateLimit, time.Minute)
+	rateLimitNotified := false // 每轮超限只提示一次，避免刷屏
 
 	defer func() {
 		if peer != nil {
@@ -1792,17 +1793,6 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	for {
-		if !limiter.Allow() {
-			// 超限不直接断开（ICE 候选+订阅消息在大房间可能瞬时超阈值），
-			// 丢弃本条消息并提示；连接保活，窗口重置后自动恢复。
-			if peer != nil {
-				s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "rate_limited"})
-			} else {
-				sendError(conn, "rate_limited", "too many messages")
-			}
-			continue
-		}
-
 		_, message, err := conn.ReadMessage()
 		if err != nil {
 			if err != io.EOF {
@@ -1810,6 +1800,23 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 			}
 			break
 		}
+
+		// 限流必须在读取之后判断：先判断再 continue 会跳过 ReadMessage，
+		// 在窗口重置前形成忙循环。
+		// 超限不直接断开（ICE 候选+订阅消息在大房间可能瞬时超阈值），
+		// 丢弃本条消息；连接保活，窗口重置后自动恢复。
+		if !limiter.Allow() {
+			if !rateLimitNotified {
+				rateLimitNotified = true
+				if peer != nil {
+					s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "rate_limited"})
+				} else {
+					sendError(conn, "rate_limited", "too many messages")
+				}
+			}
+			continue
+		}
+		rateLimitNotified = false
 
 		var msg SignalingMessage
 		if err := json.Unmarshal(message, &msg); err != nil {
