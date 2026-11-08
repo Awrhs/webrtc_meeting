@@ -16,7 +16,7 @@ import {
   FileSearchOutlined,
 } from '@ant-design/icons'
 import { RootState, AppDispatch } from '@/store'
-import { joinRoom, getRoomMessages, addMessage, setConnected, clearCurrentRoom, updateMember, removeMember, lockRoom, deleteRoom, getAuditLogs } from '@/store/slices/roomSlice'
+import { joinRoom, getRoomMessages, refreshMembers, addMessage, setConnected, clearCurrentRoom, updateMember, removeMember, lockRoom, deleteRoom, getAuditLogs } from '@/store/slices/roomSlice'
 import { MediaE2EEState, MediaE2EEManager } from '@/utils/mediaE2EE'
 import { api } from '@/utils/api'
 import VideoGrid, { RemoteStreamMeta } from '@/components/VideoGrid'
@@ -192,6 +192,14 @@ export default function MeetingRoom() {
       addMessage: (msg: any) => dispatch(addMessage(msg)),
       updateMember: (member: RoomMember) => dispatch(updateMember(member)),
       removeMember: (userId: number) => dispatch(removeMember(userId)),
+      refreshMembers: async () => {
+        try {
+          const result = await dispatch(refreshMembers(parseInt(id!))).unwrap()
+          return result.members
+        } catch {
+          return undefined
+        }
+      },
     },
     onRemoveRemoteStreams: removeRemoteStreamsByUser,
     getActiveMemberIds,

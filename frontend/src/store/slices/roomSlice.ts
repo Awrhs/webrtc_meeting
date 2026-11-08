@@ -70,6 +70,19 @@ export const joinRoom = createAsyncThunk(
   }
 )
 
+// 重新拉取房间与成员列表：有人加入时服务端只广播 user_id，成员资料（昵称/角色/媒体状态）要回源获取
+export const refreshMembers = createAsyncThunk(
+  'room/refreshMembers',
+  async (roomId: number, { rejectWithValue }) => {
+    try {
+      const response = await api.get(`/api/v1/rooms/${roomId}`)
+      return response.data as { room: Room; members: RoomMember[] }
+    } catch (error: any) {
+      return rejectWithValue(error.response?.data?.error || '刷新成员列表失败')
+    }
+  }
+)
+
 export const getRoomMessages = createAsyncThunk(
   'room/getMessages',
   async (roomId: number, { rejectWithValue }) => {
@@ -230,6 +243,12 @@ const roomSlice = createSlice({
       })
       .addCase(getRoomMessages.fulfilled, (state, action: PayloadAction<Message[]>) => {
         state.messages = action.payload
+      })
+      .addCase(refreshMembers.fulfilled, (state, action: PayloadAction<{ room: Room; members: RoomMember[] }>) => {
+        state.members = action.payload.members
+        if (state.currentRoom && action.payload.room) {
+          state.currentRoom = { ...state.currentRoom, ...action.payload.room }
+        }
       })
       .addCase(kickMember.fulfilled, (state, action: PayloadAction<number>) => {
         state.members = state.members.filter(m => m.user_id !== action.payload)

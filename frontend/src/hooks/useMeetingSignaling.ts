@@ -10,6 +10,8 @@ interface UseMeetingSignalingCallbacks {
     addMessage: (msg: any) => any
     updateMember: (member: RoomMember) => any
     removeMember: (userId: number) => any
+    // 回源刷新成员列表，返回最新成员（失败返回 undefined）
+    refreshMembers: () => Promise<RoomMember[] | undefined>
   }
   onRemoveRemoteStreams: (userId: number) => void
   getActiveMemberIds: (excludeUserId?: number) => number[]
@@ -50,10 +52,14 @@ export function useMeetingSignaling(callbacks: UseMeetingSignalingCallbacks) {
     )
 
     signaling.on('user_joined', (msg) => {
-      message.info(`${msg.data?.user_name || '用户'}加入了房间`)
-      if (msg.user_id !== callbacks.currentUserId) {
-        void signaling.rotateForMembershipChange('join', msg.user_id, callbacks.getActiveMemberIds(msg.user_id))
-      }
+      if (msg.user_id === callbacks.currentUserId) return
+      // 服务端只广播 user_id：必须回源刷新成员列表，否则已在会议中的人既看不到新成员，
+      // 也不会给对方分配视频格子/订阅其视频
+      void callbacks.dispatch.refreshMembers().then((members) => {
+        const joined = members?.find(m => m.user_id === msg.user_id)
+        message.info(`${joined?.nickname || '新成员'}加入了房间`)
+      })
+      void signaling.rotateForMembershipChange('join', msg.user_id, callbacks.getActiveMemberIds(msg.user_id))
     })
 
     signaling.on('user_left', (msg) => {
