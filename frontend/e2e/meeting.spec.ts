@@ -78,7 +78,8 @@ test.describe('full meeting E2E (requires E2E_FULL=1 + backend stack)', () => {
     await registerAndLogin(alice.page, aliceAccount)
     await alice.page.getByRole('button', { name: '创建房间' }).click()
     await alice.page.getByPlaceholder('请输入房间名称').fill(`房间${suffix}`)
-    await alice.page.getByRole('button', { name: '创建', exact: true }).click()
+    // antd 会在两个汉字的无图标按钮中间插入空格（"创 建"），不能精确匹配 "创建"
+    await alice.page.getByRole('button', { name: /^创\s?建$/ }).click()
     await alice.page.waitForURL(/\/meeting\/\d+/, { timeout: 20000 })
     const meetingUrl = alice.page.url()
 
