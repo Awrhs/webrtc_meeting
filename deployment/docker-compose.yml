@@ -27,12 +27,18 @@ services:
   redis:
     image: redis:7-alpine
     container_name: conference-redis
-    # REDIS_PASSWORD 非空时启用密码（api-server / sfu-server 同样读取 REDIS_PASSWORD）
-    command: ["sh", "-c", "exec redis-server ${REDIS_PASSWORD:+--requirepass $$REDIS_PASSWORD}"]
+    # REDIS_PASSWORD 非空时启用密码（api-server / sfu-server 同样读取 REDIS_PASSWORD）。
+    # 判断放在容器内的 sh 里做（$$ 是 compose 对 $ 的转义），不依赖 compose 的嵌套插值。
+    command:
+      - sh
+      - -c
+      - 'if [ -n "$$REDIS_PASSWORD" ]; then exec redis-server --requirepass "$$REDIS_PASSWORD"; else exec redis-server; fi'
     environment:
       REDIS_PASSWORD: ${REDIS_PASSWORD:-}
     healthcheck:
-      test: ["CMD-SHELL", "redis-cli ${REDIS_PASSWORD:+-a $$REDIS_PASSWORD} ping | grep -q PONG"]
+      test:
+        - CMD-SHELL
+        - 'if [ -n "$$REDIS_PASSWORD" ]; then redis-cli -a "$$REDIS_PASSWORD" ping; else redis-cli ping; fi | grep -q PONG'
       interval: 5s
       timeout: 5s
       retries: 12
@@ -51,9 +57,9 @@ services:
       - >-
         exec turnserver --log-file=stdout --fingerprint --no-cli
         --realm=${TURN_REALM:-conference}
-        --use-auth-secret --static-auth-secret=$$TURN_STATIC_AUTH_SECRET
+        --use-auth-secret --static-auth-secret="$$TURN_STATIC_AUTH_SECRET"
         --min-port=49300 --max-port=49400
-        ${TURN_EXTERNAL_IP:+--external-ip=$$TURN_EXTERNAL_IP}
+        $${TURN_EXTERNAL_IP:+--external-ip=$$TURN_EXTERNAL_IP}
     environment:
       TURN_STATIC_AUTH_SECRET: ${TURN_STATIC_AUTH_SECRET:-dev-turn-secret-change-in-production}
       TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}

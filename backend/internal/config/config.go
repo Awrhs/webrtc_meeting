@@ -148,9 +148,9 @@ func Load() *Config {
 		SFUCallbackToken:           getEnv("SFU_CALLBACK_TOKEN", "dev-sfu-callback-token"),
 		JWTExpiryHours:             getEnvAsInt("JWT_EXPIRY_HOURS", 168),
 		SFUTokenExpiryMinutes:      getEnvAsInt("SFU_TOKEN_EXPIRY_MINUTES", 5),
-		CoturnURL:                  getEnv("COTURN_URL", "turn:localhost:3478"),
-		CoturnUser:                 getEnv("COTURN_USER", "username"),
-		CoturnPassword:             getEnv("COTURN_PASSWORD", "password"),
+		CoturnURL:                  getEnv("COTURN_URL", ""), // 旧固定账号 TURN：显式配置才下发，默认占位值会让浏览器白做 TURN 分配
+		CoturnUser:                 getEnv("COTURN_USER", ""),
+		CoturnPassword:             getEnv("COTURN_PASSWORD", ""),
 		AllowedOrigins:             getEnvList("ALLOWED_ORIGINS", "http://localhost:3000,http://127.0.0.1:3000,http://localhost:5173,http://127.0.0.1:5173"),
 		SFUAllowUnauthenticatedDev: getEnvAsBool("SFU_ALLOW_UNAUTHENTICATED_DEV", false),
 		HTTPReadTimeoutSeconds:     getEnvAsInt("HTTP_READ_TIMEOUT_SECONDS", 10),
