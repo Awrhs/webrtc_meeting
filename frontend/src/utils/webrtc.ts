@@ -64,6 +64,8 @@ export class SFUConnection {
   private maxReconnectAttempts = 5
   private reconnectDelay = 3000
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null
+  // ICE 进入 disconnected 后的宽限定时器：多数 disconnected 是瞬时抖动，会自行恢复
+  private iceDisconnectTimer: ReturnType<typeof setTimeout> | null = null
   private isManualDisconnect = false
   private negotiationPromise: Promise<void> = Promise.resolve()
   private pendingRemoteTracks: { ssrc: number; streamId: string; track: MediaStreamTrack; stream: MediaStream }[] = []
@@ -164,6 +166,13 @@ export class SFUConnection {
         sender = this.pc!.addTrack(track, localStream)
       }
       this.mediaE2EEManager?.attachSender(sender, track)
+      // localStream 里的视频轨道就是摄像头（屏幕共享从不放进 localStream）：
+      // 记录 sender，供 muteVideo/unpublishCamera 精确操作，而不是对所有视频 sender 一刀切
+      if (track.kind === 'video') {
+        this.cameraSender = sender
+        this.cameraTrack = track
+        this.cameraStream = localStream
+      }
     })
 
     // 重连场景：摄像头轨道可能晚于 connect() 发布（默认音频入会），
@@ -211,10 +220,30 @@ export class SFUConnection {
     }
 
     this.pc.oniceconnectionstatechange = () => {
-      console.log('[WebRTC] ICE connection state:', this.pc?.iceConnectionState)
-      // ICE 连接失败自动重连
-      if (this.pc?.iceConnectionState === 'failed' || this.pc?.iceConnectionState === 'disconnected') {
+      const state = this.pc?.iceConnectionState
+      console.log('[WebRTC] ICE connection state:', state)
+      if (state === 'failed') {
+        this.clearIceDisconnectTimer()
         this.scheduleReconnect()
+        return
+      }
+      if (state === 'disconnected') {
+        // disconnected 常常是瞬时的（网络抖动、切换 Wi-Fi），ICE 会自行恢复；
+        // 给 5 秒宽限，仍未恢复才重建连接，避免一次抖动就拆掉整条媒体链路
+        if (!this.iceDisconnectTimer) {
+          this.iceDisconnectTimer = setTimeout(() => {
+            this.iceDisconnectTimer = null
+            const current = this.pc?.iceConnectionState
+            if (current === 'disconnected' || current === 'failed') {
+              console.warn('[WebRTC] ICE still disconnected after grace period, reconnecting')
+              this.scheduleReconnect()
+            }
+          }, 5000)
+        }
+        return
+      }
+      if (state === 'connected' || state === 'completed') {
+        this.clearIceDisconnectTimer()
       }
     }
 
@@ -235,7 +264,8 @@ export class SFUConnection {
 
     this.ws.onopen = () => {
       console.log('[WebRTC] Connected to SFU WebSocket, sending join...')
-      this.reconnectAttempts = 0
+      // 注意：重连计数只在 PeerConnection 真正 connected 时归零。
+      // 若在这里归零，"WS 能连上但媒体一直失败"的情况会无限重连。
       this.send({
         type: 'join',
         room_id: this.roomId,
@@ -281,43 +311,59 @@ export class SFUConnection {
     }
   }
 
+  private clearIceDisconnectTimer() {
+    if (this.iceDisconnectTimer) {
+      clearTimeout(this.iceDisconnectTimer)
+      this.iceDisconnectTimer = null
+    }
+  }
+
   private scheduleReconnect() {
     if (this.isManualDisconnect) return
+    // 已有重连计划：不重复计数。ICE failed 与 connectionState failed、WS onclose
+    // 往往接连触发，旧实现会把一次故障记成两三次尝试。
+    if (this.reconnectTimer) return
     if (this.reconnectAttempts >= this.maxReconnectAttempts) {
       console.error('[WebRTC] Max reconnect attempts reached')
       this.onError('连接失败次数过多，请刷新页面重试')
       return
     }
 
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer)
-    }
-
     this.reconnectAttempts++
     console.log(`[WebRTC] Scheduling reconnect (${this.reconnectAttempts}/${this.maxReconnectAttempts})...`)
 
     this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null
+      if (this.isManualDisconnect) return
       console.log('[WebRTC] Attempting reconnect...')
       const stream = this.localStream
-      if (stream) {
-        this.refreshSFUToken()
-          .then(() => {
-            // 重连时不能销毁本地媒体（摄像头/麦克风），只重建 WS + PC；
-            // closeTransport() 会把 localStream 置空，之前直接传 this.localStream!
-            // 会导致 connect(null) 崩溃，重连必然失败。
-            this.closeTransport(false)
-            return this.connect(stream)
-          })
-          .catch((err) => {
-            console.error('[WebRTC] Reconnect failed:', err)
-            this.onError('媒体重连失败，请刷新页面重试')
-          })
-      }
+      if (!stream) return
+      this.refreshSFUToken()
+        .then(() => {
+          // 刷新 token 期间用户可能已主动离会（disconnect）：不能再把连接拉起来
+          if (this.isManualDisconnect) return
+          // 重连时不能销毁本地媒体（摄像头/麦克风），只重建 WS + PC；
+          // closeTransport() 会把 localStream 置空，之前直接传 this.localStream!
+          // 会导致 connect(null) 崩溃，重连必然失败。
+          this.closeTransport(false)
+          return this.connect(stream)
+        })
+        .catch((err) => {
+          if (this.isManualDisconnect) return
+          console.error('[WebRTC] Reconnect failed:', err)
+          this.onError('媒体重连失败，请刷新页面重试')
+        })
     }, this.reconnectDelay)
   }
 
   private async handleMessage(event: MessageEvent) {
-    const message: SFUMessage = JSON.parse(event.data)
+    let message: SFUMessage
+    try {
+      message = JSON.parse(event.data)
+    } catch {
+      console.warn('[WebRTC] Ignoring malformed message from SFU')
+      return
+    }
     console.log('[WebRTC] Received message from SFU:', message.type)
 
     switch (message.type) {
@@ -330,14 +376,16 @@ export class SFUConnection {
         break
       case 'answer':
         console.log('[WebRTC] Received answer from SFU')
-        if (message.sdp && this.pc) {
-          await this.pc.setRemoteDescription({
-            type: 'answer',
-            sdp: message.sdp,
+        if (message.sdp) {
+          // 与 offer/重协商共用同一条串行队列：setRemoteDescription 不能与进行中的协商交错
+          const sdp = message.sdp
+          await this.queueNegotiation(async () => {
+            if (!this.pc) return
+            await this.pc.setRemoteDescription({ type: 'answer', sdp })
+            // 远端描述已设置：刷新此前缓存的 ICE 候选
+            await this.flushPendingIceCandidates()
+            console.log('[WebRTC] Remote description set')
           })
-          // 远端描述已设置：刷新此前缓存的 ICE 候选
-          await this.flushPendingIceCandidates()
-          console.log('[WebRTC] Remote description set')
         }
         break
       case 'offer':
@@ -576,14 +624,28 @@ export class SFUConnection {
   // closeTransport 重建传输层。stopLocalMedia=false 用于重连场景：
   // 保留摄像头/麦克风轨道（不调用 track.stop()），重连后重新发布。
   private closeTransport(stopLocalMedia = true) {
+    this.clearIceDisconnectTimer()
+
     if (this.ws) {
-      this.ws.close(1000, 'Connection reset')
+      const ws = this.ws
       this.ws = null
+      // 先摘掉回调再关闭：旧连接的 onclose/onerror 不能再触发 onDisconnected 或重连，
+      // 否则重连成功后旧连接的关闭事件会把新连接的状态搅乱
+      ws.onopen = null
+      ws.onmessage = null
+      ws.onerror = null
+      ws.onclose = null
+      ws.close(1000, 'Connection reset')
     }
 
     if (this.pc) {
-      this.pc.close()
+      const pc = this.pc
       this.pc = null
+      pc.onicecandidate = null
+      pc.ontrack = null
+      pc.oniceconnectionstatechange = null
+      pc.onconnectionstatechange = null
+      pc.close()
     }
 
     if (stopLocalMedia) {
@@ -639,13 +701,15 @@ export class SFUConnection {
     }
   }
 
+  // 只作用于摄像头轨道：屏幕共享是独立的视频 sender，不能被"关摄像头"一并关掉
   muteVideo(muted: boolean) {
     if (this.cameraTrack) {
       this.cameraTrack.enabled = !muted
     }
-    this.pc?.getSenders().forEach(s => {
-      if (s.track?.kind === 'video') s.track.enabled = !muted
-    })
+    const senderTrack = this.cameraSender?.track
+    if (senderTrack && senderTrack !== this.cameraTrack) {
+      senderTrack.enabled = !muted
+    }
   }
 
   // 关闭摄像头时真正停止发布（replaceTrack(null)），不再发送黑帧浪费上行带宽；

@@ -97,6 +97,11 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
   const privateHistoryLoaded = useRef<Set<number>>(new Set())
   // 私聊会话的追加消息（store 只保存群聊历史 + 实时消息）
   const [privateMessages, setPrivateMessages] = useState<Record<number, Message[]>>({})
+  // 正在解密中的消息 id：避免每次渲染都对同一条消息重复发起解密
+  const decryptInFlight = useRef<Set<number>>(new Set())
+  // 成员列表引用：供回调里查昵称，不把 members 加进 effect 依赖
+  const membersRef = useRef(members)
+  membersRef.current = members
 
   useEffect(() => {
     groupE2EEManager.setCallbacks(
@@ -124,31 +129,43 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
       },
       (fingerprint: string) => {
         setMyFingerprint(fingerprint)
+      },
+      (userId: number, oldFingerprint: string, newFingerprint: string) => {
+        // 已知成员的身份公钥变了：可能是对方清除了密钥重新生成，也可能是中间人。
+        // 不能静默接受，提示用户通过其他渠道重新核对指纹。
+        const member = membersRef.current.find(m => m.user_id === userId)
+        const name = member?.nickname || `用户 ${userId}`
+        message.warning(
+          `成员「${name}」的安全指纹已变更（${oldFingerprint.slice(0, 8)}… → ${newFingerprint.slice(0, 8)}…），请通过其他渠道重新核对`,
+          10
+        )
       }
     )
 
     if (!signaling) {
       groupE2EEManager.init(user?.id).catch(console.error)
+      return
     }
 
-    // 监听 Sender Key 分发消息
-    if (signaling) {
-      signaling.on('sender_key', async (msg: any) => {
-        if (msg.data?.key_type === 'media') return
-        if (msg.target_id && msg.target_id !== user?.id) return
-        try {
-          await groupE2EEManager.receiveSenderKey(
-            msg.data.from_user,
-            msg.data.encrypted_chain_key
-          )
-          console.log(`[Chat] Received sender key from user ${msg.data.from_user}`)
-        } catch (err) {
-          console.error('[Chat] Failed to receive sender key:', err)
-        }
-      })
+    // 监听 Sender Key 分发消息；effect 重跑/卸载时必须注销，否则每次都会多挂一个监听器
+    const onSenderKey = async (msg: any) => {
+      if (msg.data?.key_type === 'media') return
+      if (msg.target_id && msg.target_id !== user?.id) return
+      try {
+        await groupE2EEManager.receiveSenderKey(
+          msg.data.from_user,
+          msg.data.encrypted_chain_key
+        )
+        console.log(`[Chat] Received sender key from user ${msg.data.from_user}`)
+      } catch (err) {
+        console.error('[Chat] Failed to receive sender key:', err)
+      }
     }
+    signaling.on('sender_key', onSenderKey)
 
-    return () => {}
+    return () => {
+      signaling.off('sender_key', onSenderKey)
+    }
   }, [roomId, user?.id, signaling])
 
   const scrollToBottom = () => {
@@ -160,15 +177,23 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
   }, [messages])
 
   useEffect(() => {
+    const setResult = (id: number, text: string) => {
+      decryptInFlight.current.delete(id)
+      setDecryptedMessages(prev => ({ ...prev, [id]: text }))
+    }
+    const describeError = (err: unknown) => (err instanceof Error && err.message ? err.message : '未知错误')
+
     messages.forEach(message => {
       if (!message.encrypted || decryptedMessages[message.id]) return
+      if (decryptInFlight.current.has(message.id)) return
 
       // 自己发送的消息：直接取发送时记录的明文（无需也无法解密）
       if (message.sender_id === user?.id) {
         const plaintext = sentPlaintexts.current.get(message.content)
-        if (plaintext !== undefined) {
-          setDecryptedMessages(prev => ({ ...prev, [message.id]: plaintext }))
-        }
+        setDecryptedMessages(prev => ({
+          ...prev,
+          [message.id]: plaintext ?? '[本设备发送的历史消息，密钥已轮换，无法回显]',
+        }))
         return
       }
 
@@ -177,13 +202,10 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
         try {
           const payload = JSON.parse(message.content) as { v: number; ciphertext: string; iv: string }
           if (payload.v === 1 && payload.ciphertext && payload.iv) {
+            decryptInFlight.current.add(message.id)
             groupE2EEManager.decryptFromMember(message.sender_id, payload.ciphertext, payload.iv)
-              .then(plaintext => {
-                setDecryptedMessages(prev => ({ ...prev, [message.id]: plaintext }))
-              })
-              .catch(() => {
-                setDecryptedMessages(prev => ({ ...prev, [message.id]: '[无法解密]' }))
-              })
+              .then(plaintext => setResult(message.id, plaintext))
+              .catch(err => setResult(message.id, `[无法解密：${describeError(err)}]`))
             return
           }
         } catch {
@@ -193,11 +215,11 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
 
       try {
         const encryptedData = JSON.parse(message.content) as EncryptedMessage
+        decryptInFlight.current.add(message.id)
+        // 缺密钥时 decryptMessage 会挂起直到密钥到达，由 in-flight 集合防止重复发起
         groupE2EEManager.decryptMessage(encryptedData)
-          .then(plaintext => {
-            setDecryptedMessages(prev => ({ ...prev, [message.id]: plaintext }))
-          })
-          .catch(() => {})
+          .then(plaintext => setResult(message.id, plaintext))
+          .catch(err => setResult(message.id, `[无法解密：${describeError(err)}]`))
       } catch {
         setDecryptedMessages(prev => ({ ...prev, [message.id]: '[消息格式错误]' }))
       }
@@ -247,17 +269,18 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
       let encrypted = false
       let encryptionData: EncryptedMessage | null = null
 
-      // 群聊文本用 Sender Keys E2EE；私聊文本用双方 pairwise 共享密钥 E2EE
+      // 群聊文本用 Sender Keys E2EE；私聊文本用双方 pairwise 共享密钥 E2EE。
+      // 两者都不允许降级为明文：密钥没就绪就拒绝发送并明确提示。
       if (privateTarget) {
-        if (e2eeReady) {
-          try {
-            const wrapped = await groupE2EEManager.encryptForMember(privateTarget.user_id, content)
-            content = JSON.stringify({ v: 1, ...wrapped })
-            encrypted = true
-          } catch (err) {
-            console.warn('[Chat] private E2EE unavailable, sending plaintext:', err)
-          }
+        if (!e2eeReady || !groupE2EEManager.hasSharedKey(privateTarget.user_id)) {
+          message.error('与该成员的加密密钥尚未建立，私聊消息未发送（不会以明文发送）')
+          return
         }
+        const wrapped = await groupE2EEManager.encryptForMember(privateTarget.user_id, content)
+        content = JSON.stringify({ v: 1, ...wrapped })
+        encrypted = true
+        // 自己发出的私聊消息也要能回显
+        sentPlaintexts.current.set(content, input.trim())
       } else if (e2eeReady) {
         encryptionData = await groupE2EEManager.encryptMessage(content, user.id)
         content = JSON.stringify(encryptionData)
@@ -469,18 +492,24 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
             }}
           />
           <Input
-            placeholder={privateTarget ? `私聊 ${privateTarget.nickname}...` : e2eeReady ? '输入消息（端到端加密）' : '等待密钥协商...'}
+            placeholder={
+              !e2eeReady
+                ? '等待密钥协商...'
+                : privateTarget
+                  ? `私聊 ${privateTarget.nickname}（端到端加密）...`
+                  : '输入消息（端到端加密）'
+            }
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onPressEnter={handleSend}
-            disabled={!privateTarget && !e2eeReady}
+            disabled={!e2eeReady}
           />
           <Button
             type="primary"
             icon={<SendOutlined />}
             loading={sending}
             onClick={handleSend}
-            disabled={!privateTarget && !e2eeReady}
+            disabled={!e2eeReady}
           >
             发送
           </Button>

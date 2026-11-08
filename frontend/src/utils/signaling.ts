@@ -1,5 +1,5 @@
 import { RoomMember, SignalingMessage } from '@/types'
-import { groupE2EEManager } from './encryption'
+import { groupE2EEManager, decodePublicKeyBundle } from './encryption'
 import { api } from './api'
 import { MediaE2EEManager } from './mediaE2EE'
 
@@ -26,7 +26,7 @@ export class SignalingClient {
     const apiHost = import.meta.env.VITE_API_HOST || 'http://localhost:8080'
     const wsProtocol = apiHost.startsWith('https') ? 'wss:' : 'ws:'
     const wsHost = apiHost.replace(/^https?:\/\//, '')
-    return `${wsProtocol}//${wsHost}/ws?token=${token}`
+    return `${wsProtocol}//${wsHost}/ws?token=${encodeURIComponent(token ?? '')}`
   }
 
   connect(): Promise<void> {
@@ -155,23 +155,26 @@ export class SignalingClient {
   }
 
   broadcastPublicKey() {
-    const publicKey = groupE2EEManager.getIdentityPublicKey()
+    // 同时广播 ECDH 协商公钥与 ECDSA 签名公钥：后者用于校验群聊消息签名（发送者认证）
     this.send({
       type: 'public_key',
       room_id: this.currentRoomId,
       user_id: this.currentUserId,
-      data: { public_key: publicKey },
+      data: {
+        public_key: groupE2EEManager.getIdentityPublicKey(),
+        signing_key: groupE2EEManager.getSigningPublicKey(),
+      },
     })
     console.log('[Signaling] Broadcasted public key for E2EE')
   }
 
-  async addRoomMember(userId: number, publicKey?: string) {
+  async addRoomMember(userId: number, publicKey?: string, signingKey?: string) {
     if (userId === this.currentUserId) return
 
     this.roomMembers.add(userId)
 
     if (publicKey) {
-      await groupE2EEManager.addMember(userId, publicKey)
+      await groupE2EEManager.addMember(userId, publicKey, signingKey)
       await this.sendPendingSenderKey(userId)
       await this.distributeMediaKeys([userId])
       console.log(`[Signaling] E2EE shared key established with user ${userId}`)
@@ -284,8 +287,9 @@ export class SignalingClient {
 
       if (message.type === 'public_key' && message.user_id !== this.currentUserId) {
         const publicKey = message.data?.public_key
+        const signingKey = typeof message.data?.signing_key === 'string' ? message.data.signing_key : undefined
         if (publicKey) {
-          await this.addRoomMember(message.user_id, publicKey)
+          await this.addRoomMember(message.user_id, publicKey, signingKey)
         }
       }
 
@@ -337,7 +341,9 @@ export class SignalingClient {
       try {
         const response = await api.get(`/api/v1/e2ee/public-key/${userId}`)
         if (response.data?.exists && response.data.public_key) {
-          await this.addRoomMember(userId, response.data.public_key)
+          // 服务端存的是公钥包（ECDH + ECDSA）；旧客户端上传的裸 ECDH 公钥也能解析
+          const bundle = decodePublicKeyBundle(response.data.public_key)
+          await this.addRoomMember(userId, bundle.ecdh, bundle.ecdsa)
         }
       } catch (error) {
         console.warn(`[Signaling] Failed to fetch public key for user ${userId}`, error)
@@ -348,8 +354,8 @@ export class SignalingClient {
   private async uploadCurrentPublicKey() {
     try {
       await api.post('/api/v1/e2ee/public-key', {
-        public_key: groupE2EEManager.getIdentityPublicKey(),
-        key_type: 'ecdh_p256',
+        public_key: groupE2EEManager.getPublicKeyBundle(),
+        key_type: 'bundle_v2',
       })
     } catch (error) {
       console.warn('[Signaling] Failed to upload public key', error)
