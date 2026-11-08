@@ -534,6 +534,22 @@ func (m *recorderManager) listRecordings() []map[string]interface{} {
 	return result
 }
 
+// isSafeRecordingName 录制目录/文件名白名单：字母、数字、'.'、'_'、'-'，且不含 ".."（防目录穿越）。
+// 用于校验下载请求参数；与 sanitizeFileName（生成文件名时改写非法字符）不同，这里只校验不改写。
+func isSafeRecordingName(name string) bool {
+	if name == "" || strings.Contains(name, "..") {
+		return false
+	}
+	for _, r := range name {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '.', r == '_', r == '-':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
 func sanitizeFileName(name string) string {
 	var b strings.Builder
 	for _, r := range name {

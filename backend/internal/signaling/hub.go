@@ -77,6 +77,7 @@ type Hub struct {
 	removeUserFromRoom chan *RoomUserAction
 	broadcastAll       chan []byte
 	presenceQueries    chan *presenceQuery
+	statsQueries       chan chan HubStats
 	checkLeave         chan checkLeaveMsg
 
 	roomService    service.RoomService
@@ -101,6 +102,12 @@ type RoomUserAction struct {
 type presenceQuery struct {
 	roomID uint
 	resp   chan []uint
+}
+
+// HubStats 信令层的实时统计（/metrics 用）。
+type HubStats struct {
+	Clients int // 在线 WebSocket 客户端数
+	Rooms   int // 有在线成员的房间数
 }
 
 type checkLeaveMsg struct {
@@ -145,6 +152,7 @@ func NewHubWithGrace(roomService service.RoomService, chatService service.ChatSe
 		removeUserFromRoom: make(chan *RoomUserAction, 16),
 		broadcastAll:       make(chan []byte, 16),
 		presenceQueries:    make(chan *presenceQuery, 16),
+		statsQueries:       make(chan chan HubStats, 4),
 		checkLeave:         make(chan checkLeaveMsg, 64),
 		roomService:        roomService,
 		chatService:        chatService,
@@ -242,9 +250,28 @@ func (h *Hub) Run() {
 			}
 			query.resp <- users
 
+		case resp := <-h.statsQueries:
+			resp <- HubStats{Clients: len(h.clients), Rooms: len(h.rooms)}
+
 		case msg := <-h.checkLeave:
 			h.handleCheckLeave(msg)
 		}
+	}
+}
+
+// Stats 返回当前在线客户端数与活跃房间数（经 Run 循环串行读取，无需加锁）。
+func (h *Hub) Stats() HubStats {
+	resp := make(chan HubStats, 1)
+	select {
+	case h.statsQueries <- resp:
+		select {
+		case stats := <-resp:
+			return stats
+		case <-time.After(2 * time.Second):
+			return HubStats{}
+		}
+	case <-time.After(2 * time.Second):
+		return HubStats{}
 	}
 }
 

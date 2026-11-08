@@ -61,6 +61,10 @@ type Config struct {
 	SMTPTLSMode              string
 	RequireEmailVerification bool
 	AppName                  string
+	// SFUHTTPURL：API 服务访问 SFU HTTP 接口（录制列表/下载代理）的内网地址
+	SFUHTTPURL string
+	// MetricsToken：非空时 /metrics 需要 Bearer token（Prometheus bearer_token）
+	MetricsToken string
 }
 
 func loadEnvFromFile(filename string) error {
@@ -160,6 +164,8 @@ func Load() *Config {
 		SMTPTLSMode:                strings.ToLower(getEnv("SMTP_TLS_MODE", "starttls")),
 		RequireEmailVerification:   getEnvAsBool("REQUIRE_EMAIL_VERIFICATION", false),
 		AppName:                    getEnv("APP_NAME", "SFU会议"),
+		SFUHTTPURL:                 getEnv("SFU_HTTP_URL", "http://localhost:8081"),
+		MetricsToken:               getEnv("METRICS_TOKEN", ""),
 	}
 	if err := cfg.Validate(); err != nil {
 		panic(err)

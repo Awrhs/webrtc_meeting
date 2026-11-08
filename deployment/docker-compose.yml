@@ -61,6 +61,10 @@ services:
       SFU_PORT: 8081
       SFU_GRPC_PORT: 50051
       SFU_ADDR: sfu-server:50051
+      # API 访问 SFU HTTP 接口（录制列表/下载代理）的内网地址
+      SFU_HTTP_URL: http://sfu-server:8081
+      # 非空时 /metrics 需要 Bearer token
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
       DB_HOST: postgres
       DB_PORT: 5432
       DB_USER: ${DB_USER:-postgres}
@@ -139,6 +143,7 @@ services:
       RATE_LIMIT_SFU_MSG_PER_MINUTE: ${RATE_LIMIT_SFU_MSG_PER_MINUTE:-600}
       SFU_PUBLIC_WS_URL: ${SFU_PUBLIC_WS_URL:-ws://localhost:8081}
       SFU_RECORDING_DIR: ${SFU_RECORDING_DIR:-}
+      METRICS_TOKEN: ${METRICS_TOKEN:-}
     ports:
       - "8081:8081"
     volumes:

@@ -28,11 +28,13 @@ type Handler struct {
 	sfuRouter        *sfu.ControlRouter
 	logger           *zap.Logger
 	sfuCallbackToken string
-	uploadDir        string
-	uploadMaxBytes   int64
+	// sfuHTTPURL：API 访问 SFU HTTP 接口（录制列表/下载代理）的内网地址
+	sfuHTTPURL     string
+	uploadDir      string
+	uploadMaxBytes int64
 }
 
-func NewHandler(userService service.UserService, userRepo repository.UserRepository, roomService service.RoomService, chatService service.ChatService, hub *signaling.Hub, sfuRouter *sfu.ControlRouter, sfuCallbackToken string, uploadDir string, uploadMaxBytes int64, logger *zap.Logger) *Handler {
+func NewHandler(userService service.UserService, userRepo repository.UserRepository, roomService service.RoomService, chatService service.ChatService, hub *signaling.Hub, sfuRouter *sfu.ControlRouter, sfuCallbackToken string, sfuHTTPURL string, uploadDir string, uploadMaxBytes int64, logger *zap.Logger) *Handler {
 	return &Handler{
 		userService:      userService,
 		userRepo:         userRepo,
@@ -42,6 +44,7 @@ func NewHandler(userService service.UserService, userRepo repository.UserReposit
 		sfuRouter:        sfuRouter,
 		logger:           logger,
 		sfuCallbackToken: sfuCallbackToken,
+		sfuHTTPURL:       sfuHTTPURL,
 		uploadDir:        uploadDir,
 		uploadMaxBytes:   uploadMaxBytes,
 	}

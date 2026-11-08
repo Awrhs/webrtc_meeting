@@ -22,6 +22,7 @@ import { api } from '@/utils/api'
 import VideoGrid, { RemoteStreamMeta } from '@/components/VideoGrid'
 import Chat from '@/components/Chat'
 import MemberList from '@/components/MemberList'
+import RecordingsModal from '@/components/RecordingsModal'
 import { JoinRoomResponse, RoomMember, AuditLog } from '@/types'
 import { useRemoteStreams } from '@/hooks/useRemoteStreams'
 import { useLocalMedia } from '@/hooks/useLocalMedia'
@@ -50,6 +51,8 @@ export default function MeetingRoom() {
   const [privateTarget, setPrivateTarget] = useState<RoomMember | null>(null)
   // 审计日志弹窗
   const [auditLogsVisible, setAuditLogsVisible] = useState(false)
+  // 会议录制弹窗（房主/管理员）
+  const [recordingsVisible, setRecordingsVisible] = useState(false)
   const [auditLogs, setAuditLogs] = useState<AuditLog[]>([])
   const [auditLogsLoading, setAuditLogsLoading] = useState(false)
 
@@ -350,6 +353,12 @@ export default function MeetingRoom() {
         label: '审计日志',
         onClick: handleShowAuditLogs,
       })
+      items.push({
+        key: 'recordings',
+        icon: <VideoCameraOutlined />,
+        label: '会议录制',
+        onClick: () => setRecordingsVisible(true),
+      })
     }
 
     if (items.length > 0) {
@@ -572,6 +581,12 @@ export default function MeetingRoom() {
         </div>
       </Layout>
       {auditModal}
+      <RecordingsModal
+        roomId={parseInt(id!)}
+        open={recordingsVisible}
+        onClose={() => setRecordingsVisible(false)}
+        mediaE2EEEnabled={mediaE2EEState === 'enabled'}
+      />
     </Layout>
   )
 }

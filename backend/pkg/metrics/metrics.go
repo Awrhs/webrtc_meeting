@@ -76,6 +76,26 @@ func (r *Registry) Handler() http.Handler {
 	})
 }
 
+// ProtectedHandler 在 token 非空时要求 `Authorization: Bearer <token>` 或 `?token=<token>`
+// （Prometheus 的 bearer_token 配置即可对接）；token 为空则与 Handler 相同。
+func (r *Registry) ProtectedHandler(token string) http.Handler {
+	if token == "" {
+		return r.Handler()
+	}
+	inner := r.Handler()
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		provided := strings.TrimPrefix(req.Header.Get("Authorization"), "Bearer ")
+		if provided == "" || provided == req.Header.Get("Authorization") {
+			provided = req.URL.Query().Get("token")
+		}
+		if provided != token {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		inner.ServeHTTP(w, req)
+	})
+}
+
 // ===================== 带标签的样本表 =====================
 
 type labeled struct {
@@ -256,6 +276,21 @@ func (r *Registry) NewGaugeFunc(name, help string, fn func() float64) {
 func (g *gaugeFunc) write(w io.Writer) {
 	writeHeader(w, g.name, g.help, "gauge")
 	fmt.Fprintf(w, "%s %s\n", g.name, formatFloat(g.fn()))
+}
+
+// counterFunc 抓取时调用回调取值的计数器（值由调用方保证单调递增，如 atomic 计数）。
+type counterFunc struct {
+	name, help string
+	fn         func() float64
+}
+
+func (r *Registry) NewCounterFunc(name, help string, fn func() float64) {
+	r.register(name, &counterFunc{name: name, help: help, fn: fn})
+}
+
+func (c *counterFunc) write(w io.Writer) {
+	writeHeader(w, c.name, c.help, "counter")
+	fmt.Fprintf(w, "%s %s\n", c.name, formatFloat(c.fn()))
 }
 
 // ===================== Histogram =====================

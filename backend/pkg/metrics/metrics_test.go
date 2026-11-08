@@ -91,6 +91,40 @@ func TestHandlerContentType(t *testing.T) {
 	}
 }
 
+func TestCounterFuncAndProtectedHandler(t *testing.T) {
+	r := NewRegistry()
+	r.NewCounterFunc("joins_total", "Joins.", func() float64 { return 12 })
+	if out := render(r); !strings.Contains(out, "# TYPE joins_total counter\njoins_total 12\n") {
+		t.Fatalf("counter func output wrong:\n%s", out)
+	}
+
+	h := r.ProtectedHandler("s3cret")
+	serve := func(auth, query string) int {
+		req := httptest.NewRequest(http.MethodGet, "/metrics"+query, nil)
+		if auth != "" {
+			req.Header.Set("Authorization", auth)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := serve("", ""); code != http.StatusUnauthorized {
+		t.Fatalf("no token: %d", code)
+	}
+	if code := serve("Bearer wrong", ""); code != http.StatusUnauthorized {
+		t.Fatalf("wrong token: %d", code)
+	}
+	if code := serve("Bearer s3cret", ""); code != http.StatusOK {
+		t.Fatalf("bearer token: %d", code)
+	}
+	if code := serve("", "?token=s3cret"); code != http.StatusOK {
+		t.Fatalf("query token: %d", code)
+	}
+	if code := NewRegistry().ProtectedHandler("").(http.HandlerFunc); code == nil {
+		t.Fatal("empty token must return the plain handler")
+	}
+}
+
 func TestDuplicateNamePanics(t *testing.T) {
 	r := NewRegistry()
 	r.NewCounter("dup", "a")

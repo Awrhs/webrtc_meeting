@@ -192,7 +192,18 @@ type SFUServer struct {
 	rtcpRouter              *RTCPRouter      // RTCP 路由表：接收端反馈 -> 发送端
 	qos                     *QoSController   // 自适应 Simulcast 切层控制器
 	recorders               *recorderManager // 会议录制（SFU_RECORDING_DIR 非空时启用）
+	stats                   sfuStats         // 运行计数（/metrics）
 	mu                      sync.Mutex
+}
+
+// sfuStats 单调递增的运行计数，由 RegisterMetrics 以 counter 形式暴露。
+type sfuStats struct {
+	peersJoined        atomic.Uint64
+	peersRemoved       atomic.Uint64
+	renegotiations     atomic.Uint64
+	connectionFailures atomic.Uint64
+	rtpBytesIn         atomic.Uint64
+	rtpBytesOut        atomic.Uint64
 }
 
 // TokenReplayChecker 抽象 jti 重放检查（生产用 Redis SetNX，测试可注入 mock）。
@@ -435,6 +446,7 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 			}
 
 			trackInfo.bytesIn.Add(uint64(len(pkt.Raw)))
+			s.stats.rtpBytesIn.Add(uint64(len(pkt.Raw)))
 			if recorder != nil {
 				recorder.writeRTP(pkt)
 			}
@@ -462,6 +474,7 @@ func (s *SFUServer) onTrack(room *Room, peer *Peer, track *webrtc.TrackRemote, r
 				} else {
 					writeErrCount = 0
 					trackInfo.bytesOut.Add(uint64(len(pkt.Raw)))
+					s.stats.rtpBytesOut.Add(uint64(len(pkt.Raw)))
 				}
 			}
 		}
@@ -1040,6 +1053,7 @@ func (s *SFUServer) doRenegotiate(peer *Peer) {
 		Type: "offer",
 		SDP:  offerSDP,
 	})
+	s.stats.renegotiations.Add(1)
 	s.logger.Info("Sent renegotiation offer", zap.Uint("userID", peer.UserID))
 }
 
@@ -1096,8 +1110,9 @@ func (r *RTCPRouter) StatsByPublisher(userID uint) (fractionLost, jitter, totalL
 
 // RTCPRouter RTCP 路由表，将接收端的反馈转发给对应的发送端
 type RTCPRouter struct {
-	mu      sync.RWMutex
-	ssrcMap map[uint32]*RTCPTarget // SSRC -> 目标信息
+	mu           sync.RWMutex
+	ssrcMap      map[uint32]*RTCPTarget // SSRC -> 目标信息
+	pliForwarded atomic.Uint64          // 成功转发给发布者的 PLI 数（/metrics）
 }
 
 // NewRTCPRouter 创建新的 RTCP 路由器
@@ -1160,7 +1175,11 @@ func (r *RTCPRouter) Route(pkt rtcp.Packet) bool {
 		SenderSSRC: pli.SenderSSRC,
 		MediaSSRC:  target.TrackSSRC,
 	}
-	return target.Publisher.PC.WriteRTCP([]rtcp.Packet{rewritten}) == nil
+	if err := target.Publisher.PC.WriteRTCP([]rtcp.Packet{rewritten}); err != nil {
+		return false
+	}
+	r.pliForwarded.Add(1)
+	return true
 }
 
 // startRTCPReadLoop 启动 RTCP 读取和转发 goroutine
@@ -1674,6 +1693,7 @@ func (s *SFUServer) onConnectionStateChange(room *Room, peer *Peer, state webrtc
 			s.qos.RemoveAllForUser(peer.UserID)
 			delete(room.Peers, peer.UserID)
 			s.closePeer(peer)
+			s.stats.peersRemoved.Add(1)
 			roomEmpty = len(room.Peers) == 0
 		}
 		room.mu.Unlock()
@@ -1685,6 +1705,7 @@ func (s *SFUServer) onConnectionStateChange(room *Room, peer *Peer, state webrtc
 
 		// 锁外回调 API（HTTP 请求不持锁）
 		if state == webrtc.PeerConnectionStateFailed {
+			s.stats.connectionFailures.Add(1)
 			s.logger.Warn("Peer connection failed (ICE negotiation failed)",
 				zap.Uint("roomID", room.ID),
 				zap.Uint("userID", peer.UserID))
@@ -1960,6 +1981,7 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 		s.qos.RemoveAllForUser(msg.UserID)
 		s.closePeer(existing)
 		delete(room.Peers, msg.UserID)
+		s.stats.peersRemoved.Add(1)
 	}
 
 	// 创建PeerConnection
@@ -2019,6 +2041,7 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 	})
 
 	room.Peers[msg.UserID] = peer
+	s.stats.peersJoined.Add(1)
 
 	// 发送joined确认
 	s.sendToPeer(peer, SignalingMessage{
@@ -2166,6 +2189,7 @@ func (s *SFUServer) removePeer(peer *Peer) {
 		// 清理该用户相关的 RTCP 路由（发布侧 + 订阅侧）与 QoS 状态
 		s.rtcpRouter.UnregisterByUser(peer.UserID)
 		s.qos.RemoveAllForUser(peer.UserID)
+		s.stats.peersRemoved.Add(1)
 		roomEmpty = len(room.Peers) == 0
 	}
 	room.mu.Unlock()
@@ -2247,10 +2271,11 @@ func (s *SFUServer) HandleRecordingsDownload(w http.ResponseWriter, r *http.Requ
 		http.Error(w, "recording disabled", http.StatusNotFound)
 		return
 	}
-	roomDir := sanitizeFileName(r.URL.Query().Get("room"))
-	fileName := sanitizeFileName(r.URL.Query().Get("file"))
-	if roomDir == "" || fileName == "" {
-		http.Error(w, "room and file required", http.StatusBadRequest)
+	// 只校验不改写：旧实现用 sanitizeFileName 把 '.' 也替换成 '_'，带扩展名的文件永远下载不到
+	roomDir := r.URL.Query().Get("room")
+	fileName := r.URL.Query().Get("file")
+	if !isSafeRecordingName(roomDir) || !isSafeRecordingName(fileName) {
+		http.Error(w, "invalid room or file name", http.StatusBadRequest)
 		return
 	}
 	path := filepath.Join(s.recorders.baseDir, roomDir, fileName)
@@ -2269,11 +2294,11 @@ func (s *SFUServer) Shutdown() {
 	s.recorders.stopAll()
 }
 
-func (s *SFUServer) HandleMetrics(w http.ResponseWriter, r *http.Request) {
+// snapshotCounts 统计当前房间/成员/轨道数（锁序 s.mu → room.mu → peer.mu）。
+func (s *SFUServer) snapshotCounts() (rooms, peers, tracks int) {
 	s.mu.Lock()
-	rooms := len(s.rooms)
-	peers := 0
-	tracks := 0
+	defer s.mu.Unlock()
+	rooms = len(s.rooms)
 	for _, room := range s.rooms {
 		room.mu.Lock()
 		peers += len(room.Peers)
@@ -2285,7 +2310,11 @@ func (s *SFUServer) HandleMetrics(w http.ResponseWriter, r *http.Request) {
 		}
 		room.mu.Unlock()
 	}
-	s.mu.Unlock()
+	return rooms, peers, tracks
+}
+
+func (s *SFUServer) HandleMetrics(w http.ResponseWriter, r *http.Request) {
+	rooms, peers, tracks := s.snapshotCounts()
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]int{
@@ -2320,6 +2349,7 @@ func (s *SFUServer) KickUser(roomID, userID uint, reason string) error {
 	// 清理该用户相关的 RTCP 路由（发布侧 + 订阅侧）与 QoS 状态
 	s.rtcpRouter.UnregisterByUser(userID)
 	s.qos.RemoveAllForUser(userID)
+	s.stats.peersRemoved.Add(1)
 	roomEmpty := len(room.Peers) == 0
 	room.mu.Unlock()
 
