@@ -78,6 +78,6 @@ jobs:
         run: npx playwright install --with-deps chromium firefox webkit
         working-directory: frontend
 
-      - name: Run smoke E2E (full meeting suite needs backend stack: E2E_FULL=1)
+      - name: "Run smoke E2E (full meeting suite needs backend stack: E2E_FULL=1)"
         run: npx playwright test
         working-directory: frontend
