@@ -585,6 +585,9 @@ export class SFUConnection {
   // 将期望订阅集与已同步集做差量同步到 SFU。
   // 退订时带上摄像头流 ID：只退订摄像头，保留自动订阅的屏幕共享流。
   private syncVideoSubscriptions() {
+    // WS 未就绪时不发送：joined 之后会统一重新同步。
+    // 否则 open 前被缓存的一份与 joined 后重发的一份会让每个订阅发两次。
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return
     const newSet = this.desiredVideoSubscriptions
     for (const id of newSet) {
       if (!this.subscribedVideos.has(id)) {

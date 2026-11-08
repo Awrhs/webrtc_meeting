@@ -40,6 +40,8 @@ export default function MeetingRoom() {
 
   const [loading, setLoading] = useState(false)
   const [mediaE2EEState, setMediaE2EEState] = useState<MediaE2EEState>('disabled')
+  // SFU 媒体连接是否已建立（头部持久显示，比瞬时 toast 更可靠）
+  const [mediaConnected, setMediaConnected] = useState(false)
   // 远端流元信息（streamId -> kind/rid），用于区分摄像头流与屏幕共享流
   const [remoteStreamMeta, setRemoteStreamMeta] = useState<Map<string, RemoteStreamMeta>>(new Map())
   // 由 useLocalMedia 提供：注入入会时的麦克风流，供开启摄像头时复用
@@ -95,6 +97,7 @@ export default function MeetingRoom() {
     mediaE2EEManagerRef,
     localStreamRef,
     onInitialStream: (s) => initialStreamSetterRef.current?.(s),
+    onConnectionChange: setMediaConnected,
   })
 
   // 视频选择性订阅策略：最多订阅前 6 个开启视频的用户
@@ -175,6 +178,7 @@ export default function MeetingRoom() {
     setRemoteStreamMeta(new Map())
     setPrivateTarget(null)
     setMediaE2EEState('disabled')
+    setMediaConnected(false)
   }, [cleanupLocalMedia, sfuDisconnect, clearRemoteStreams])
 
   useEffect(() => {
@@ -450,6 +454,9 @@ export default function MeetingRoom() {
             {currentRoom?.is_locked ? '已锁定' : '开放中'}
           </Tag>
           {mediaE2EETag()}
+          <Tag data-testid="media-status" color={mediaConnected ? 'green' : 'default'}>
+            {mediaConnected ? '媒体已连接' : '媒体连接中'}
+          </Tag>
           <span style={{ marginLeft: 16, color: '#888' }}>
             {currentRoom?.current_size}/{currentRoom?.max_members} 人
           </span>
@@ -511,6 +518,8 @@ export default function MeetingRoom() {
                 size="large"
                 icon={videoOn ? <VideoCameraFilled /> : <VideoCameraOutlined />}
                 onClick={toggleVideo}
+                title={videoOn ? '关闭摄像头' : '开启摄像头'}
+                aria-label={videoOn ? '关闭摄像头' : '开启摄像头'}
               />
               <Dropdown
                 menu={{
@@ -537,6 +546,8 @@ export default function MeetingRoom() {
                 size="large"
                 icon={audioOn ? <AudioOutlined /> : <AudioMutedOutlined />}
                 onClick={toggleAudio}
+                title={audioOn ? '关闭麦克风' : '开启麦克风'}
+                aria-label={audioOn ? '关闭麦克风' : '开启麦克风'}
               />
               <Button
                 type={screenShare ? 'primary' : 'default'}
@@ -545,6 +556,8 @@ export default function MeetingRoom() {
                 size="large"
                 icon={<StopOutlined />}
                 onClick={toggleScreenShare}
+                title={screenShare ? '停止共享屏幕' : '共享屏幕'}
+                aria-label={screenShare ? '停止共享屏幕' : '共享屏幕'}
               />
             </Space>
           </div>
