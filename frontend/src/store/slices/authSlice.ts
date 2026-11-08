@@ -74,6 +74,17 @@ export const updateProfile = createAsyncThunk(
   }
 )
 
+// 登出：先通知服务端吊销当前会话（token 立即失效，其它设备不受影响），再清理本地状态。
+// 服务端不可达时也要能登出，所以吊销失败只记录不阻断。
+export const logoutAndRevoke = createAsyncThunk('auth/logoutAndRevoke', async (_, { dispatch }) => {
+  try {
+    await api.post('/api/v1/auth/logout')
+  } catch (error) {
+    console.warn('[auth] server-side logout failed, clearing local session anyway', error)
+  }
+  dispatch(logout())
+})
+
 const authSlice = createSlice({
   name: 'auth',
   initialState,
@@ -85,6 +96,12 @@ const authSlice = createSlice({
       state.user = null
       state.token = null
       state.isAuthenticated = false
+    },
+    // 改密码后服务端会返回为当前设备签发的新 token：替换本地凭据，不必重新登录
+    setToken: (state, action: PayloadAction<string>) => {
+      state.token = action.payload
+      state.isAuthenticated = true
+      localStorage.setItem('token', action.payload)
     },
   },
   extraReducers: (builder) => {
@@ -116,5 +133,5 @@ const authSlice = createSlice({
   },
 })
 
-export const { logout } = authSlice.actions
+export const { logout, setToken } = authSlice.actions
 export default authSlice.reducer

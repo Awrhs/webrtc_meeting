@@ -4,7 +4,7 @@ import { useDispatch, useSelector } from 'react-redux'
 import { Layout, Button, Card, List, Input, Space, Tag, Modal, Form, message, Typography, Avatar, Dropdown } from 'antd'
 import { PlusOutlined, LockOutlined, UnlockOutlined, UserOutlined, SettingOutlined, LogoutOutlined, CopyOutlined, InfoCircleOutlined } from '@ant-design/icons'
 import { getMyRooms, createRoom, joinRoom, getRoomByNumber, deleteRoom } from '@/store/slices/roomSlice'
-import { logout } from '@/store/slices/authSlice'
+import { logoutAndRevoke } from '@/store/slices/authSlice'
 import { RootState, AppDispatch } from '@/store'
 import { Room } from '@/types'
 
@@ -170,8 +170,8 @@ export default function RoomList() {
       icon: <LogoutOutlined />,
       label: '退出登录',
       danger: true,
-      onClick: () => {
-        dispatch(logout())
+      onClick: async () => {
+        await dispatch(logoutAndRevoke())
         message.success('已退出登录')
         navigate('/login')
       },

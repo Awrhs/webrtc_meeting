@@ -20,7 +20,15 @@ export default function Login() {
       message.success('登录成功')
       navigate('/')
     } catch (error: any) {
-      message.error(error.message || error || '登录失败')
+      const text: string = error?.message || error || '登录失败'
+      // 服务端要求先验证邮箱：直接带到验证页
+      if (typeof text === 'string' && text.includes('not verified')) {
+        message.warning('邮箱尚未验证，请先完成验证')
+        const email = values.account.includes('@') ? values.account : ''
+        navigate(`/verify-email${email ? `?email=${encodeURIComponent(email)}` : ''}`)
+        return
+      }
+      message.error(text)
     } finally {
       setLoading(false)
     }
@@ -89,6 +97,9 @@ export default function Login() {
               <span>还没有账号？</span>
               <Button type="link" onClick={() => navigate('/register')}>
                 立即注册
+              </Button>
+              <Button type="link" onClick={() => navigate('/forgot-password')}>
+                忘记密码？
               </Button>
             </Space>
           </div>

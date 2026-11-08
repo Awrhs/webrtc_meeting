@@ -21,7 +21,13 @@ export default function Register() {
   }) => {
     setLoading(true)
     try {
-      await dispatch(register(values)).unwrap()
+      const result = await dispatch(register(values)).unwrap()
+      if (result?.verification_required) {
+        // 服务端开启了邮箱验证：先去验证页输入邮件里的验证码
+        message.success('注册成功，验证码已发送到你的邮箱，请完成验证后登录')
+        navigate(`/verify-email?email=${encodeURIComponent(values.email)}`)
+        return
+      }
       message.success('注册成功，请登录')
       navigate('/login')
     } catch (error: any) {

@@ -3,9 +3,10 @@ import { useNavigate } from 'react-router-dom'
 import { useDispatch, useSelector } from 'react-redux'
 import { Layout, Card, Form, Input, Button, Avatar, message, Typography, Divider, List, Tag, Popconfirm } from 'antd'
 import { UserOutlined, LaptopOutlined, DeleteOutlined } from '@ant-design/icons'
-import { updateProfile, getMe } from '@/store/slices/authSlice'
+import { updateProfile, getMe, setToken, logout } from '@/store/slices/authSlice'
 import { clearLegacyKeyStore } from '@/utils/encryption'
 import { api } from '@/utils/api'
+import { getDeviceId } from '@/utils/device'
 import { RootState, AppDispatch } from '@/store'
 import { Device } from '@/types'
 
@@ -17,10 +18,13 @@ export default function Profile() {
   const navigate = useNavigate()
   const { user } = useSelector((state: RootState) => state.auth)
   const [formProfile] = Form.useForm()
+  const [formPassword] = Form.useForm()
   const [loading, setLoading] = useState(false)
+  const [passwordLoading, setPasswordLoading] = useState(false)
   // 登录设备管理
   const [devices, setDevices] = useState<Device[]>([])
   const [devicesLoading, setDevicesLoading] = useState(false)
+  const currentDeviceId = getDeviceId()
 
   const loadDevices = useCallback(async () => {
     setDevicesLoading(true)
@@ -34,13 +38,44 @@ export default function Profile() {
     }
   }, [])
 
-  const handleDeleteDevice = async (deviceId: number) => {
+  // 删除设备 = 吊销该设备上的全部登录会话。删的是当前设备时，本地也会随之登出。
+  const handleDeleteDevice = async (device: Device) => {
     try {
-      await api.delete(`/api/v1/user/devices/${deviceId}`)
-      message.success('设备记录已删除')
+      await api.delete(`/api/v1/user/devices/${device.id}`)
+      if (device.device_id === currentDeviceId) {
+        message.success('已删除当前设备并退出登录')
+        dispatch(logout())
+        navigate('/login')
+        return
+      }
+      message.success('设备已删除，该设备上的登录已失效')
       void loadDevices()
     } catch {
-      message.error('删除设备记录失败')
+      message.error('删除设备失败')
+    }
+  }
+
+  // 改密码：服务端会让所有旧会话失效，并为当前设备返回新 token，这里直接替换，不用重新登录
+  const handleChangePassword = async (values: { old_password: string; new_password: string; confirm: string }) => {
+    if (values.new_password !== values.confirm) {
+      message.error('两次输入的新密码不一致')
+      return
+    }
+    setPasswordLoading(true)
+    try {
+      const response = await api.put('/api/v1/user/password', {
+        old_password: values.old_password,
+        new_password: values.new_password,
+      })
+      if (response.data?.token) {
+        dispatch(setToken(response.data.token))
+      }
+      formPassword.resetFields()
+      message.success('密码已修改，其它设备上的登录已全部失效')
+    } catch (error: any) {
+      message.error(error?.response?.data?.error || '修改密码失败')
+    } finally {
+      setPasswordLoading(false)
     }
   }
 
@@ -159,9 +194,39 @@ export default function Profile() {
 
           <Divider />
 
+          <Title level={5}>修改密码</Title>
+          <div style={{ color: '#999', fontSize: 12, marginBottom: 8 }}>
+            修改后其它设备上的登录会全部失效，当前设备保持登录。
+          </div>
+          <Form form={formPassword} layout="vertical" onFinish={handleChangePassword}>
+            <Form.Item name="old_password" label="当前密码" rules={[{ required: true, message: '请输入当前密码' }]}>
+              <Input.Password placeholder="当前密码" />
+            </Form.Item>
+            <Form.Item
+              name="new_password"
+              label="新密码"
+              rules={[
+                { required: true, message: '请输入新密码' },
+                { min: 8, max: 20, message: '密码长度8-20位' },
+              ]}
+            >
+              <Input.Password placeholder="新密码（8-20 位）" />
+            </Form.Item>
+            <Form.Item name="confirm" label="确认新密码" rules={[{ required: true, message: '请再次输入新密码' }]}>
+              <Input.Password placeholder="再次输入新密码" />
+            </Form.Item>
+            <Form.Item>
+              <Button type="primary" htmlType="submit" loading={passwordLoading} block>
+                修改密码
+              </Button>
+            </Form.Item>
+          </Form>
+
+          <Divider />
+
           <Title level={5}>登录设备</Title>
           <div style={{ color: '#999', fontSize: 12, marginBottom: 8 }}>
-            每次登录会记录设备指纹（X-Device-Id 或 UA 哈希）、UA 与 IP，可在此删除异常设备记录。
+            每次登录会记录设备（浏览器设备 ID）、UA 与 IP。删除设备会立即吊销该设备上的登录会话。
           </div>
           <List
             loading={devicesLoading}
@@ -172,8 +237,8 @@ export default function Profile() {
                 actions={[
                   <Popconfirm
                     key="delete"
-                    title="确定删除该设备记录？"
-                    onConfirm={() => handleDeleteDevice(device.id)}
+                    title={device.device_id === currentDeviceId ? '删除当前设备将退出登录，确定？' : '删除该设备并吊销其登录会话？'}
+                    onConfirm={() => handleDeleteDevice(device)}
                   >
                     <Button size="small" danger icon={<DeleteOutlined />}>删除</Button>
                   </Popconfirm>,
@@ -185,6 +250,7 @@ export default function Profile() {
                     <span>
                       {device.device_name || device.device_id.slice(0, 12)}
                       <Tag style={{ marginLeft: 8 }}>{device.ip}</Tag>
+                      {device.device_id === currentDeviceId && <Tag color="green">当前设备</Tag>}
                     </span>
                   }
                   description={
