@@ -113,6 +113,9 @@ SFU 媒体连接默认不再接受裸连。用户必须先通过 API 登录并�
 - **选择性订阅与 Simulcast** - 视频按需订阅（音频/无 RID 视频流（屏幕共享、非 simulcast 回退）自动全量订阅），摄像头视频默认两层 Simulcast 编码且不自动扇出，订阅请求由前端按成员媒体状态（前 6 路开视频用户）动态下发，重连后自动重同步；订阅端可按 quality 选层（协议已支持，前端暂无切换 UI，默认 high）
 - **SFU token 防重放与登录设备记录** - SFU admission token 内嵌 jti 并通过 Redis 标记，登录设备会被指纹化记录并提供 API 管理
 - **房间审计 API** - kick/mute/admin/transfer/lock/delete 等敏感操作落库，owner/admin 通过 `/rooms/:id/audit-logs` 分页查询
+- **会话与账号安全** - 登录会话可逐设备吊销（登出、改密码、删除设备），找回密码与邮箱验证（验证码邮件，`log`/`smtp` 两种发送方式）
+- **可观测性与录制** - API/SFU 的 `/metrics` 输出 Prometheus 文本指标（可选 Bearer token），会议录制经 API 鉴权代理列出/下载
+- **部署就绪** - 内嵌数据库迁移、HTTPS 叠加编排、服务端下发 ICE 配置（时限 TURN 凭据）、SFU 对外 IP 配置；详见 [docs/LAN_DEPLOYMENT.md](docs/LAN_DEPLOYMENT.md)
 
 
 ## 🏗️ 项目架构
@@ -159,16 +162,22 @@ conference-sfu/
 │   │   ├── server/       # API/信令服务器入口
 │   │   └── sfu/          # SFU媒体服务器入口（独立进程）
 │   ├── internal/
+│   │   ├── auth/         # 会话 token（jti/版本/设备）与校验器
+│   │   ├── config/       # 环境变量配置与校验
+│   │   ├── db/           # 内嵌 SQL 迁移运行器 + migrations/*.up.sql
+│   │   ├── mail/         # 邮件发送（log / smtp / 测试用 memory）
 │   │   ├── models/       # 数据模型定义
-│   │   ├── handlers/     # HTTP API处理器
+│   │   ├── handlers/     # HTTP API处理器（含 ICE 配置下发、录制代理）
 │   │   ├── service/      # 业务逻辑层
 │   │   ├── repository/   # 数据库操作层
-│   │   ├── sfu/          # SFU媒体服务 + gRPC服务
+│   │   ├── sfu/          # SFU媒体服务 + gRPC服务 + 录制 + 指标
 │   │   ├── signaling/    # WebSocket信令 Hub
-│   │   └── middleware/   # 中间件
+│   │   ├── middleware/   # 中间件（限流、HTTP 指标）
+│   │   └── testutil/     # 集成测试用的 Postgres/Redis 环境
 │   └── pkg/
 │       ├── crypto/       # AES加密工具
-│       └── logger/       # 日志封装
+│       ├── logger/       # 日志封装
+│       └── metrics/      # 标准库实现的 Prometheus 文本格式指标
 ├── frontend/
 │   ├── src/
 │   │   ├── pages/        # 页面组件
@@ -179,12 +188,15 @@ conference-sfu/
 │       ├── sfu-test.html           # 旧版 SFU 直连调试页，仅开发逃生阀可用
 │       └── sfu-test-no-camera.html # 旧版无摄像头调试页，仅开发逃生阀可用
 ├── deployment/
-│   ├── docker-compose.yml  # Docker 服务编排
-│   ├── nginx.conf          # Nginx 反向代理配置（生产环境用）
-│   └── docker/             # Dockerfile 目录
-│       ├── Dockerfile.frontend
-│       ├── Dockerfile.server
-│       └── Dockerfile.sfu
+│   ├── docker-compose.yml      # 基础编排（HTTP，本机）
+│   ├── docker-compose.dev.yml  # 开发叠加：暴露 Postgres/Redis 端口
+│   ├── docker-compose.tls.yml  # HTTPS 叠加：nginx 443 终结 TLS（局域网/公网）
+│   ├── nginx.conf / nginx.tls.conf
+│   ├── tls/gen-self-signed.sh  # 自签名证书生成脚本（证书文件已 gitignore）
+│   └── docker/                 # Dockerfile 目录（非 root 运行）
+├── docs/
+│   └── LAN_DEPLOYMENT.md       # 局域网试用部署指南（端口、证书信任、排错、搬公网）
+├── .github/workflows/ci.yml    # GitHub Actions：gofmt/vet/race + Postgres/Redis 集成测试、vitest/tsc、Playwright 冒烟与完整会议 E2E
 └── README.md
 ```
 
@@ -310,16 +322,16 @@ conference-sfu/
 - Node.js 18+
 - Docker + Docker Compose
 
-### 使用 Docker Compose 启动
+### 使用 Docker Compose 启动（本机 HTTP）
 
 ```bash
-# 复制环境变量并按需修改 secret、数据库密码、TURN 凭据和 ALLOWED_ORIGINS
+# 复制环境变量并按需修改 secret、数据库密码、TURN 共享密钥和 ALLOWED_ORIGINS
 cp .env.example .env
 
 # 检查 Compose 配置是否能正确展开
 docker compose -f deployment/docker-compose.yml config
 
-# 启动所有服务（包括数据库、Redis、Coturn、API、SFU、前端）
+# 启动所有服务（数据库、Redis、Coturn、API、SFU、前端、nginx）
 docker compose -f deployment/docker-compose.yml up -d --build
 ```
 
@@ -328,7 +340,21 @@ docker compose -f deployment/docker-compose.yml up -d --build
 - API: http://localhost:8080
 - SFU: http://localhost:8081
 
-> 当前 Docker Compose 默认只提供 HTTP，本地开发可用；生产环境需要在外层配置 HTTPS/WSS 反向代理和正式证书。
+数据库表结构由 `api-server` 启动时的内嵌迁移（`backend/internal/db/migrations/*.up.sql`，`schema_migrations` 记录版本）自动创建和升级，不再需要手动导入 SQL。
+Postgres/Redis 默认不暴露宿主机端口；本地开发要直连时叠加 `deployment/docker-compose.dev.yml`。
+
+### 局域网 / 公网部署（HTTPS）
+
+浏览器只在 `localhost` 或 HTTPS 页面上开放摄像头和麦克风，所以除本机自测外都必须走 HTTPS：
+
+```bash
+export PUBLIC_HOST=192.168.1.10                 # 服务端电脑的局域网 IP（或域名）
+deployment/tls/gen-self-signed.sh $PUBLIC_HOST  # 自签名证书（公网可换成 Let's Encrypt）
+docker compose -f deployment/docker-compose.yml -f deployment/docker-compose.tls.yml up -d --build
+```
+
+nginx 在 443 统一终结 TLS 并反代前端、`/api`、`/ws`（信令）和 `/sfu/ws`（媒体信令）；ICE 配置（STUN、时限 TURN 凭据）由服务端在入会时下发。
+每台客户端需要信任 `deployment/tls/server.crt`。完整步骤、端口清单与排错见 **[docs/LAN_DEPLOYMENT.md](docs/LAN_DEPLOYMENT.md)**。
 
 ### 本地开发
 
@@ -346,7 +372,8 @@ docker compose -f deployment/docker-compose.yml up --build api-server sfu-server
 
 ##### 1. 启动基础设施
 ```bash
-docker compose -f deployment/docker-compose.yml up -d postgres redis coturn
+# dev 叠加文件把 Postgres(5433)/Redis(6379) 端口暴露给宿主机
+docker compose -f deployment/docker-compose.yml -f deployment/docker-compose.dev.yml up -d postgres redis coturn
 ```
 
 ##### 2. 编译 gRPC 代码（首次运行）
@@ -723,6 +750,8 @@ npm --prefix frontend test -- --run src/utils/encryption.test.ts
 
 仍建议继续补充 FEC 前向纠错、跨实例分布式转发、录制在线回放等增强（均非功能缺口）；已完成项目见下方“📋 功能完成情况”。
 
+2026-11 第三轮（见下方“📋 第三轮：可运营化与测试基建”）把测试环境搬到 GitHub Actions：每次推送跑 gofmt/vet/`go test -race`（含真实 Postgres/Redis 集成测试与真实 SFU 媒体链路测试）、vitest + tsc、三浏览器 Playwright 冒烟，以及在真实后端栈上用 Chromium 假摄像头跑完整双用户会议用例。该用例随后暴露并修掉了三处真实缺陷（SFU 丢弃早到的摄像头订阅、刷新页面后当前用户为空、成员入会默认“摄像头已开”）。
+
 ---
 
 ### ✨ 核心功能实现
@@ -797,6 +826,37 @@ npm --prefix frontend test -- --run src/utils/encryption.test.ts
 | 单元测试 | 新增 QoS 控制器（切层/固定层/REMB/清理）、IVF/OGG/VP8 录制器等 Go 测试；VideoGrid 多路流/远端共享大屏测试 |
 
 > 说明：README 早期提到的“移动端**原生**客户端（iOS/Android 原生封装）”不在本轮范围；当前移动端以可安装 PWA 实现跨平台覆盖。原生壳可在此 PWA 基础上直接封装，无需重写业务。
+
+### 📋 第三轮：可运营化与测试基建（2026-11）
+
+#### 数据与账号安全
+| 功能 | 实现 |
+|------|------|
+| 内嵌 SQL 迁移 | `backend/internal/db`：`embed` 迁移文件，`schema_migrations` 记录版本，API 启动时自动执行；`init.sql` 与 compose 挂载移除；集成测试按包建独立数据库 |
+| 入会容量与计数 | `JoinRoom` 在事务内 `SELECT … FOR UPDATE` 锁房间行后再核对人数，`current_size` 定向更新（不再整行 Save 覆盖锁房状态）；10 用户并发抢位测试 |
+| 会话管理 | JWT 携带 `jti`/`ver`/`dev`；Redis 会话表 + 用户 `token_version`；校验链：签名 → 会话存在 → 版本一致；登出吊销当前会话，改密码吊销全部会话并为当前设备签发新 token，删除设备即吊销其会话 |
+| 找回密码 / 邮箱验证 | 6 位验证码 SHA-256 存 Redis（15 分钟 / 24 小时，5 次尝试上限），可插拔 Mailer（`log` / `smtp`，`net/smtp` + STARTTLS/implicit TLS）；`REQUIRE_EMAIL_VERIFICATION` 可强制先验证再登录；前端新增找回密码、邮箱验证页面与修改密码表单 |
+| 上传鉴权 | 聊天附件改为房间作用域 `GET /rooms/:id/uploads/:name`（成员校验、安全文件名），前端以 blob 方式带 token 拉取 |
+
+#### 媒体与信令健壮性
+| 功能 | 实现 |
+|------|------|
+| 文本 E2EE 签名 | 公钥包升级为 ECDH + ECDSA P-256（`bundle_v2`），消息携带签名，指纹覆盖两把公钥；Sender Key 分发携带链位置修复乱序导致的解密失败；跳过消息密钥缓存一次性使用（重放防护），密钥变更告警 |
+| 信令 Hub | ping 并入 WritePump（gorilla 单写者规则）、读限制与 pong 超时、离开宽限、在线统计；`user_joined` 触发成员列表回源刷新 |
+| SFU | 房间删除标记 `closed` 防孤儿房间、关键帧请求在协商完成后统一补发、PLI 转发改写 SSRC、消息限流不再忙等、录制下载不再把文件名里的 `.` 改写成 `_`；5 用户 × 3 轮并发进出压力测试 |
+| 早到的摄像头订阅 | SFU 记住订阅意图（`videoInterest`），摄像头层到达时主动推给已声明兴趣的订阅者，低层先到时切到期望层，同一条流只保留一层；真实 SFU + WS 客户端回归测试 |
+| 前端媒体 | ICE disconnected 5 秒宽限、重连幂等、断开时摘掉旧回调、协商串行队列、非法 JSON 防护；刷新页面/直接打开会议链接时先拉取当前用户再渲染会议页 |
+
+#### 部署与运维
+| 功能 | 实现 |
+|------|------|
+| 可观测性 | `pkg/metrics` 纯标准库实现 Prometheus 文本格式；API 暴露 HTTP 请求计数/耗时直方图、信令在线数；SFU 暴露房间/成员/轨道、加入/移除/重协商/连接失败计数、RTP 字节、PLI 转发；`METRICS_TOKEN` 可选保护；`/metrics.json` 返回真实数值 |
+| 录制访问 | `GET /rooms/:id/recordings` 与下载经 API 代理（房主/管理员，仅本房间目录），nginx 不再公开 SFU 的 `/recordings/`；会议菜单新增“会议录制” |
+| ICE 配置下发 | 入会 / `sfu-token` 响应携带 `ice_servers`：`STUN_URLS` + coturn `--use-auth-secret` 的时限 TURN 凭据（HMAC-SHA1，TTL 可配），前端优先使用并在重连时刷新；固定 TURN 账号不再打进前端包；`STUN_URLS=none` 适用于无外网内网 |
+| 对外地址 | `SFU_PUBLIC_IP`（支持域名，解析成 IPv4）→ `SetNAT1To1IPs`；`WEBRTC_PORT_RANGE_*` 进容器并发布同一 UDP 段 |
+| HTTPS 叠加 | `docker-compose.tls.yml` + `nginx.tls.conf`：443 终结 TLS，反代前端 / `/api` / `/ws` / `/sfu/ws`；`gen-self-signed.sh` 生成带 SAN 的自签名证书 |
+| compose 加固 | Postgres/Redis 不暴露宿主机端口（开发叠加 `docker-compose.dev.yml`）、Redis 可选密码、全部服务 healthcheck、Go 镜像非 root、基础镜像固定版本 |
+| CI | GitHub Actions：后端 gofmt/vet/`go test -race`（Postgres/Redis 服务容器）、前端 vitest + tsc、Playwright 三浏览器冒烟、`e2e-full`（真实 API+SFU，Chromium 假摄像头，失败时上传后端日志与 Playwright 报告）；本地对应 `make e2e-up / e2e-backend / e2e-full` |
 
 ### 🚀 后续增强建议（非缺口，均为锦上添花）
 
