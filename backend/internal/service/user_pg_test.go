@@ -62,8 +62,13 @@ func (e *userEnv) lastCode(t *testing.T) string {
 	return m[1]
 }
 
-func devA() service.DeviceInfo { return service.DeviceInfo{ID: "dev-a", UserAgent: "ua-a", IP: "10.0.0.1"} }
-func devB() service.DeviceInfo { return service.DeviceInfo{ID: "dev-b", UserAgent: "ua-b", IP: "10.0.0.2"} }
+func devA() service.DeviceInfo {
+	return service.DeviceInfo{ID: "dev-a", UserAgent: "ua-a", IP: "10.0.0.1"}
+}
+
+func devB() service.DeviceInfo {
+	return service.DeviceInfo{ID: "dev-b", UserAgent: "ua-b", IP: "10.0.0.2"}
+}
 
 func TestLoginLogoutSession(t *testing.T) {
 	e := newUserEnv(t, false)

@@ -52,15 +52,15 @@ type Config struct {
 	PresenceGraceSeconds       int
 	// 邮件发送：MailProvider 取 log（打到日志，开发/局域网默认）或 smtp；
 	// SMTPTLSMode 取 starttls（587）、implicit（465）或 none（仅本机调试）
-	MailProvider               string
-	SMTPHost                   string
-	SMTPPort                   int
-	SMTPUsername               string
-	SMTPPassword               string
-	SMTPFrom                   string
-	SMTPTLSMode                string
-	RequireEmailVerification   bool
-	AppName                    string
+	MailProvider             string
+	SMTPHost                 string
+	SMTPPort                 int
+	SMTPUsername             string
+	SMTPPassword             string
+	SMTPFrom                 string
+	SMTPTLSMode              string
+	RequireEmailVerification bool
+	AppName                  string
 }
 
 func loadEnvFromFile(filename string) error {
