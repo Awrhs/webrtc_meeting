@@ -14,6 +14,7 @@ func TestBuildMessageEncodesUTF8(t *testing.T) {
 	if !found {
 		t.Fatal("message must separate headers and body with a blank line")
 	}
+	headers += "\r\n" // Cut 吃掉了最后一个头部行的 CRLF，补回来便于逐行断言
 	for _, want := range []string{
 		"From: noreply@example.com\r\n",
 		"To: alice@example.com\r\n",
