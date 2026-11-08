@@ -185,34 +185,20 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 		return nil, errors.New("room not found")
 	}
 
-	if room.IsLocked {
-		return nil, errors.New("room is locked")
-	}
-
 	isKicked, err := s.roomRepo.IsKicked(room.ID, userID)
 	if err == nil && isKicked {
 		return nil, errors.New("you are kicked from this room, please try again later")
 	}
 
-	// 先判断用户是否已在房间（未离开）：已在房间的成员（如刷新页面重新入会）
-	// 不应受满员限制，直接幂等返回。
+	// 已在房间（未离开）的成员（如刷新页面重新入会）幂等返回，不受满员/锁房限制
 	activeMember, err := s.roomRepo.GetMember(room.ID, userID)
 	if err != nil {
-		s.logger.Warn("Failed to get active member, falling back to new member creation",
-			zap.Uint("roomID", room.ID),
-			zap.Uint("userID", userID),
-			zap.Error(err))
+		activeMember = nil
 	}
 
-	// 满员检查：只对真正的新加入成员生效
-	if activeMember == nil {
-		count, err := s.roomRepo.CountMembers(room.ID)
-		if err != nil {
-			return nil, err
-		}
-		if int(count) >= room.MaxMembers {
-			return nil, errors.New("room is full")
-		}
+	// 锁房只拦截新成员：已在会议中的人刷新页面不能被挡在门外
+	if room.IsLocked && activeMember == nil {
+		return nil, errors.New("room is locked")
 	}
 
 	switch room.AuthType {
@@ -230,57 +216,21 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 		}
 	}
 
-	// 成员记录创建/恢复
 	if activeMember == nil {
-		existingMember, err := s.roomRepo.GetAnyMember(room.ID, userID)
-		if err != nil {
-			s.logger.Warn("Failed to get existing member",
-				zap.Uint("roomID", room.ID),
-				zap.Uint("userID", userID),
-				zap.Error(err))
-		}
-		if existingMember == nil {
-			// 新成员：插入前二次校验人数，缩小并发超员窗口
-			count, err := s.roomRepo.CountMembers(room.ID)
-			if err != nil {
-				return nil, err
-			}
-			if int(count) >= room.MaxMembers {
-				return nil, errors.New("room is full")
-			}
-			member := &models.RoomMember{
-				RoomID:    room.ID,
-				UserID:    userID,
-				Role:      models.RoleMember,
-				IsMuted:   false,
-				IsVideoOn: false,
-				IsAudioOn: true,
-				JoinedAt:  time.Now(),
-			}
-			err = s.roomRepo.AddMember(member)
-			if err != nil {
-				return nil, err
-			}
-		} else {
-			// 用户曾经加入过，更新记录
-			now := time.Now()
-			existingMember.LeftAt = nil
-			existingMember.JoinedAt = now
-			err = s.roomRepo.UpdateMember(existingMember)
-			if err != nil {
-				return nil, err
-			}
+		if err := s.admitMember(room, userID); err != nil {
+			return nil, err
 		}
 	}
-	// 如果用户已经在房间中（activeMember != nil），不做任何操作
 
-	// 重新统计当前房间人数，确保计数正确
+	// 以成员表为准刷新人数。只更新 current_size 列：Save 整行会把并发的锁房等修改覆盖掉
 	newCount, err := s.roomRepo.CountMembers(room.ID)
 	if err != nil {
 		return nil, err
 	}
 	room.CurrentSize = int(newCount)
-	s.roomRepo.Update(room)
+	if err := s.roomRepo.UpdateCurrentSize(room.ID, room.CurrentSize); err != nil {
+		s.logger.Warn("Failed to update room size", zap.Uint("roomID", room.ID), zap.Error(err))
+	}
 
 	s.redis.AddToRoom(room.ID, userID)
 
@@ -312,6 +262,79 @@ func (s *roomService) JoinRoom(userID uint, roomIDStr string, verifyCode string)
 	}, nil
 }
 
+// admitMember 在单个事务内完成"锁房间行 → 校验锁房/人数 → 创建或恢复成员记录 → 更新人数"。
+// 行锁把并发入会串行化：两个人同时抢最后一个名额只会放进一个；同一用户的并发
+// 重复请求在持锁后重新检查，不会产生第二条成员记录（数据库唯一索引是最后兜底）。
+func (s *roomService) admitMember(room *models.Room, userID uint) error {
+	tx := s.roomRepo.Begin()
+
+	lockedRoom, err := tx.LockRoomForUpdate(room.ID)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	if lockedRoom.IsLocked {
+		tx.Rollback()
+		return errors.New("room is locked")
+	}
+
+	// 持锁后再确认：并发的另一次加入可能刚刚把这个用户放进来了
+	if member, err := tx.GetMember(room.ID, userID); err == nil && member != nil {
+		tx.Rollback()
+		return nil
+	}
+
+	count, err := tx.CountMembers(room.ID)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+	if int(count) >= lockedRoom.MaxMembers {
+		tx.Rollback()
+		return errors.New("room is full")
+	}
+
+	existing, err := tx.GetAnyMember(room.ID, userID)
+	if err != nil {
+		existing = nil
+	}
+	if existing == nil {
+		member := &models.RoomMember{
+			RoomID:    room.ID,
+			UserID:    userID,
+			Role:      models.RoleMember,
+			IsMuted:   false,
+			IsVideoOn: false,
+			IsAudioOn: true,
+			JoinedAt:  time.Now(),
+		}
+		if err := tx.AddMember(member); err != nil {
+			tx.Rollback()
+			return err
+		}
+	} else {
+		// 用户曾经加入过：复用同一条记录（唯一索引要求一人一行）
+		now := time.Now()
+		existing.LeftAt = nil
+		existing.JoinedAt = now
+		if err := tx.UpdateMember(existing); err != nil {
+			tx.Rollback()
+			return err
+		}
+	}
+
+	if err := tx.UpdateCurrentSize(room.ID, int(count)+1); err != nil {
+		tx.Rollback()
+		return err
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	room.IsLocked = lockedRoom.IsLocked
+	room.CurrentSize = int(count) + 1
+	return nil
+}
+
 func (s *roomService) LeaveRoom(roomID uint, userID uint) error {
 	err := s.roomRepo.RemoveMember(roomID, userID)
 	if err != nil {
@@ -324,14 +347,9 @@ func (s *roomService) LeaveRoom(roomID uint, userID uint) error {
 	if err != nil {
 		return err
 	}
-
-	room, err := s.roomRepo.FindByID(roomID)
-	if err != nil {
+	if err := s.roomRepo.UpdateCurrentSize(roomID, int(count)); err != nil {
 		return err
 	}
-
-	room.CurrentSize = int(count)
-	s.roomRepo.Update(room)
 
 	// Invalidate caches
 	s.redis.DeleteRoom(roomID)
@@ -440,13 +458,7 @@ func (s *roomService) KickMember(roomID uint, requesterID uint, targetID uint) e
 		tx.Rollback()
 		return err
 	}
-	room, err := tx.FindByID(roomID)
-	if err != nil {
-		tx.Rollback()
-		return err
-	}
-	room.CurrentSize = int(count)
-	if err := tx.Update(room); err != nil {
+	if err := tx.UpdateCurrentSize(roomID, int(count)); err != nil {
 		tx.Rollback()
 		return err
 	}

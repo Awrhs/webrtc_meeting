@@ -5,15 +5,22 @@ import (
 	"time"
 
 	"gorm.io/gorm"
+	"gorm.io/gorm/clause"
 )
 
 type RoomRepository interface {
 	Create(room *models.Room) error
 	FindByRoomID(roomID string) (*models.Room, error)
 	FindByID(id uint) (*models.Room, error)
+	// LockRoomForUpdate 以 SELECT ... FOR UPDATE 读取房间行，把并发的入会/踢人串行化。
+	// 只能在 Begin() 返回的事务仓库上调用，事务提交或回滚时释放锁。
+	LockRoomForUpdate(id uint) (*models.Room, error)
 	FindByOwnerID(ownerID uint) ([]*models.Room, error)
 	FindRoomsByUserID(userID uint) ([]*models.Room, error)
 	Update(room *models.Room) error
+	// UpdateCurrentSize 只更新 current_size 列。人数变更不能用 Update(room) 整行保存：
+	// 读出房间到写回之间若有人锁房/改名，整行 Save 会把那些修改覆盖掉。
+	UpdateCurrentSize(roomID uint, size int) error
 	Delete(id uint) error
 	AddMember(member *models.RoomMember) error
 	UpdateMember(member *models.RoomMember) error
@@ -76,8 +83,21 @@ func (r *roomRepository) FindRoomsByUserID(userID uint) ([]*models.Room, error) 
 	return rooms, err
 }
 
+func (r *roomRepository) LockRoomForUpdate(id uint) (*models.Room, error) {
+	var room models.Room
+	err := r.db.Clauses(clause.Locking{Strength: "UPDATE"}).Where("id = ?", id).First(&room).Error
+	if err != nil {
+		return nil, err
+	}
+	return &room, nil
+}
+
 func (r *roomRepository) Update(room *models.Room) error {
 	return r.db.Save(room).Error
+}
+
+func (r *roomRepository) UpdateCurrentSize(roomID uint, size int) error {
+	return r.db.Model(&models.Room{}).Where("id = ?", roomID).Update("current_size", size).Error
 }
 
 func (r *roomRepository) Delete(id uint) error {

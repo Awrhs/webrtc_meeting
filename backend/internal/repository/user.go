@@ -327,6 +327,12 @@ func (r *RedisClient) Ping() error {
 	return r.client.Ping(ctx).Err()
 }
 
+// FlushDB 清空当前 Redis 库。仅供集成测试在用例间隔离状态使用，业务代码不得调用。
+func (r *RedisClient) FlushDB() error {
+	ctx := context.Background()
+	return r.client.FlushDB(ctx).Err()
+}
+
 // ==================== User Cache Methods ====================
 
 const (

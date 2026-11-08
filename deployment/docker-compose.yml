@@ -8,9 +8,10 @@ services:
       POSTGRES_DB: ${DB_NAME:-conference}
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
+    # 表结构由 api-server 启动时的内嵌迁移自动创建/升级（backend/internal/db/migrations），
+    # 不再挂载 init.sql：那种方式只在数据卷为空时执行一次，后续改表对已有库无效。
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ../backend/migrations/init.sql:/docker-entrypoint-initdb.d/init.sql
     ports:
       - "5433:5432"
     networks:

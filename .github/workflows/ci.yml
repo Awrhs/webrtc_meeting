@@ -10,6 +10,34 @@ jobs:
   backend:
     name: Backend
     runs-on: ubuntu-latest
+    # 真实 Postgres / Redis：repository、service、db 包的集成测试依赖它们
+    # （未设置 TEST_DATABASE_DSN / TEST_REDIS_ADDR 时这些测试自动跳过）
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_DSN: host=localhost port=5432 user=postgres password=postgres sslmode=disable
+      TEST_REDIS_ADDR: localhost:6379
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,10 +48,20 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      - name: gofmt check
+        run: |
+          UNFORMATTED=$(gofmt -l backend tools)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "The following files are not gofmt-formatted:"
+            echo "$UNFORMATTED"
+            gofmt -d $UNFORMATTED
+            exit 1
+          fi
+
       - name: Vet backend
         run: go vet ./...
 
-      - name: Test backend (race detector)
+      - name: Test backend (race detector, with Postgres/Redis integration tests)
         run: go test -race ./...
 
       - name: Build backend

@@ -1,3 +1,7 @@
+-- 0001：基础表结构。
+-- 全部使用 IF NOT EXISTS：由 docker-compose 旧方式（挂载 init.sql 到 Postgres 初始化目录）
+-- 建出来的存量库，再跑一遍本迁移是安全的 no-op。
+
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     username VARCHAR(50) UNIQUE NOT NULL,
@@ -93,10 +97,6 @@ CREATE INDEX IF NOT EXISTS idx_messages_sender_id ON messages(sender_id);
 CREATE INDEX IF NOT EXISTS idx_room_members_room_id ON room_members(room_id);
 CREATE INDEX IF NOT EXISTS idx_room_members_user_id ON room_members(user_id);
 
--- ============================================
--- v1.2 新增表
--- ============================================
-
 -- E2EE 端到端加密公钥存储
 CREATE TABLE IF NOT EXISTS e2ee_public_keys (
     id SERIAL PRIMARY KEY,
@@ -128,3 +128,13 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 CREATE INDEX IF NOT EXISTS idx_audit_logs_room_id ON audit_logs(room_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_user_id ON audit_logs(user_id);
 CREATE INDEX IF NOT EXISTS idx_audit_logs_created_at ON audit_logs(created_at DESC);
+
+-- 同一用户在同一房间只有一条成员记录（离开/重进复用同一行，left_at 标记是否在线）。
+-- 唯一索引是并发入会的最后一道防线；先清掉存量库里可能存在的重复行（保留最新一条）。
+DELETE FROM room_members a USING room_members b
+    WHERE a.id < b.id AND a.room_id = b.room_id AND a.user_id = b.user_id;
+CREATE UNIQUE INDEX IF NOT EXISTS idx_room_members_room_user ON room_members(room_id, user_id);
+
+-- 踢出封禁按 (room, user) 查询；消息按房间 + 时间分页
+CREATE INDEX IF NOT EXISTS idx_kick_bans_room_user ON kick_bans(room_id, user_id);
+CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at DESC);

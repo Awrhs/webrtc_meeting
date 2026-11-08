@@ -2,6 +2,7 @@ package main
 
 import (
 	"conference-sfu/backend/internal/config"
+	migrations "conference-sfu/backend/internal/db"
 	"conference-sfu/backend/internal/handlers"
 	"conference-sfu/backend/internal/middleware"
 	"conference-sfu/backend/internal/repository"
@@ -30,6 +31,11 @@ func main() {
 	db, err := gorm.Open(postgres.Open(cfg.DatabaseDSN), &gorm.Config{})
 	if err != nil {
 		log.Fatal("Failed to connect to database", zap.Error(err))
+	}
+	// 启动时应用内嵌的 SQL 迁移（幂等）。不再依赖 Postgres 容器首次初始化时挂载的 init.sql：
+	// 那种方式只在数据卷为空时生效，之后任何改表都不会应用到已有库。
+	if err := migrations.Migrate(db); err != nil {
+		log.Fatal("Failed to run database migrations", zap.Error(err))
 	}
 
 	redisClient := repository.NewRedisClient(cfg.RedisAddr, cfg.RedisPassword, log)
