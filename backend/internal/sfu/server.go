@@ -28,6 +28,11 @@ type Room struct {
 	ID    uint
 	Peers map[uint]*Peer
 	mu    sync.Mutex
+
+	// closed 表示房间已从 SFUServer.rooms 中删除（最后一个成员离开）。
+	// 仅在持有 room.mu 时读写。handleJoin 拿到房间指针后若发现 closed，
+	// 必须重新从 s.rooms 获取/创建，否则会加入一个"孤儿房间"，与后来者互不可见。
+	closed bool
 }
 
 type TrackInfo struct {
@@ -71,6 +76,18 @@ type Peer struct {
 	Subscriptions map[uint][]*webrtc.RTPSender // key: fromUserID
 	addedTracks   map[string]bool              // key: fromUserID|trackKey
 	negotiated    atomic.Bool                  // 初始协商（首个 offer/answer 交换）是否已完成；未完成时 AddTrack 不触发 renegotiation
+
+	// pendingKeyframes：订阅建立后待发送的关键帧请求（PLI）。订阅时订阅者侧的
+	// 协商/传输往往尚未就绪，立刻请求关键帧多半白白浪费一帧；改为在协商完成
+	// （重协商 answer 到达）或连接建立（初始协商）后统一发送。受 mu 保护。
+	pendingKeyframes []keyframeRequest
+}
+
+// keyframeRequest 待发送的关键帧请求：向 publisher 的原始 SSRC 发 PLI。
+type keyframeRequest struct {
+	publisher *Peer
+	ssrc      uint32
+	trackKey  string
 }
 
 // 订阅相关的事件类型已定义在 peerEventType 中
@@ -782,11 +799,15 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 			Type: webrtc.SDPTypeAnswer,
 			SDP:  data.sdp,
 		})
-		if err != nil && evt.respCh != nil {
-			evt.respCh <- peerResp{err: err}
+		if err != nil {
+			if evt.respCh != nil {
+				evt.respCh <- peerResp{err: err}
+			}
 			return
 		}
 		s.logger.Info("Renegotiation completed", zap.Uint("user", peer.UserID))
+		// 重协商完成：新订阅的轨道现在可以接收，补发积压的关键帧请求
+		s.flushPendingKeyframes(peer)
 		if evt.respCh != nil {
 			evt.respCh <- peerResp{err: nil}
 		}
@@ -1053,18 +1074,6 @@ func (r *RTCPRouter) Lookup(ssrc uint32) (*RTCPTarget, bool) {
 	return t, ok
 }
 
-// lookupFor 查找某订阅者对某发布者的任一路由条目（REMB 无媒体 SSRC 时用）
-func (r *RTCPRouter) lookupFor(subscriber *Peer, publisherID uint) (*RTCPTarget, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	for _, t := range r.ssrcMap {
-		if t.Subscriber == subscriber && t.FromUserID == publisherID {
-			return t, true
-		}
-	}
-	return nil, false
-}
-
 // StatsByPublisher 汇总某发布者全部出站轨道的最新接收统计。
 func (r *RTCPRouter) StatsByPublisher(userID uint) (fractionLost, jitter, totalLost uint32, ok bool) {
 	r.mu.RLock()
@@ -1122,64 +1131,36 @@ func (r *RTCPRouter) UnregisterByUser(userID uint) {
 	}
 }
 
-// Route 将订阅端发来的 RTCP 反馈路由到对应的 publisher。
-// 【关键】订阅端 PLI/NACK 携带的是订阅侧出站轨道的 SSRC（Pion 为每个订阅者
-// 生成新 SSRC），发布者浏览器只认识自己的原始 SSRC，因此转发 PLI 前必须把
-// MediaSSRC 改写回发布者原始 SSRC（target.TrackSSRC），否则发布者不会响应，
-// 表现为黑屏/花屏要等很久。
-// 订阅端 NACK 不在此转发：下行丢包重传由 SFU 内置的 NACK responder
-// 拦截器（RegisterDefaultInterceptors）负责（SFU 缓存有出站 RTP）。
+// Route 将订阅端发来的 PLI 路由到对应的 publisher。
+// 【关键】订阅端 PLI 携带的是订阅侧出站轨道的 SSRC（Pion 为每个订阅者生成新
+// SSRC），发布者浏览器只认识自己的原始 SSRC，因此转发前必须把 MediaSSRC 改写回
+// 发布者原始 SSRC（target.TrackSSRC），否则发布者不会响应，表现为黑屏/花屏要等很久。
+//
+// 其它 RTCP 一律不转发：
+//   - NACK：下行丢包重传由 SFU 内置的 NACK responder 拦截器从出站缓存完成；
+//   - REMB：描述的是订阅者的下行带宽，由 QoSController 消费；
+//   - RR：描述的是"SFU → 订阅者"这一跳的接收质量，与发布者无关。SFU 自己的
+//     RTCP 拦截器已经向发布者发送真实的 RR；再把多个订阅者的 RR 改写后转给
+//     发布者，只会让它收到互相矛盾的统计、误导其码率控制。统计值已在
+//     startRTCPReadLoop 中记录到路由表供 GetRoomStats/QoS 使用。
 func (r *RTCPRouter) Route(pkt rtcp.Packet) bool {
-	var mediaSSRC uint32
-	var target *RTCPTarget
-
-	switch p := pkt.(type) {
-	case *rtcp.PictureLossIndication:
-		mediaSSRC = p.MediaSSRC
-	case *rtcp.ReceiverEstimatedMaximumBitrate:
-		// REMB 描述的是订阅者下行带宽，由 QoSController 消费，不转发
-		return false
-	case *rtcp.ReceiverReport:
-		if len(p.Reports) > 0 {
-			mediaSSRC = p.Reports[0].SSRC
-		} else {
-			return false
-		}
-	default:
-		// TransportLayerNack 等其它类型不转发（NACK 由 SFU 拦截器处理）
+	pli, ok := pkt.(*rtcp.PictureLossIndication)
+	if !ok {
 		return false
 	}
 
 	r.mu.RLock()
-	target, ok := r.ssrcMap[mediaSSRC]
+	target, found := r.ssrcMap[pli.MediaSSRC]
 	r.mu.RUnlock()
-
-	if !ok || target.Publisher == nil || target.TrackSSRC == 0 {
+	if !found || target.Publisher == nil || target.TrackSSRC == 0 {
 		return false
 	}
 
-	// PLI：改写 MediaSSRC 为发布者原始 SSRC 后转发
-	if pli, ok := pkt.(*rtcp.PictureLossIndication); ok {
-		rewritten := &rtcp.PictureLossIndication{
-			SenderSSRC: pli.SenderSSRC,
-			MediaSSRC:  target.TrackSSRC,
-		}
-		err := target.Publisher.PC.WriteRTCP([]rtcp.Packet{rewritten})
-		return err == nil
+	rewritten := &rtcp.PictureLossIndication{
+		SenderSSRC: pli.SenderSSRC,
+		MediaSSRC:  target.TrackSSRC,
 	}
-
-	// ReceiverReport：SSRC 语义是"报告的是谁的流"，同样需要改写
-	if rr, ok := pkt.(*rtcp.ReceiverReport); ok {
-		rewritten := *rr
-		rewritten.Reports = make([]rtcp.ReceptionReport, len(rr.Reports))
-		for i, rep := range rr.Reports {
-			rep.SSRC = target.TrackSSRC
-			rewritten.Reports[i] = rep
-		}
-		err := target.Publisher.PC.WriteRTCP([]rtcp.Packet{&rewritten})
-		return err == nil
-	}
-	return false
+	return target.Publisher.PC.WriteRTCP([]rtcp.Packet{rewritten}) == nil
 }
 
 // startRTCPReadLoop 启动 RTCP 读取和转发 goroutine
@@ -1202,14 +1183,18 @@ func (s *SFUServer) startRTCPReadLoop(peer *Peer, sender *webrtc.RTPSender, from
 				FromUserID: fromUserID,
 				TrackKey:   trackKey,
 			})
-			// 新订阅建立时立即向发布者请求一个关键帧，
-			// 否则订阅者要等发布者自然发下一个关键帧才能出图（黑屏数秒）。
-			if publisherSSRC != 0 {
-				pli := &rtcp.PictureLossIndication{MediaSSRC: publisherSSRC}
-				if err := publisher.PC.WriteRTCP([]rtcp.Packet{pli}); err != nil {
-					s.logger.Warn("Failed to request initial keyframe",
-						zap.Uint("publisher", fromUserID), zap.String("trackKey", trackKey), zap.Error(err))
-				}
+			// 新订阅建立后需要向发布者请求一个关键帧，否则订阅者要等发布者自然
+			// 发出下一个关键帧才能出图（黑屏数秒）。但此刻订阅者侧的协商/传输
+			// 尚未就绪，立刻发 PLI 换来的关键帧多半送不到；先登记为待发送，
+			// 由 flushPendingKeyframes 在协商完成或连接建立后统一发出。
+			if publisherSSRC != 0 && strings.HasPrefix(trackKey, "video-") {
+				peer.mu.Lock()
+				peer.pendingKeyframes = append(peer.pendingKeyframes, keyframeRequest{
+					publisher: publisher,
+					ssrc:      publisherSSRC,
+					trackKey:  trackKey,
+				})
+				peer.mu.Unlock()
 			}
 		}
 	}
@@ -1307,15 +1292,34 @@ func (s *SFUServer) startRTCPReadLoop(peer *Peer, sender *webrtc.RTPSender, from
 							}
 						}
 					}
-					s.rtcpRouter.Route(pkt)
+					// RR 只用于本地统计/QoS，不转发给发布者（见 Route 的说明）
 
 				default:
-					// 其他类型的 RTCP 包直接转发
-					s.rtcpRouter.Route(pkt)
+					// 其它类型（SR/SDES/BYE 等）与发布者无关，忽略
 				}
 			}
 		}
 	}()
+}
+
+// flushPendingKeyframes 向各发布者发送订阅者 peer 积压的关键帧请求（PLI）。
+// 在重协商 answer 处理完成、以及 PeerConnection 进入 connected 时调用。
+func (s *SFUServer) flushPendingKeyframes(peer *Peer) {
+	peer.mu.Lock()
+	pending := peer.pendingKeyframes
+	peer.pendingKeyframes = nil
+	peer.mu.Unlock()
+
+	for _, req := range pending {
+		pli := &rtcp.PictureLossIndication{MediaSSRC: req.ssrc}
+		if err := req.publisher.PC.WriteRTCP([]rtcp.Packet{pli}); err != nil {
+			s.logger.Debug("Failed to request keyframe",
+				zap.Uint("subscriber", peer.UserID),
+				zap.Uint("publisher", req.publisher.UserID),
+				zap.String("trackKey", req.trackKey),
+				zap.Error(err))
+		}
+	}
 }
 
 // lookupPublisherSSRC 按 trackKey 查找发布者轨道的原始 SSRC。
@@ -1630,18 +1634,22 @@ func (s *SFUServer) closePeer(peer *Peer) {
 }
 
 // deleteRoomIfEmpty 房间没人时删除房间并落盘录制文件。
-// 调用方必须已持有 room.mu。
-// deleteRoomIfEmpty 房间没人时删除房间并落盘录制文件。
-// 【锁顺序】必须在未持有 room.mu 时调用（本函数拿 s.mu；全局锁序统一为
-// s.mu → room.mu，若持 room.mu 再拿 s.mu 会与 HandleMetrics/ListRooms 等
-// 反序导致死锁）。调用方负责确认房间已空。
+// 【锁顺序】必须在未持有 room.mu 时调用。本函数按全局锁序 s.mu → room.mu 依次
+// 加锁：读 room.Peers 必须持 room.mu（否则与 handleJoin 等并发写竞争），而
+// 若调用方持 room.mu 再由本函数拿 s.mu，就与 HandleMetrics/ListRooms 等反序死锁。
+// 删除时把房间标记为 closed，让并发中的 handleJoin 识别出孤儿房间并重新获取。
 func (s *SFUServer) deleteRoomIfEmpty(roomID uint) {
 	s.mu.Lock()
 	room, ok := s.rooms[roomID]
-	if ok && len(room.Peers) == 0 {
-		delete(s.rooms, roomID)
-	} else {
-		ok = false
+	if ok {
+		room.mu.Lock()
+		if len(room.Peers) == 0 {
+			room.closed = true
+			delete(s.rooms, roomID)
+		} else {
+			ok = false
+		}
+		room.mu.Unlock()
 	}
 	s.mu.Unlock()
 	if ok {
@@ -1650,6 +1658,11 @@ func (s *SFUServer) deleteRoomIfEmpty(roomID uint) {
 }
 
 func (s *SFUServer) onConnectionStateChange(room *Room, peer *Peer, state webrtc.PeerConnectionState) {
+	if state == webrtc.PeerConnectionStateConnected {
+		// 传输已建立（初始协商路径）：补发订阅建立期间积压的关键帧请求
+		s.flushPendingKeyframes(peer)
+		return
+	}
 	if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
 		roomEmpty := false
 		room.mu.Lock()
@@ -1905,17 +1918,31 @@ func (s *SFUServer) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Peer, error) {
 	s.logger.Info("Peer joining", zap.Uint("room", msg.RoomID), zap.Uint("user", msg.UserID))
 
-	s.mu.Lock()
-	if _, ok := s.rooms[msg.RoomID]; !ok {
-		s.rooms[msg.RoomID] = &Room{
-			ID:    msg.RoomID,
-			Peers: make(map[uint]*Peer),
+	// 获取或创建房间。拿到指针后必须在 room.mu 下确认房间没有被并发删除：
+	// deleteRoomIfEmpty 可能在我们释放 s.mu 之后、拿到 room.mu 之前把房间删掉
+	// （最后一个成员恰好此刻离开），不检查就会加入一个已脱离 s.rooms 的"孤儿房间"，
+	// 与后来者互不可见。发现 closed 就回到 s.rooms 重新获取/创建。
+	var room *Room
+	for {
+		s.mu.Lock()
+		candidate, ok := s.rooms[msg.RoomID]
+		if !ok {
+			candidate = &Room{
+				ID:    msg.RoomID,
+				Peers: make(map[uint]*Peer),
+			}
+			s.rooms[msg.RoomID] = candidate
 		}
-	}
-	room := s.rooms[msg.RoomID]
-	s.mu.Unlock()
+		s.mu.Unlock()
 
-	room.mu.Lock()
+		candidate.mu.Lock()
+		if candidate.closed {
+			candidate.mu.Unlock()
+			continue
+		}
+		room = candidate
+		break
+	}
 	defer room.mu.Unlock()
 
 	// 同账号多端入会同房间：踢掉旧连接（与信令 Hub 行为对齐）。
