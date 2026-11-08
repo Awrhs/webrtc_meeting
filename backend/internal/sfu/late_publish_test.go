@@ -227,19 +227,19 @@ func TestLatePublish_SubscribeBeforeCameraTrackIsHonored(t *testing.T) {
 		return e.layerSubscribedByB() == "high"
 	})
 
-	select {
-	case m := <-e.clientB.ssrcMappings:
-		found := false
-		for _, entry := range m {
-			if entry.UserID == 1 && entry.Kind == "video" && entry.StreamID == "stream-a" && entry.RID == "high" {
-				found = true
+	// B 入会时已收到过 A 音频的 ssrc_mapping，这里要一直读到摄像头流的映射为止
+	deadline := time.After(5 * time.Second)
+	for found := false; !found; {
+		select {
+		case m := <-e.clientB.ssrcMappings:
+			for _, entry := range m {
+				if entry.UserID == 1 && entry.Kind == "video" && entry.StreamID == "stream-a" && entry.RID == "high" {
+					found = true
+				}
 			}
+		case <-deadline:
+			t.Fatal("B did not receive ssrc_mapping for the pushed camera track")
 		}
-		if !found {
-			t.Fatalf("ssrc_mapping lacks A's camera stream: %+v", m)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("B did not receive ssrc_mapping for the pushed camera track")
 	}
 
 	select {

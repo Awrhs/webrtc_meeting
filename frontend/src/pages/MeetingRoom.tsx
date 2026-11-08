@@ -517,7 +517,9 @@ export default function MeetingRoom() {
                   onSetVideoQuality={(userId, quality) => sfuConnectionRef.current?.setVideoQuality(userId, quality)}
                 />
               ) },
-              { key: 'chat', label: privateTarget ? `私聊：${privateTarget.nickname}` : '聊天', children: (
+              // forceRender：Chat 负责接收 Sender Key，必须随会议页一起挂载；
+              // 懒渲染会让用户打开聊天 Tab 之前到达的密钥被丢弃，之后的消息全部无法解密
+              { key: 'chat', forceRender: true, label: privateTarget ? `私聊：${privateTarget.nickname}` : '聊天', children: (
                 <Chat
                   roomId={parseInt(id!)}
                   messages={messages}

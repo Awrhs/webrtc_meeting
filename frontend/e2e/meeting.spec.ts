@@ -1,4 +1,4 @@
-import { test, expect, type Browser, type Page } from '@playwright/test'
+import { test, expect, type Browser, type Page, type TestInfo } from '@playwright/test'
 
 // ===================== 冒烟套件：应用外壳可加载（不依赖真实后端） =====================
 // CI 中用静态预览服务器跑：npm run build && npx playwright test
@@ -57,15 +57,39 @@ async function registerAndLogin(page: Page, account: Account) {
   await page.waitForURL(url => url.pathname === '/', { timeout: 20000 })
 }
 
-async function newUserPage(browser: Browser) {
+// 失败时把两个浏览器的 console 输出作为附件上传（CI 的 diagnostics 产物里能看到），
+// 否则只能靠服务端日志和页面快照猜前端发生了什么
+const consoleCaptures: { name: string; lines: string[] }[] = []
+
+async function newUserPage(browser: Browser, name: string) {
   const context = await browser.newContext({ permissions: ['camera', 'microphone'] })
   const page = await context.newPage()
+  const lines: string[] = []
+  page.on('console', msg => lines.push(`${new Date().toISOString()} [${msg.type()}] ${msg.text()}`))
+  page.on('pageerror', err => lines.push(`${new Date().toISOString()} [pageerror] ${err.message}`))
+  consoleCaptures.push({ name, lines })
   return { context, page }
+}
+
+async function attachConsoleLogs(testInfo: TestInfo) {
+  if (testInfo.status !== testInfo.expectedStatus) {
+    for (const capture of consoleCaptures) {
+      await testInfo.attach(`${capture.name}-console.log`, {
+        body: capture.lines.join('\n'),
+        contentType: 'text/plain',
+      })
+    }
+  }
+  consoleCaptures.length = 0
 }
 
 test.describe('full meeting E2E (requires E2E_FULL=1 + backend stack)', () => {
   test.skip(!process.env.E2E_FULL, 'set E2E_FULL=1 and run make e2e-up to enable')
   test.skip(({ browserName }) => browserName !== 'chromium', 'fake media devices are only available in Chromium')
+
+  test.afterEach(async ({}, testInfo) => {
+    await attachConsoleLogs(testInfo)
+  })
 
   test('two users register, create/join a room, see each other, exchange media and E2EE chat', async ({ browser }) => {
     test.setTimeout(180_000)
@@ -74,7 +98,7 @@ test.describe('full meeting E2E (requires E2E_FULL=1 + backend stack)', () => {
     const bobAccount = makeAccount('bob', suffix, '138')
 
     // 1) Alice 注册、登录、创建房间（无验证），进入会议
-    const alice = await newUserPage(browser)
+    const alice = await newUserPage(browser, 'alice')
     await registerAndLogin(alice.page, aliceAccount)
     await alice.page.getByRole('button', { name: '创建房间' }).click()
     await alice.page.getByPlaceholder('请输入房间名称').fill(`房间${suffix}`)
@@ -87,7 +111,7 @@ test.describe('full meeting E2E (requires E2E_FULL=1 + backend stack)', () => {
     await expect(alice.page.getByTestId('media-status')).toHaveText('媒体已连接', { timeout: 40000 })
 
     // 2) Bob 注册、登录，直接打开会议链接加入（无验证房间支持直接进入）
-    const bob = await newUserPage(browser)
+    const bob = await newUserPage(browser, 'bob')
     await registerAndLogin(bob.page, bobAccount)
     await bob.page.goto(meetingUrl)
     await bob.page.waitForURL(/\/meeting\/\d+/, { timeout: 20000 })

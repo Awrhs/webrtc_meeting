@@ -79,7 +79,9 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
   const { members } = useSelector((state: RootState) => state.room)
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
-  const [e2eeReady, setE2eeReady] = useState(false)
+  // 聊天 Tab 是懒渲染的：本组件可能在密钥交换早已完成之后才挂载，初始状态必须取管理器的当前值，
+  // 否则 onStateChange 不会再触发，输入框永远停在"正在协商加密密钥..."
+  const [e2eeReady, setE2eeReady] = useState(() => groupE2EEManager.isReady())
   const [myFingerprint, setMyFingerprint] = useState('')
   const [debugInfo, setDebugInfo] = useState('')
   const [decryptedMessages, setDecryptedMessages] = useState<Record<number, string>>({})
@@ -141,6 +143,10 @@ export default function Chat({ roomId, messages, signaling, privateTarget, onClo
         )
       }
     )
+
+    // 回调可能注册得比密钥交换晚：挂载时同步一次就绪状态与本机指纹
+    setE2eeReady(groupE2EEManager.isReady())
+    groupE2EEManager.getMyFingerprint().then(setMyFingerprint).catch(() => undefined)
 
     if (!signaling) {
       groupE2EEManager.init(user?.id).catch(console.error)
