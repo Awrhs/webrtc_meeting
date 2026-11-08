@@ -12,10 +12,12 @@ import (
 	"conference-sfu/backend/internal/sfu"
 	"conference-sfu/backend/internal/signaling"
 	"conference-sfu/backend/pkg/logger"
+	"conference-sfu/backend/pkg/metrics"
 	"context"
 	"net/http"
 	"os/signal"
 	"path/filepath"
+	"runtime"
 	"syscall"
 	"time"
 
@@ -87,6 +89,16 @@ func main() {
 	go hub.Run()
 
 	r := gin.Default()
+	// Prometheus 指标：HTTP 请求计数/耗时 + 信令在线数 + Go 运行时
+	promRegistry := metrics.NewRegistry()
+	promRegistry.RegisterGoRuntime()
+	promRegistry.NewGaugeFunc("signaling_connected_clients", "WebSocket signaling clients currently connected.", func() float64 {
+		return float64(hub.Stats().Clients)
+	})
+	promRegistry.NewGaugeFunc("signaling_active_rooms", "Rooms with at least one connected signaling client.", func() float64 {
+		return float64(hub.Stats().Rooms)
+	})
+	r.Use(middleware.Metrics(promRegistry))
 	authLimiter := middleware.NewIPLimiter(cfg.RateLimitAuthPerMinute, time.Minute)
 	apiLimiter := middleware.NewIPLimiter(cfg.RateLimitAPIPerMinute, time.Minute)
 	wsLimiter := middleware.NewIPLimiter(cfg.RateLimitWSPerMinute, time.Minute)
@@ -97,12 +109,13 @@ func main() {
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     cfg.AllowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
+		// X-Device-Id：前端每个请求携带的设备标识（登录会话绑定设备），不加入白名单会被 CORS 预检拒绝
+		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Device-Id"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 	}))
 
-	handler := handlers.NewHandler(userService, userRepo, roomService, chatService, hub, sfuRouter, cfg.SFUCallbackToken, cfg.UploadDir, int64(cfg.UploadMaxBytes), log)
+	handler := handlers.NewHandler(userService, userRepo, roomService, chatService, hub, sfuRouter, cfg.SFUCallbackToken, cfg.SFUHTTPURL, cfg.UploadDir, int64(cfg.UploadMaxBytes), log)
 
 	api := r.Group("/api/v1")
 	{
@@ -148,6 +161,10 @@ func main() {
 
 			authed.GET("/rooms/:id/audit-logs", handler.GetAuditLogs)
 
+			// 会议录制（owner/admin）：经 API 代理访问 SFU，只暴露本房间的录制
+			authed.GET("/rooms/:id/recordings", handler.ListRecordings)
+			authed.GET("/rooms/:id/recordings/:dir/:file", handler.DownloadRecording)
+
 			authed.PUT("/rooms/:id/media-state", handler.UpdateMediaState)
 
 			// 离开会议与实时在线状态
@@ -185,8 +202,15 @@ func main() {
 		}
 		c.JSON(http.StatusOK, gin.H{"ready": true})
 	})
+	r.GET("/metrics", gin.WrapH(promRegistry.ProtectedHandler(cfg.MetricsToken)))
 	r.GET("/metrics.json", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok"})
+		stats := hub.Stats()
+		c.JSON(http.StatusOK, gin.H{
+			"status":            "ok",
+			"signaling_clients": stats.Clients,
+			"signaling_rooms":   stats.Rooms,
+			"goroutines":        runtime.NumGoroutine(),
+		})
 	})
 
 	r.GET("/ws", wsLimiter.Gin(), func(c *gin.Context) {

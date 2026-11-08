@@ -6,6 +6,7 @@ import (
 	"conference-sfu/backend/internal/repository"
 	"conference-sfu/backend/internal/sfu"
 	"conference-sfu/backend/pkg/logger"
+	"conference-sfu/backend/pkg/metrics"
 	"context"
 	"net/http"
 	"os"
@@ -101,6 +102,11 @@ func main() {
 		_, _ = w.Write([]byte("ready"))
 	})
 	mux.HandleFunc("/metrics.json", sfuServer.HandleMetrics)
+	// Prometheus 文本指标（METRICS_TOKEN 非空时需要 Bearer token）
+	promRegistry := metrics.NewRegistry()
+	promRegistry.RegisterGoRuntime()
+	sfuServer.RegisterMetrics(promRegistry)
+	mux.Handle("/metrics", promRegistry.ProtectedHandler(cfg.MetricsToken))
 
 	// 录制管理接口（X-SFU-Callback-Token 鉴权）：查询与下载/回放录制文件
 	mux.HandleFunc("/recordings/list", sfuServer.HandleRecordingsList)
@@ -110,7 +116,7 @@ func main() {
 	c := cors.New(cors.Options{
 		AllowedOrigins:   cfg.AllowedOrigins,
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"Content-Type", "Authorization"},
+		AllowedHeaders:   []string{"Content-Type", "Authorization", "X-Device-Id"},
 		AllowCredentials: true,
 	})
 
