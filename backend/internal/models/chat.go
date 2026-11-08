@@ -53,9 +53,15 @@ type E2EEPublicKey struct {
 	ID        uint      `json:"id" gorm:"primaryKey"`
 	UserID    uint      `json:"user_id" gorm:"uniqueIndex;not null"`
 	PublicKey string    `json:"public_key" gorm:"type:text;not null"`
-	KeyType   string    `json:"key_type" gorm:"size:20;default:ecdh_p256"` // ecdh_p256, rsa_2048 等
+	KeyType   string    `json:"key_type" gorm:"size:20;default:ecdh_p256"` // ecdh_p256、bundle_v2（ECDH+ECDSA 公钥包）等
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// TableName 显式指定表名。GORM 的默认命名会把 E2EEPublicKey 变成 e2_ee_public_keys，
+// 与迁移脚本里的 e2ee_public_keys 不一致，导致公钥接口一直报"relation does not exist"。
+func (E2EEPublicKey) TableName() string {
+	return "e2ee_public_keys"
 }
 
 // E2EEKeyExchangeRequest 密钥交换请求
