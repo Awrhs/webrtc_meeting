@@ -700,11 +700,14 @@ export class GroupE2EEManager {
         arrayBufferToBase64(sharedKeyRaw)
       )
 
+      // messageNumber 是这把链密钥对应的位置：接收方从这里开始棘轮。
+      // 没有它，接收方只能假设位置 0；若分发发生在发过消息之后，解密全部错位。
       const distributionPackage = JSON.stringify({
         chainKey: ciphertext,
         chainKeyIv: iv,
         publicKey: this.identityKeyPair!.publicKey,
         epoch: this.mySenderChain.epoch,
+        messageNumber: this.mySenderChain.messageNumber,
       })
 
       encryptedKeys.set(userId, distributionPackage)
@@ -721,7 +724,7 @@ export class GroupE2EEManager {
     const sharedKey = this.pairwiseSharedKeys.get(senderId)
     if (!sharedKey) throw new Error(`No shared key with user ${senderId}`)
 
-    const { chainKey: encryptedChainKey, chainKeyIv, publicKey, epoch = 0 } = JSON.parse(encryptedPackage)
+    const { chainKey: encryptedChainKey, chainKeyIv, publicKey, epoch = 0, messageNumber = 0 } = JSON.parse(encryptedPackage)
     const sharedKeyRaw = await crypto.subtle.exportKey('raw', sharedKey)
     const chainKey = await aesDecrypt(
       encryptedChainKey,
@@ -730,13 +733,22 @@ export class GroupE2EEManager {
     )
 
     const key = this.senderChainKey(senderId, epoch)
+    const existing = this.peerSenderChains.get(key)
+    if (existing && existing.messageNumber >= messageNumber) {
+      // 已持有同一 epoch 中位置相同或更靠后的链：不能用旧位置覆盖，
+      // 否则已经推进过的棘轮被拉回，后续消息全部解不开
+      console.log(`[E2EE] Ignoring sender key from user ${senderId} (epoch ${epoch}, position ${messageNumber}, have ${existing.messageNumber})`)
+      this.tryProcessPendingMessages(senderId, epoch)
+      return
+    }
+
     this.peerSenderChains.set(key, {
       chainKey,
-      messageNumber: 0,
+      messageNumber,
       publicKey,
       epoch,
     })
-    // 新链从 0 开始，旧链缓存的跳过密钥不再适用
+    // 链被替换，旧链缓存的跳过密钥不再适用
     this.skippedMessageKeys.delete(key)
 
     // 尝试解密之前缓存的消息
@@ -815,9 +827,19 @@ export class GroupE2EEManager {
     if (!this.mySenderChain) throw new Error('Sender chain not initialized')
     if (!this.signingKeyPair) throw new Error('Signing key not initialized')
 
-    const { nextChainKey, messageKey } = await ratchetStep(this.mySenderChain.chainKey)
     const currentMessageNumber = this.mySenderChain.messageNumber
 
+    // 本 epoch 的首条消息：先把当前链（位置 0）分发出去，再推进棘轮。
+    // 【顺序很重要】旧实现先推进再分发，对方拿到的是位置 1 的链密钥，
+    // 却用它去解位置 0 的消息，必然失败。
+    if (currentMessageNumber === 0) {
+      const encryptedKeys = await this.distributeSenderKey()
+      for (const [userId, encryptedChainKey] of encryptedKeys.entries()) {
+        this.onNeedSendKey?.(userId, encryptedChainKey)
+      }
+    }
+
+    const { nextChainKey, messageKey } = await ratchetStep(this.mySenderChain.chainKey)
     this.mySenderChain.chainKey = nextChainKey
     this.mySenderChain.messageNumber++
 
@@ -833,14 +855,6 @@ export class GroupE2EEManager {
     }
     const signature = await signPayload(this.signingKeyPair.privateKey, messageSigningPayload(unsigned))
     const message: EncryptedMessage = { ...unsigned, signature }
-
-    // 如果是首次发送，分发 Sender Key
-    if (currentMessageNumber === 0) {
-      const encryptedKeys = await this.distributeSenderKey()
-      for (const [userId, encryptedChainKey] of encryptedKeys.entries()) {
-        this.onNeedSendKey?.(userId, encryptedChainKey)
-      }
-    }
 
     this.scheduleSave()
     return message

@@ -125,6 +125,8 @@ describe('GroupE2EEManager: Sender Keys 加解密', () => {
     await alice.addMember(3, carol.getIdentityPublicKey(), carol.getSigningPublicKey())
     await carol.addMember(1, alice.getIdentityPublicKey(), alice.getSigningPublicKey())
 
+    // 网络乱序：分发包（位置 0）先于消息生成，却晚于消息到达
+    const packages = await alice.distributeCurrentSenderKey([3])
     const m0 = await alice.encryptMessage('early', 1)
     let settled = false
     const pending = carol.decryptMessage(m0).then(text => {
@@ -134,9 +136,43 @@ describe('GroupE2EEManager: Sender Keys 加解密', () => {
     await new Promise(r => setTimeout(r, 20))
     expect(settled).toBe(false)
 
-    const packages = await alice.distributeCurrentSenderKey([3])
     await carol.receiveSenderKey(1, packages.get(3)!)
     expect(await pending).toBe('early')
+  })
+
+  it('分发包携带链位置：中途加入的成员只能解之后的消息（回归：先推进再分发的错位 bug）', async () => {
+    const alice = new GroupE2EEManager()
+    const late = new GroupE2EEManager()
+    await alice.init(1)
+    await late.init(5)
+    await alice.addMember(5, late.getIdentityPublicKey(), late.getSigningPublicKey())
+    await late.addMember(1, alice.getIdentityPublicKey(), alice.getSigningPublicKey())
+
+    const m0 = await alice.encryptMessage('before join', 1)
+    const m1 = await alice.encryptMessage('also before', 1)
+    // 此时分发：链位置应为 2
+    const packages = await alice.distributeCurrentSenderKey([5])
+    expect(JSON.parse(packages.get(5)!).messageNumber).toBe(2)
+    await late.receiveSenderKey(1, packages.get(5)!)
+
+    const m2 = await alice.encryptMessage('after join', 1)
+    expect(await late.decryptMessage(m2)).toBe('after join')
+    // 加入前的消息没有对应密钥（前向保密），被拒绝而不是解出乱码
+    await expect(late.decryptMessage(m0)).rejects.toThrow(/重复|过期/)
+    await expect(late.decryptMessage(m1)).rejects.toThrow(/重复|过期/)
+  })
+
+  it('重复收到同一 epoch 的旧位置分发包不会把链拉回去', async () => {
+    const { alice, bob } = await pair()
+    const stale = await alice.distributeCurrentSenderKey([2]) // 位置 0 的包
+    const m0 = await alice.encryptMessage('a', 1)
+    const m1 = await alice.encryptMessage('b', 1)
+    expect(await bob.decryptMessage(m0)).toBe('a')
+    expect(await bob.decryptMessage(m1)).toBe('b')
+    // Bob 的链已在位置 2；再次收到位置 0 的包必须被忽略
+    await bob.receiveSenderKey(1, stale.get(2)!)
+    const m2 = await alice.encryptMessage('c', 1)
+    expect(await bob.decryptMessage(m2)).toBe('c')
   })
 
   it('签名公钥晚于消息到达：消息先挂起，公钥到达后自动解出', async () => {
