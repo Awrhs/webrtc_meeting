@@ -76,6 +76,8 @@ export class SFUConnection {
   private desiredVideoSubscriptions: Set<number> = new Set()
   // WebSocket 未 open 时的消息缓冲：避免 join 前的 subscribe 等消息被静默丢弃
   private pendingMessages: SFUMessage[] = []
+  // 服务端下发的 ICE 配置（入会响应 / sfu-token 刷新响应）；为空时回退到构建期环境变量
+  private iceServers: RTCIceServer[] = []
 
   constructor(
     roomId: number,
@@ -86,7 +88,8 @@ export class SFUConnection {
     onDisconnected: () => void,
     onError: (error: string) => void,
     mediaE2EEManager?: MediaE2EEManager | null,
-    sfuUrl?: string
+    sfuUrl?: string,
+    iceServers?: RTCIceServer[]
   ) {
     this.roomId = roomId
     this.userId = userId
@@ -97,6 +100,26 @@ export class SFUConnection {
     this.onError = onError
     this.mediaE2EEManager = mediaE2EEManager ?? null
     this.sfuUrl = sfuUrl || ''
+    this.iceServers = iceServers ?? []
+  }
+
+  // 构建 RTCPeerConnection 的 ICE 服务器列表：优先服务端下发（含时限 TURN 凭据），
+  // 否则用构建期环境变量（VITE_STUN_SERVER / VITE_TURN_*）。默认 STUN 用国内可达的服务器：
+  // stun.l.google.com 在国内经常超时，会把 ICE 收集拖慢好几秒。
+  private buildIceServers(): RTCIceServer[] {
+    if (this.iceServers.length > 0) return this.iceServers
+
+    const stunServer = import.meta.env.VITE_STUN_SERVER || 'stun:stun.qq.com:3478'
+    const turnServer = import.meta.env.VITE_TURN_SERVER
+    const turnUsername = import.meta.env.VITE_TURN_USERNAME
+    const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL
+
+    const iceServers: RTCIceServer[] = [{ urls: stunServer }]
+    if (turnServer && turnUsername && turnCredential) {
+      iceServers.push({ urls: turnServer, username: turnUsername, credential: turnCredential })
+      console.log('[WebRTC] TURN server configured from build env:', turnServer)
+    }
+    return iceServers
   }
 
   private getWsUrl(): string {
@@ -120,25 +143,8 @@ export class SFUConnection {
     this.isManualDisconnect = false
     this.localStream = localStream
 
-    const stunServer = import.meta.env.VITE_STUN_SERVER || 'stun:stun.l.google.com:19302'
-    const turnServer = import.meta.env.VITE_TURN_SERVER
-    const turnUsername = import.meta.env.VITE_TURN_USERNAME
-    const turnCredential = import.meta.env.VITE_TURN_CREDENTIAL
-
-    const iceServers: RTCIceServer[] = [{ urls: stunServer }]
-
-    // 如果配置了 TURN 服务器，则添加
-    if (turnServer && turnUsername && turnCredential) {
-      iceServers.push({
-        urls: turnServer,
-        username: turnUsername,
-        credential: turnCredential,
-      })
-      console.log('[WebRTC] TURN server configured:', turnServer)
-    }
-
     const configuration: RTCConfiguration = {
-      iceServers,
+      iceServers: this.buildIceServers(),
       encodedInsertableStreams: this.mediaE2EEManager?.isEnabled() || undefined,
     }
 
@@ -524,6 +530,10 @@ export class SFUConnection {
     // 集群模式：实例可能变化，同步更新
     if (response.data.sfu_url) {
       this.sfuUrl = response.data.sfu_url
+    }
+    // TURN 凭据是时限的：重连拿到的新凭据用于新建的 PeerConnection
+    if (Array.isArray(response.data.ice_servers) && response.data.ice_servers.length > 0) {
+      this.iceServers = response.data.ice_servers
     }
   }
 

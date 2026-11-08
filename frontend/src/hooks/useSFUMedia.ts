@@ -24,6 +24,7 @@ export function useSFUMedia({ onRemoteTrack, mediaE2EEManagerRef, localStreamRef
     userId: number,
     sfuToken: string,
     sfuUrl?: string,
+    iceServers?: RTCIceServer[],
   ) => {
     try {
       const stream = await getMediaStream(false, true)
@@ -52,7 +53,8 @@ export function useSFUMedia({ onRemoteTrack, mediaE2EEManagerRef, localStreamRef
           message.error(error)
         },
         mediaE2EEManagerRef.current,
-        sfuUrl || undefined
+        sfuUrl || undefined,
+        iceServers
       )
 
       sfuConnectionRef.current = sfuConnection

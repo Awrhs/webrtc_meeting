@@ -8,23 +8,26 @@ RUN apk --no-cache add ca-certificates git
 
 WORKDIR /app
 
-COPY go.mod ./
+COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
 
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o sfu ./backend/cmd/sfu
 
-FROM alpine:latest
+FROM alpine:3.20
 
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add ca-certificates tzdata \
+    && adduser -D -u 10001 app \
+    && mkdir -p /data/recordings \
+    && chown -R app:app /data
 
-WORKDIR /root/
-
+WORKDIR /app
 COPY --from=builder /app/sfu .
 
+# 以非 root 运行；/data/recordings 的属主在镜像里设好，首次创建的命名卷会继承
+USER app
 EXPOSE 8081
-
 ENV GO_ENV=production
 
 CMD ["./sfu"]

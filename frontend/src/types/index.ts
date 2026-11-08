@@ -82,6 +82,9 @@ export interface JoinRoomResponse {
   my_permissions: Permission[]
   sfu_token: string
   sfu_url?: string
+  // 服务端下发的 ICE 配置：STUN + 时限 TURN 凭据（coturn --use-auth-secret），固定账号不再打进前端
+  ice_servers?: RTCIceServer[]
+  ice_ttl_seconds?: number
 }
 
 // 审计日志

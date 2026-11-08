@@ -1,0 +1,52 @@
+# HTTPS 叠加（局域网试用 / 公网部署都需要：浏览器只在 localhost 或 HTTPS 页面上开放摄像头和麦克风）。
+#
+# 用法：
+#   1) 设定对外访问地址（局域网 IP 或域名）：export PUBLIC_HOST=192.168.1.10
+#   2) 生成自签名证书：deployment/tls/gen-self-signed.sh $PUBLIC_HOST
+#      （公网域名可换成 Let's Encrypt 证书，放到 deployment/tls/server.crt|server.key）
+#   3) 启动：docker compose -f deployment/docker-compose.yml -f deployment/docker-compose.tls.yml up -d --build
+#   4) 每台客户端电脑信任 deployment/tls/server.crt（自签名时），然后访问 https://$PUBLIC_HOST
+#
+# nginx 在 443 统一终结 TLS：/ 前端、/api 与 /ws 到 API、/sfu/ws 到 SFU 的 WebSocket。
+# 注意：compose 合并文件时列表字段默认是追加，这里用 !reset / !override 收回基础文件暴露的
+# 明文端口，需要 Docker Compose v2.24 及以上。
+services:
+  nginx:
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.tls.conf:/etc/nginx/nginx.conf:ro
+      - ./tls:/etc/nginx/tls:ro
+
+  frontend:
+    build:
+      args:
+        VITE_API_HOST: https://${PUBLIC_HOST:?set PUBLIC_HOST to your LAN IP or domain}
+        VITE_SFU_HOST: https://${PUBLIC_HOST}/sfu
+    # 只经 nginx 访问，不再直接暴露 3000
+    ports: !reset []
+
+  api-server:
+    environment:
+      ALLOWED_ORIGINS: https://${PUBLIC_HOST}
+      # 浏览器通过 nginx 的 /sfu/ws 连接 SFU
+      SFU_PUBLIC_WS_URL: wss://${PUBLIC_HOST}/sfu
+      # TURN 地址给浏览器用：默认指向同一台宿主机上的 coturn
+      TURN_URLS: ${TURN_URLS:-turn:${PUBLIC_HOST}:3478?transport=udp,turn:${PUBLIC_HOST}:3478?transport=tcp}
+    # 不再直接暴露 8080，统一走 nginx
+    ports: !reset []
+
+  sfu-server:
+    environment:
+      ALLOWED_ORIGINS: https://${PUBLIC_HOST}
+      SFU_PUBLIC_WS_URL: wss://${PUBLIC_HOST}/sfu
+      # 媒体 host 候选使用对外地址（局域网为宿主机 IP）
+      SFU_PUBLIC_IP: ${SFU_PUBLIC_IP:-${PUBLIC_HOST}}
+    # 8081 不再直接暴露（WebSocket 经 nginx）；只保留媒体 UDP 端口段
+    ports: !override
+      - "${WEBRTC_PORT_RANGE_MIN:-49152}-${WEBRTC_PORT_RANGE_MAX:-49200}:${WEBRTC_PORT_RANGE_MIN:-49152}-${WEBRTC_PORT_RANGE_MAX:-49200}/udp"
+
+  coturn:
+    environment:
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-${PUBLIC_HOST}}

@@ -36,7 +36,8 @@ type wsSignaling struct {
 	remoteOffer  chan string
 
 	iceCandidates chan webrtc.ICECandidateInit
-	writeMu       sync.Mutex // gorilla websocket 不允许并发写（测试客户端侧）
+	ssrcMappings  chan []SSRC // SFU 下发的 ssrc_mapping（订阅建立后的流归属信息）
+	writeMu       sync.Mutex  // gorilla websocket 不允许并发写（测试客户端侧）
 
 	closedOnce sync.Once
 }
@@ -55,6 +56,7 @@ func newWSClient(t *testing.T, url string, pc *webrtc.PeerConnection) *wsSignali
 		remoteAnswer:  make(chan string, 8),
 		remoteOffer:   make(chan string, 8),
 		iceCandidates: make(chan webrtc.ICECandidateInit, 64),
+		ssrcMappings:  make(chan []SSRC, 16),
 	}
 	go c.readLoop()
 	return c
@@ -84,7 +86,12 @@ func (c *wsSignaling) readLoop() {
 		case "ice-candidate":
 			cand := webrtc.ICECandidateInit{Candidate: msg.Candidate}
 			c.iceCandidates <- cand
-		case "ssrc_mapping", "muted", "error":
+		case "ssrc_mapping":
+			select {
+			case c.ssrcMappings <- msg.SSRCs:
+			default:
+			}
+		case "muted", "error":
 			// 基础测试不关心
 		}
 	}

@@ -65,6 +65,15 @@ type Config struct {
 	SFUHTTPURL string
 	// MetricsToken：非空时 /metrics 需要 Bearer token（Prometheus bearer_token）
 	MetricsToken string
+	// 下发给浏览器的 ICE 配置：STUN 列表、TURN 列表，以及 coturn --use-auth-secret 的共享密钥
+	// （API 据此签发时限 TURN 凭据，不再把固定账号密码打进前端）
+	STUNURLs                 []string
+	TURNURLs                 []string
+	TURNStaticAuthSecret     string
+	TURNCredentialTTLSeconds int
+	// SFUPublicIPs：SFU 对外可达的 IP（云主机的弹性公网 IP、局域网部署时的宿主机 IP），
+	// 以 NAT 1:1 的方式写进 ICE host 候选；容器内只有私网地址时必须配置
+	SFUPublicIPs []string
 }
 
 func loadEnvFromFile(filename string) error {
@@ -166,6 +175,11 @@ func Load() *Config {
 		AppName:                    getEnv("APP_NAME", "SFU会议"),
 		SFUHTTPURL:                 getEnv("SFU_HTTP_URL", "http://localhost:8081"),
 		MetricsToken:               getEnv("METRICS_TOKEN", ""),
+		STUNURLs:                   stunURLsFromEnv(),
+		TURNURLs:                   getEnvList("TURN_URLS", ""),
+		TURNStaticAuthSecret:       getEnv("TURN_STATIC_AUTH_SECRET", ""),
+		TURNCredentialTTLSeconds:   getEnvAsInt("TURN_CREDENTIAL_TTL_SECONDS", 3600),
+		SFUPublicIPs:               getEnvList("SFU_PUBLIC_IP", ""),
 	}
 	if err := cfg.Validate(); err != nil {
 		panic(err)
@@ -198,6 +212,16 @@ func getEnvAsBool(key string, defaultValue bool) bool {
 	default:
 		return defaultValue
 	}
+}
+
+// stunURLsFromEnv 解析 STUN_URLS：未设置用国内默认；设为 none 表示不配置 STUN
+// （纯内网/无外网部署时 STUN 不可达只会让 ICE gathering 白等几秒，host 候选已够用）。
+func stunURLsFromEnv() []string {
+	list := getEnvList("STUN_URLS", "stun:stun.qq.com:3478,stun:stun.miwifi.com:3478")
+	if len(list) == 1 && strings.EqualFold(list[0], "none") {
+		return []string{}
+	}
+	return list
 }
 
 func getEnvList(key string, defaultValue string) []string {

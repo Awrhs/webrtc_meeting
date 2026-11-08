@@ -32,6 +32,8 @@ type Handler struct {
 	sfuHTTPURL     string
 	uploadDir      string
 	uploadMaxBytes int64
+	// ice：下发给浏览器的 STUN/TURN 配置（见 ice.go）
+	ice ICEConfig
 }
 
 func NewHandler(userService service.UserService, userRepo repository.UserRepository, roomService service.RoomService, chatService service.ChatService, hub *signaling.Hub, sfuRouter *sfu.ControlRouter, sfuCallbackToken string, sfuHTTPURL string, uploadDir string, uploadMaxBytes int64, logger *zap.Logger) *Handler {

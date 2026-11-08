@@ -1,5 +1,9 @@
-version: '3.8'
-
+# 基础编排：HTTP（本机/开发）。
+#   - 局域网/公网试用需要 HTTPS（浏览器只在 localhost 或 HTTPS 页面上开放摄像头/麦克风）：
+#       docker compose -f deployment/docker-compose.yml -f deployment/docker-compose.tls.yml up -d --build
+#     见 docs/LAN_DEPLOYMENT.md。
+#   - 需要从宿主机直连 Postgres/Redis（本地开发、make e2e-up）时叠加 docker-compose.dev.yml。
+#   - 数据库表结构由 api-server 启动时的内嵌迁移自动创建/升级。
 services:
   postgres:
     image: postgres:15-alpine
@@ -8,12 +12,14 @@ services:
       POSTGRES_DB: ${DB_NAME:-conference}
       POSTGRES_USER: ${DB_USER:-postgres}
       POSTGRES_PASSWORD: ${DB_PASSWORD:-postgres}
-    # 表结构由 api-server 启动时的内嵌迁移自动创建/升级（backend/internal/db/migrations），
-    # 不再挂载 init.sql：那种方式只在数据卷为空时执行一次，后续改表对已有库无效。
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5433:5432"
+    # 默认不把端口暴露到宿主机（公网机器上暴露数据库端口就是事故）；需要时叠加 docker-compose.dev.yml
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-postgres} -d ${DB_NAME:-conference}"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
     networks:
       - conference-net
     restart: unless-stopped
@@ -21,29 +27,40 @@ services:
   redis:
     image: redis:7-alpine
     container_name: conference-redis
-    ports:
-      - "6379:6379"
+    # REDIS_PASSWORD 非空时启用密码（api-server / sfu-server 同样读取 REDIS_PASSWORD）
+    command: ["sh", "-c", "exec redis-server ${REDIS_PASSWORD:+--requirepass $$REDIS_PASSWORD}"]
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-}
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ${REDIS_PASSWORD:+-a $$REDIS_PASSWORD} ping | grep -q PONG"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
     networks:
       - conference-net
     restart: unless-stopped
 
   coturn:
-    image: instrumentisto/coturn:latest
+    image: instrumentisto/coturn:4.6
     container_name: conference-coturn
+    # REST 时限凭据（--use-auth-secret）：API 用同一个 TURN_STATIC_AUTH_SECRET 为每个用户签发短期凭据，
+    # 前端不再持有固定账号密码。中继端口段 49300-49400（与 SFU 的媒体端口段错开）。
+    command:
+      - sh
+      - -c
+      - >-
+        exec turnserver --log-file=stdout --fingerprint --no-cli
+        --realm=${TURN_REALM:-conference}
+        --use-auth-secret --static-auth-secret=$$TURN_STATIC_AUTH_SECRET
+        --min-port=49300 --max-port=49400
+        ${TURN_EXTERNAL_IP:+--external-ip=$$TURN_EXTERNAL_IP}
+    environment:
+      TURN_STATIC_AUTH_SECRET: ${TURN_STATIC_AUTH_SECRET:-dev-turn-secret-change-in-production}
+      TURN_EXTERNAL_IP: ${TURN_EXTERNAL_IP:-}
     ports:
       - "3478:3478"
       - "3478:3478/udp"
-      - "49152-49200:49152-49200/udp"
-    command:
-      - turnserver
-      - --log-file=stdout
-      - --realm=conference
-      - --user=${COTURN_USER:-username}:${COTURN_PASSWORD:-password}
-      - --lt-cred-mech
-    environment:
-      TURN_STATIC_AUTH_SECRET: ${TURN_STATIC_AUTH_SECRET:-dev-turn-secret-change-in-production}
-      TURN_USER: ${COTURN_USER:-username}
-      TURN_PWD: ${COTURN_PASSWORD:-password}
+      - "49300-49400:49300-49400/udp"
     networks:
       - conference-net
     restart: unless-stopped
@@ -78,9 +95,11 @@ services:
       SFU_CALLBACK_TOKEN: ${SFU_CALLBACK_TOKEN:-dev-sfu-callback-token}
       JWT_EXPIRY_HOURS: ${JWT_EXPIRY_HOURS:-168}
       SFU_TOKEN_EXPIRY_MINUTES: ${SFU_TOKEN_EXPIRY_MINUTES:-5}
-      COTURN_URL: ${COTURN_URL:-turn:coturn:3478}
-      COTURN_USER: ${COTURN_USER:-username}
-      COTURN_PASSWORD: ${COTURN_PASSWORD:-password}
+      # 下发给浏览器的 ICE 配置：TURN_URLS 指向浏览器能访问到的 coturn 地址（局域网 IP / 公网 IP）
+      STUN_URLS: ${STUN_URLS:-stun:stun.qq.com:3478,stun:stun.miwifi.com:3478}
+      TURN_URLS: ${TURN_URLS:-}
+      TURN_STATIC_AUTH_SECRET: ${TURN_STATIC_AUTH_SECRET:-dev-turn-secret-change-in-production}
+      TURN_CREDENTIAL_TTL_SECONDS: ${TURN_CREDENTIAL_TTL_SECONDS:-3600}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080,http://localhost,http://127.0.0.1}
       SFU_ALLOW_UNAUTHENTICATED_DEV: ${SFU_ALLOW_UNAUTHENTICATED_DEV:-false}
       UPLOAD_DIR: /data/uploads
@@ -108,10 +127,19 @@ services:
       - "8080:8080"
     volumes:
       - uploads_data:/data/uploads
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 20s
     depends_on:
-      - postgres
-      - redis
-      - sfu-server
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      sfu-server:
+        condition: service_started
     networks:
       - conference-net
     restart: unless-stopped
@@ -134,9 +162,7 @@ services:
       SFU_JWT_SECRET: ${SFU_JWT_SECRET:-your-sfu-secret-key-change-in-production}
       SFU_CONTROL_TOKEN: ${SFU_CONTROL_TOKEN:-dev-sfu-control-token}
       SFU_CALLBACK_TOKEN: ${SFU_CALLBACK_TOKEN:-dev-sfu-callback-token}
-      COTURN_URL: ${COTURN_URL:-turn:coturn:3478}
-      COTURN_USER: ${COTURN_USER:-username}
-      COTURN_PASSWORD: ${COTURN_PASSWORD:-password}
+      STUN_URLS: ${STUN_URLS:-stun:stun.qq.com:3478,stun:stun.miwifi.com:3478}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000,http://localhost:8080,http://127.0.0.1:8080,http://localhost,http://127.0.0.1}
       SFU_ALLOW_UNAUTHENTICATED_DEV: ${SFU_ALLOW_UNAUTHENTICATED_DEV:-false}
       RATE_LIMIT_SFU_WS_PER_MINUTE: ${RATE_LIMIT_SFU_WS_PER_MINUTE:-20}
@@ -144,13 +170,25 @@ services:
       SFU_PUBLIC_WS_URL: ${SFU_PUBLIC_WS_URL:-ws://localhost:8081}
       SFU_RECORDING_DIR: ${SFU_RECORDING_DIR:-}
       METRICS_TOKEN: ${METRICS_TOKEN:-}
+      # 媒体 UDP 端口段：必须与下面 ports 发布的区间一致；容器外的浏览器才收得到媒体
+      WEBRTC_PORT_RANGE_MIN: ${WEBRTC_PORT_RANGE_MIN:-49152}
+      WEBRTC_PORT_RANGE_MAX: ${WEBRTC_PORT_RANGE_MAX:-49200}
+      # SFU 对外可达的 IP（局域网：宿主机 IP；云主机：弹性公网 IP），写进 ICE host 候选
+      SFU_PUBLIC_IP: ${SFU_PUBLIC_IP:-}
     ports:
       - "8081:8081"
+      - "${WEBRTC_PORT_RANGE_MIN:-49152}-${WEBRTC_PORT_RANGE_MAX:-49200}:${WEBRTC_PORT_RANGE_MIN:-49152}-${WEBRTC_PORT_RANGE_MAX:-49200}/udp"
     volumes:
       - sfu_recordings:/data/recordings
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
     depends_on:
-      - postgres
-      - redis
+      redis:
+        condition: service_healthy
     networks:
       - conference-net
     restart: unless-stopped
@@ -174,12 +212,12 @@ services:
     restart: unless-stopped
 
   nginx:
-    image: nginx:alpine
+    image: nginx:1.27-alpine
     container_name: conference-nginx
     ports:
       - "80:80"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
     depends_on:
       - frontend
       - api-server

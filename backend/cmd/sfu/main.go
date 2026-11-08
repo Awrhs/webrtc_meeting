@@ -54,6 +54,8 @@ func main() {
 		MessageRateLimit:        cfg.RateLimitSFUMsgPerMinute,
 		TokenReplayChecker:      replayChecker,
 		RecordingDir:            cfg.SFURecordingDir,
+		STUNURLs:                cfg.STUNURLs,
+		PublicIPs:               sfu.ResolvePublicIPs(cfg.SFUPublicIPs, log),
 	})
 
 	// 集群模式：向共享 Redis 心跳注册本实例（API 服务器据此做房间亲和路由）。

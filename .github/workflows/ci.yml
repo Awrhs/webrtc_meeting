@@ -168,6 +168,8 @@ jobs:
       SFU_CALLBACK_TOKEN: e2e-callback-token
       ALLOWED_ORIGINS: http://localhost:3000,http://127.0.0.1:3000
       SFU_PUBLIC_WS_URL: ws://localhost:8081
+      # runner 到公网 STUN 不稳定会让 SFU 每次入会白等 5 秒；浏览器与 SFU 同机，host 候选足够
+      STUN_URLS: none
       # 两个用户各注册+登录，默认 5 次/分钟的认证限流太紧
       RATE_LIMIT_AUTH_PER_MINUTE: "100"
       RATE_LIMIT_SFU_WS_PER_MINUTE: "100"

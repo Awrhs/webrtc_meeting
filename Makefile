@@ -5,7 +5,7 @@
 # 2) make e2e-backend 在前台启动 SFU + API（另开终端）
 # 3) make e2e-full    构建前端并用 Chromium 跑完整会议用例
 e2e-up:
-	docker compose -f deployment/docker-compose.yml up -d postgres redis
+	docker compose -f deployment/docker-compose.yml -f deployment/docker-compose.dev.yml up -d postgres redis
 	@echo "Postgres: localhost:5433  Redis: localhost:6379 — 现在运行 make e2e-backend"
 
 e2e-backend:

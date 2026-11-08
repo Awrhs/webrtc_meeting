@@ -263,6 +263,27 @@ describe('SFUConnection 入会与协商', () => {
   })
 })
 
+describe('SFUConnection ICE 配置', () => {
+  it('优先使用服务端下发的 ice_servers（含时限 TURN 凭据）', async () => {
+    const servers: RTCIceServer[] = [
+      { urls: ['stun:stun.example.com:3478'] },
+      { urls: ['turn:turn.example.com:3478?transport=udp'], username: '1700003600:42', credential: 'hmac' },
+    ]
+    const conn = new SFUConnection(7, 42, 'tok', vi.fn(), vi.fn(), vi.fn(), vi.fn(), null, undefined, servers)
+    await conn.connect(makeStream([new FakeTrack('audio')]))
+    const pc = FakeRTCPeerConnection.instances[FakeRTCPeerConnection.instances.length - 1]
+    expect((pc.config as RTCConfiguration).iceServers).toEqual(servers)
+  })
+
+  it('服务端未下发时回退到构建期配置的 STUN，不再默认 Google STUN', async () => {
+    const h = await connectHarness()
+    const iceServers = (h.pc().config as RTCConfiguration).iceServers ?? []
+    expect(iceServers).toHaveLength(1)
+    expect(String(iceServers[0].urls)).toMatch(/^stun:/)
+    expect(String(iceServers[0].urls)).not.toContain('google')
+  })
+})
+
 describe('SFUConnection 摄像头与屏幕共享隔离', () => {
   it('muteVideo 只关摄像头轨道，不影响屏幕共享轨道', async () => {
     const camera = new FakeTrack('video')

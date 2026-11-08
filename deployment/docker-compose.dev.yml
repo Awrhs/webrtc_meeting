@@ -1,0 +1,10 @@
+# 开发叠加：把 Postgres / Redis 端口暴露到宿主机（本地跑 go run、make e2e-up 需要）。
+# 公网机器上不要叠加此文件。
+#   docker compose -f deployment/docker-compose.yml -f deployment/docker-compose.dev.yml up -d postgres redis
+services:
+  postgres:
+    ports:
+      - "5433:5432"
+  redis:
+    ports:
+      - "6379:6379"

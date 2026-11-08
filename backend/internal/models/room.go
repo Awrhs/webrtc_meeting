@@ -32,13 +32,16 @@ const (
 	AuthTypeInviteCode AuthType = "invite_code"
 )
 
+// RoomMember 房间成员。
+// IsVideoOn 不能带 gorm default 标签：GORM 会把零值 false 从 INSERT 里省掉、落回列默认值，
+// 入会时写的 IsVideoOn=false 就变成了 true（所有成员一进房都"摄像头已开"）。
 type RoomMember struct {
 	ID        uint       `json:"id" gorm:"primaryKey"`
 	RoomID    uint       `json:"room_id"`
 	UserID    uint       `json:"user_id"`
 	Role      Role       `json:"role" gorm:"default:member"`
 	IsMuted   bool       `json:"is_muted" gorm:"default:false"`
-	IsVideoOn bool       `json:"is_video_on" gorm:"default:true"`
+	IsVideoOn bool       `json:"is_video_on"`
 	IsAudioOn bool       `json:"is_audio_on" gorm:"default:true"`
 	JoinedAt  time.Time  `json:"joined_at"`
 	LeftAt    *time.Time `json:"left_at"`

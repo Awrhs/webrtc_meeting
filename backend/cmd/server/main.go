@@ -106,16 +106,26 @@ func main() {
 	defer apiLimiter.Stop()
 	defer wsLimiter.Stop()
 
+	// X-Device-Id：前端每个请求携带的设备标识（登录会话绑定设备），不加入白名单会被 CORS 预检拒绝
 	r.Use(cors.New(cors.Config{
 		AllowOrigins:     cfg.AllowedOrigins,
 		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		// X-Device-Id：前端每个请求携带的设备标识（登录会话绑定设备），不加入白名单会被 CORS 预检拒绝
 		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization", "X-Device-Id"},
 		ExposeHeaders:    []string{"Content-Length"},
 		AllowCredentials: true,
 	}))
 
 	handler := handlers.NewHandler(userService, userRepo, roomService, chatService, hub, sfuRouter, cfg.SFUCallbackToken, cfg.SFUHTTPURL, cfg.UploadDir, int64(cfg.UploadMaxBytes), log)
+	// 浏览器 ICE 配置：STUN + TURN（有共享密钥时签发时限凭据；否则退回 COTURN_* 固定账号）
+	handler.SetICEConfig(handlers.ICEConfig{
+		STUNURLs:           cfg.STUNURLs,
+		TURNURLs:           cfg.TURNURLs,
+		TURNSecret:         cfg.TURNStaticAuthSecret,
+		TURNTTL:            time.Duration(cfg.TURNCredentialTTLSeconds) * time.Second,
+		LegacyTURNURL:      cfg.CoturnURL,
+		LegacyTURNUser:     cfg.CoturnUser,
+		LegacyTURNPassword: cfg.CoturnPassword,
+	})
 
 	api := r.Group("/api/v1")
 	{

@@ -81,6 +81,14 @@ type Peer struct {
 	// 协商/传输往往尚未就绪，立刻请求关键帧多半白白浪费一帧；改为在协商完成
 	// （重协商 answer 到达）或连接建立（初始协商）后统一发送。受 mu 保护。
 	pendingKeyframes []keyframeRequest
+
+	// videoInterest：该订阅者声明想看哪些发布者的摄像头视频（subscribe kind=video）。
+	// 摄像头轨道（带 RID）不自动广播，只推给声明过兴趣的订阅者；兴趣在发布者的
+	// 轨道尚不存在时也必须记住——浏览器点"开启摄像头"后 API 立刻广播 media_state，
+	// 其他人随即 subscribe，而发布者 addTrack → renegotiation → SFU OnTrack 要晚
+	// 几百毫秒到几秒。旧实现此时直接丢弃 subscribe，轨道到了也没人再订阅，远端永远黑屏。
+	// 受 mu 保护。
+	videoInterest map[uint]bool
 }
 
 // keyframeRequest 待发送的关键帧请求：向 publisher 的原始 SSRC 发 PLI。
@@ -256,22 +264,30 @@ type ServerOptions struct {
 	CallbackToken           string
 	MessageRateLimit        int
 	TokenReplayChecker      TokenReplayChecker
-	RecordingDir            string // SFU_RECORDING_DIR，非空启用录制
+	RecordingDir            string   // SFU_RECORDING_DIR，非空启用录制
+	STUNURLs                []string // SFU 自身 ICE gathering 用的 STUN（config 提供默认）；为空则只用 host 候选
+	PublicIPs               []string // NAT 1:1 公网/宿主机 IP：容器内只有私网地址时必须配置
 }
 
 func NewSFUServer(logger *zap.Logger, opts ServerOptions) *SFUServer {
-	// 国内访问 stun.l.google.com 经常超时，把 ICE gathering 拖到 8~15 秒，
-	// 拉长了 renegotiation 与 onTrack 的 race window。换成国内 STUN 后
-	// gathering 通常 < 1 秒。多个 server 互为备份，任一可达即可。
-	configuration := webrtc.Configuration{
-		ICEServers: []webrtc.ICEServer{
-			{URLs: []string{"stun:stun.qq.com:3478"}},
-			{URLs: []string{"stun:stun.miwifi.com:3478"}},
-			{URLs: []string{"stun:stun.syncthing.net:3478"}},
-		},
+	// STUN 列表由 config 决定（默认国内 STUN：访问 stun.l.google.com 经常超时，把 ICE
+	// gathering 拖到 8~15 秒；STUN_URLS=none 表示不配置——纯内网/无外网部署时 STUN 不可达
+	// 只会让每次入会白等 5 秒，host 候选（配合 SFU_PUBLIC_IP）已经够用）。
+	// 多个 server 互为备份，任一可达即可。
+	iceServers := make([]webrtc.ICEServer, 0, len(opts.STUNURLs))
+	for _, u := range opts.STUNURLs {
+		iceServers = append(iceServers, webrtc.ICEServer{URLs: []string{u}})
 	}
+	configuration := webrtc.Configuration{ICEServers: iceServers}
 
 	settingEngine := webrtc.SettingEngine{}
+
+	// 对外可达 IP：Docker/云主机里 SFU 只有私网地址，浏览器无法回连；
+	// 以 NAT 1:1 方式把公网/宿主机 IP 写进 host 候选，不必依赖 STUN 发现
+	if len(opts.PublicIPs) > 0 {
+		settingEngine.SetNAT1To1IPs(opts.PublicIPs, webrtc.ICECandidateTypeHost)
+		logger.Info("SFU public IPs configured for ICE host candidates", zap.Strings("ips", opts.PublicIPs))
+	}
 
 	// WebRTC 端口范围配置（可选）
 	if minPortStr := os.Getenv("WEBRTC_PORT_RANGE_MIN"); minPortStr != "" {
@@ -661,6 +677,11 @@ func (s *SFUServer) handlePeerEvent(peer *Peer, evt peerEvent) {
 			if alreadyAdded {
 				continue
 			}
+			// 摄像头 simulcast 同一条流只允许一层在发：另一层已在订阅中就跳过。
+			// 切层走 unsubscribe → subscribe 两个串行事件，不会被这里拦住。
+			if ti.Kind == "video" && ti.RID != "" && peer.hasSubscriptionFor(data.targetUserID, "video", ti.StreamID) {
+				continue
+			}
 
 			sender, err := peer.PC.AddTrack(ti.Track)
 			if err != nil {
@@ -924,6 +945,56 @@ func (p *Peer) hasSubscriptionFor(fromUserID uint, kind, streamID string) bool {
 		}
 	}
 	return false
+}
+
+// setVideoInterest 记录/清除订阅者对某发布者摄像头视频的订阅意图。
+func (p *Peer) setVideoInterest(publisherID uint, interested bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if !interested {
+		delete(p.videoInterest, publisherID)
+		return
+	}
+	if p.videoInterest == nil {
+		p.videoInterest = make(map[uint]bool)
+	}
+	p.videoInterest[publisherID] = true
+}
+
+// wantsVideoFrom 订阅者是否声明过想看该发布者的摄像头视频。
+func (p *Peer) wantsVideoFrom(publisherID uint) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.videoInterest[publisherID]
+}
+
+// subscribedCameraLayer 返回订阅者当前订阅的该摄像头流的层（RID）；未订阅返回 ""。
+func (p *Peer) subscribedCameraLayer(publisherID uint, streamID string) string {
+	prefix := fmt.Sprintf("%d|video-%s/", publisherID, streamID)
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for key := range p.addedTracks {
+		if strings.HasPrefix(key, prefix) {
+			return strings.TrimPrefix(key, prefix)
+		}
+	}
+	return ""
+}
+
+// cameraStream 返回发布者摄像头流（带 RID 的视频轨道）的 streamID，以及该流是否已有指定层。
+func (p *Peer) cameraStream(rid string) (streamID string, hasLayer bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for _, ti := range p.Tracks {
+		if ti.Kind != "video" || ti.RID == "" {
+			continue
+		}
+		streamID = ti.StreamID
+		if ti.RID == rid {
+			hasLayer = true
+		}
+	}
+	return streamID, hasLayer
 }
 
 // 这些函数封装了 event loop 的通信细节，外部调用只需关注业务逻辑
@@ -1423,12 +1494,14 @@ func (s *SFUServer) getRoom(roomID uint) *Room {
 // 规则：
 //   - 音频：自动订阅给所有人；
 //   - 视频（RID == ""，即屏幕共享或非 simulcast 浏览器的摄像头回退）：自动订阅；
-//   - 视频（RID != ""，即带 simulcast 层的摄像头）：不自动订阅，由前端按需 subscribe。
+//   - 视频（RID != ""，即带 simulcast 层的摄像头）：不广播，只推给声明过兴趣
+//     （subscribe kind=video）的订阅者——兴趣可能早于轨道到达，见 Peer.videoInterest。
 //
 // 【注意】浏览器 SDP 中的 msid/StreamID 是浏览器生成的 GUID，不能与 "camera"/"screen"
 // 字面量比较；摄像头与屏幕共享的区分依赖 RID（前端摄像头默认两层 simulcast，屏幕共享单层）。
 func (s *SFUServer) autoSubscribeTrack(room *Room, publisher *Peer, trackInfo *TrackInfo) {
 	if trackInfo.Kind == "video" && trackInfo.RID != "" {
+		s.pushCameraLayerToInterested(room, publisher, trackInfo)
 		return
 	}
 
@@ -1454,6 +1527,88 @@ func (s *SFUServer) autoSubscribeTrack(room *Room, publisher *Peer, trackInfo *T
 	}
 }
 
+// pushCameraLayerToInterested 把发布者新到的摄像头层推给已声明兴趣的订阅者。
+// 本函数在发布者的事件循环里运行，对订阅者只能异步操作：SubscribeTracksWait 会等
+// 订阅者的事件循环，而订阅者的事件循环此刻可能正等着发布者的（双方同时开摄像头），
+// 互等即死锁，所以每个订阅者的处理放到独立 goroutine。
+func (s *SFUServer) pushCameraLayerToInterested(room *Room, publisher *Peer, trackInfo *TrackInfo) {
+	room.mu.Lock()
+	subscribers := make([]*Peer, 0, len(room.Peers))
+	for _, p := range room.Peers {
+		if p.UserID != publisher.UserID && p.wantsVideoFrom(publisher.UserID) {
+			subscribers = append(subscribers, p)
+		}
+	}
+	room.mu.Unlock()
+
+	for _, subscriber := range subscribers {
+		go s.subscribeCameraLayer(subscriber, publisher, trackInfo)
+	}
+}
+
+// subscribeCameraLayer 让订阅者订阅发布者的摄像头流（按 QoS 期望层选层），
+// 并在先到的层不是期望层时（low 先到被暂用，high 随后才到）切到期望层。
+func (s *SFUServer) subscribeCameraLayer(subscriber, publisher *Peer, trackInfo *TrackInfo) {
+	if !subscriber.hasSubscriptionFor(publisher.UserID, "video", trackInfo.StreamID) {
+		quality := s.qos.Current(subscriber.UserID, publisher.UserID)
+		selected := s.selectTracksForQuality(publisher, "video", trackInfo.StreamID, quality)
+		if len(selected) == 0 {
+			return
+		}
+		added, err := s.SubscribeTracksWait(subscriber, publisher.UserID, "video", trackInfo.StreamID, selected)
+		if err != nil {
+			s.logger.Warn("Failed to push camera track to interested subscriber",
+				zap.Uint("subscriber", subscriber.UserID),
+				zap.Uint("publisher", publisher.UserID),
+				zap.Error(err))
+			return
+		}
+		s.sendSSRCMapping(subscriber, publisher.UserID, added)
+		if len(added) > 0 {
+			s.logger.Info("Camera track pushed to interested subscriber",
+				zap.Uint("subscriber", subscriber.UserID),
+				zap.Uint("publisher", publisher.UserID),
+				zap.String("trackKey", added[0].Key()))
+		}
+	}
+	s.ensureDesiredCameraLayer(subscriber, publisher)
+}
+
+// ensureDesiredCameraLayer 订阅者正在收发布者摄像头的非期望层、而期望层已经存在时切层。
+// 覆盖两种情形：simulcast 两层先后到达时先到的层被暂用；用户手动选层（subscribe 带 quality）。
+func (s *SFUServer) ensureDesiredCameraLayer(subscriber, publisher *Peer) {
+	quality := s.qos.Current(subscriber.UserID, publisher.UserID)
+	streamID, hasDesired := publisher.cameraStream(quality)
+	if streamID == "" || !hasDesired {
+		return
+	}
+	current := subscriber.subscribedCameraLayer(publisher.UserID, streamID)
+	if current == "" || current == quality {
+		return
+	}
+	s.applyQualitySwitch(subscriber, publisher.UserID)
+}
+
+// sendSSRCMapping 把新增订阅轨道的 SSRC/流映射发给订阅者，让前端能把远端流归属到正确的用户。
+// 注意要带上 StreamID/RID：Pion 转发时会重写 SSRC（每个订阅者一个新随机 SSRC），
+// 前端可靠的归属依据是 SDP msid（StreamID），SFU 原样保留了发布者的 msid。
+func (s *SFUServer) sendSSRCMapping(subscriber *Peer, publisherID uint, tracks []*TrackInfo) {
+	if len(tracks) == 0 {
+		return
+	}
+	ssrcs := make([]SSRC, 0, len(tracks))
+	for _, ti := range tracks {
+		ssrcs = append(ssrcs, SSRC{
+			SSRC:     ti.SSRC,
+			UserID:   publisherID,
+			Kind:     ti.Kind,
+			StreamID: ti.StreamID,
+			RID:      ti.RID,
+		})
+	}
+	s.sendToPeer(subscriber, SignalingMessage{Type: "ssrc_mapping", SSRCs: ssrcs})
+}
+
 // handleSubscribe 处理前端发来的选择性订阅请求。
 // Quality："high"/"low" 固定该层；"auto"（或空）交给 QoS 自适应。
 func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessage) {
@@ -1462,24 +1617,35 @@ func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessag
 		return
 	}
 
-	room.mu.Lock()
-	publisher := room.Peers[msg.TargetUserID]
-	room.mu.Unlock()
-	if publisher == nil {
-		s.logger.Debug("Subscribe target not found",
-			zap.Uint("subscriber", peer.UserID),
-			zap.Uint("target", msg.TargetUserID))
-		return
+	// 先记兴趣再找轨道：发布者的摄像头轨道可能还没到（甚至发布者正在重连），
+	// 轨道到达时由 autoSubscribeTrack → pushCameraLayerToInterested 补上订阅
+	if msg.Kind == "video" {
+		peer.setVideoInterest(msg.TargetUserID, true)
 	}
 
 	// 显式选层时更新 QoS 固定状态（"auto" 解除固定，交回自动切层）
 	if msg.Quality != "" {
 		s.qos.Pin(peer.UserID, msg.TargetUserID, msg.Quality)
 	}
+
+	room.mu.Lock()
+	publisher := room.Peers[msg.TargetUserID]
+	room.mu.Unlock()
+	if publisher == nil {
+		s.logger.Debug("Subscribe target not in room yet; interest recorded",
+			zap.Uint("subscriber", peer.UserID),
+			zap.Uint("target", msg.TargetUserID))
+		return
+	}
+
 	desiredQuality := s.qos.Current(peer.UserID, msg.TargetUserID)
 
 	selectedTracks := s.selectTracksForQuality(publisher, msg.Kind, msg.StreamID, desiredQuality)
 	if len(selectedTracks) == 0 {
+		s.logger.Debug("Subscribe deferred: publisher has no matching tracks yet",
+			zap.Uint("subscriber", peer.UserID),
+			zap.Uint("target", msg.TargetUserID),
+			zap.String("kind", msg.Kind))
 		return
 	}
 
@@ -1489,25 +1655,11 @@ func (s *SFUServer) handleSubscribe(room *Room, peer *Peer, msg *SignalingMessag
 		s.sendToPeer(peer, SignalingMessage{Type: "error", Error: err.Error()})
 		return
 	}
+	s.sendSSRCMapping(peer, msg.TargetUserID, addedTracks)
 
-	// 发送新增轨道的 SSRC/流映射给前端（让其能把 RTP 包/流归属到正确的用户）。
-	// 注意要带上 StreamID/RID：Pion 转发时会重写 SSRC（每个订阅者一个新随机 SSRC），
-	// 前端可靠的归属依据是 SDP msid（StreamID），SFU 原样保留了发布者的 msid。
-	if len(addedTracks) > 0 {
-		ssrcs := make([]SSRC, 0, len(addedTracks))
-		for _, ti := range addedTracks {
-			ssrcs = append(ssrcs, SSRC{
-				SSRC:     ti.SSRC,
-				UserID:   msg.TargetUserID,
-				Kind:     ti.Kind,
-				StreamID: ti.StreamID,
-				RID:      ti.RID,
-			})
-		}
-		s.sendToPeer(peer, SignalingMessage{
-			Type:  "ssrc_mapping",
-			SSRCs: ssrcs,
-		})
+	// 已订阅的是另一层（例如手动从 high 切到 low）：切层而不是叠加第二层
+	if msg.Kind == "video" {
+		s.ensureDesiredCameraLayer(peer, publisher)
 	}
 }
 
@@ -1612,19 +1764,7 @@ func (s *SFUServer) applyQualitySwitch(subscriber *Peer, publisherID uint) {
 		s.logger.Warn("QoS switch: subscribe failed", zap.Error(err))
 		return
 	}
-	if len(addedTracks) > 0 {
-		ssrcs := make([]SSRC, 0, len(addedTracks))
-		for _, ti := range addedTracks {
-			ssrcs = append(ssrcs, SSRC{
-				SSRC:     ti.SSRC,
-				UserID:   publisherID,
-				Kind:     ti.Kind,
-				StreamID: ti.StreamID,
-				RID:      ti.RID,
-			})
-		}
-		s.sendToPeer(subscriber, SignalingMessage{Type: "ssrc_mapping", SSRCs: ssrcs})
-	}
+	s.sendSSRCMapping(subscriber, publisherID, addedTracks)
 	s.logger.Info("QoS: switched simulcast layer",
 		zap.Uint("subscriber", subscriber.UserID),
 		zap.Uint("publisher", publisherID),
@@ -1635,6 +1775,11 @@ func (s *SFUServer) handleUnsubscribe(room *Room, peer *Peer, msg *SignalingMess
 	if msg.TargetUserID == 0 || msg.Kind == "" {
 		s.sendToPeer(peer, SignalingMessage{Type: "error", Error: "unsubscribe requires target_user_id and kind"})
 		return
+	}
+
+	// 退订摄像头即撤回兴趣：发布者之后再开摄像头也不再主动推给本订阅者
+	if msg.Kind == "video" {
+		peer.setVideoInterest(msg.TargetUserID, false)
 	}
 
 	// 通过统一事件循环串行执行取消订阅
@@ -1999,6 +2144,7 @@ func (s *SFUServer) handleJoin(conn *websocket.Conn, msg *SignalingMessage) (*Pe
 		Tracks:        make(map[string]*TrackInfo),
 		Subscriptions: make(map[uint][]*webrtc.RTPSender),
 		addedTracks:   make(map[string]bool),
+		videoInterest: make(map[uint]bool),
 		renegoCh:      make(chan struct{}, 1),
 		sendCh:        make(chan SignalingMessage, 64),
 		eventCh:       make(chan peerEvent, 32), // buffer=32，统一状态变更事件队列

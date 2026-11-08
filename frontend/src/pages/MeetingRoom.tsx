@@ -256,6 +256,7 @@ export default function MeetingRoom() {
       currentUserId,
       joinResult.sfu_token,
       joinResult.sfu_url,
+      joinResult.ice_servers,
     )
   }
 

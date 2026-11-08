@@ -313,10 +313,15 @@ func (s *roomService) admitMember(room *models.Room, userID uint) error {
 			return err
 		}
 	} else {
-		// 用户曾经加入过：复用同一条记录（唯一索引要求一人一行）
+		// 用户曾经加入过：复用同一条记录（唯一索引要求一人一行）。
+		// 媒体状态回到客户端的初始状态（摄像头关、麦克风开），否则上次离开前
+		// 开着的摄像头会让别人看到一块"等待视频流"的空位；IsMuted 是管理员
+		// 的强制静音，离开再进不能绕开，保持不变。
 		now := time.Now()
 		existing.LeftAt = nil
 		existing.JoinedAt = now
+		existing.IsVideoOn = false
+		existing.IsAudioOn = true
 		if err := tx.UpdateMember(existing); err != nil {
 			tx.Rollback()
 			return err

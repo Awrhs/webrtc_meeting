@@ -4,6 +4,7 @@ import (
 	"conference-sfu/backend/internal/models"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"go.uber.org/zap"
@@ -108,13 +109,16 @@ func (h *Handler) JoinRoom(c *gin.Context) {
 	h.hub.BroadcastUserJoined(result.Room.ID, userID)
 
 	sfuURL, _ := h.roomService.PickSFUEndpoint(result.Room.ID)
+	iceServers, iceTTL := h.iceServersFor(userID, time.Now())
 
 	c.JSON(http.StatusOK, gin.H{
-		"room":           result.Room,
-		"members":        result.Members,
-		"my_permissions": result.Permissions,
-		"sfu_token":      result.SFUToken,
-		"sfu_url":        sfuURL,
+		"room":            result.Room,
+		"members":         result.Members,
+		"my_permissions":  result.Permissions,
+		"sfu_token":       result.SFUToken,
+		"sfu_url":         sfuURL,
+		"ice_servers":     iceServers,
+		"ice_ttl_seconds": iceTTL,
 	})
 }
 
@@ -134,8 +138,14 @@ func (h *Handler) GetSFUToken(c *gin.Context) {
 	}
 
 	sfuURL, _ := h.roomService.PickSFUEndpoint(uint(roomID))
+	iceServers, iceTTL := h.iceServersFor(userID, time.Now())
 
-	c.JSON(http.StatusOK, gin.H{"sfu_token": token, "sfu_url": sfuURL})
+	c.JSON(http.StatusOK, gin.H{
+		"sfu_token":       token,
+		"sfu_url":         sfuURL,
+		"ice_servers":     iceServers,
+		"ice_ttl_seconds": iceTTL,
+	})
 }
 
 func (h *Handler) DeleteRoom(c *gin.Context) {

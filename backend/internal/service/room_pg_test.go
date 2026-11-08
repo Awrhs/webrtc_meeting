@@ -269,3 +269,47 @@ func TestLeaveRoom_UpdatesCountWithoutClobberingLockState(t *testing.T) {
 		t.Fatal("LeaveRoom must not reset is_locked (whole-row Save regression)")
 	}
 }
+
+// 入会时摄像头必须是关闭状态（GORM default 标签回归：零值 false 曾被省略成列默认值 TRUE），
+// 离开再进也要回到初始媒体状态，而管理员的强制静音不能靠离开再进绕开。
+func TestJoinRoom_MediaStateStartsWithCameraOff(t *testing.T) {
+	e := newPGEnv(t)
+	owner := e.user(t, "owner")
+	guest := e.user(t, "guest")
+	room := e.room(t, owner, 10, models.AuthTypeNone, "")
+	if _, err := e.rooms.JoinRoom(guest.ID, roomKey(room), ""); err != nil {
+		t.Fatal(err)
+	}
+	member, err := e.roomRepo.GetMember(room.ID, guest.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.IsVideoOn || !member.IsAudioOn {
+		t.Fatalf("fresh member media state video=%v audio=%v, want video off / audio on", member.IsVideoOn, member.IsAudioOn)
+	}
+
+	// 开摄像头、被管理员静音，然后离开再进
+	videoOn := true
+	if _, _, err := e.rooms.UpdateMediaState(room.ID, guest.ID, &videoOn, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.rooms.MuteMember(room.ID, owner.ID, guest.ID, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.rooms.LeaveRoom(room.ID, guest.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.rooms.JoinRoom(guest.ID, roomKey(room), ""); err != nil {
+		t.Fatal(err)
+	}
+	member, err = e.roomRepo.GetMember(room.ID, guest.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if member.IsVideoOn {
+		t.Fatal("rejoin must reset is_video_on to false (client starts with the camera off)")
+	}
+	if !member.IsMuted {
+		t.Fatal("rejoin must not clear an admin mute")
+	}
+}
