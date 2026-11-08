@@ -1,9 +1,11 @@
 package main
 
 import (
+	"conference-sfu/backend/internal/auth"
 	"conference-sfu/backend/internal/config"
 	migrations "conference-sfu/backend/internal/db"
 	"conference-sfu/backend/internal/handlers"
+	"conference-sfu/backend/internal/mail"
 	"conference-sfu/backend/internal/middleware"
 	"conference-sfu/backend/internal/repository"
 	"conference-sfu/backend/internal/service"
@@ -44,7 +46,29 @@ func main() {
 	roomRepo := repository.NewRoomRepository(db)
 	chatRepo := repository.NewChatRepository(db)
 
-	userService := service.NewUserService(userRepo, redisClient, cfg.JWTSecret, log)
+	// 邮件发送器：局域网/开发默认 log（验证码打到服务端日志），生产配置 SMTP
+	var mailer mail.Mailer
+	if cfg.MailProvider == "smtp" {
+		mailer = &mail.SMTPMailer{
+			Host:     cfg.SMTPHost,
+			Port:     cfg.SMTPPort,
+			Username: cfg.SMTPUsername,
+			Password: cfg.SMTPPassword,
+			From:     cfg.SMTPFrom,
+			TLSMode:  cfg.SMTPTLSMode,
+		}
+	} else {
+		mailer = &mail.LogMailer{Logger: log}
+	}
+	userService := service.NewUserService(userRepo, redisClient, service.UserServiceConfig{
+		JWTSecret:                cfg.JWTSecret,
+		JWTExpiry:                time.Duration(cfg.JWTExpiryHours) * time.Hour,
+		Mailer:                   mailer,
+		RequireEmailVerification: cfg.RequireEmailVerification,
+		AppName:                  cfg.AppName,
+	}, log)
+	// 登录 token 校验：签名 → Redis 会话仍有效 → token 版本未被改密码作废
+	tokenValidator := &auth.Validator{Secret: cfg.JWTSecret, Sessions: redisClient, Versions: userService}
 	roomService := service.NewRoomService(roomRepo, userRepo, redisClient, cfg.SFUJWTSecret, cfg.SFUTokenExpiryMinutes, log)
 	chatService := service.NewChatService(chatRepo, roomRepo)
 
@@ -84,51 +108,56 @@ func main() {
 	{
 		api.POST("/auth/register", authLimiter.Gin(), handler.Register)
 		api.POST("/auth/login", authLimiter.Gin(), handler.Login)
+		api.POST("/auth/password/forgot", authLimiter.Gin(), handler.ForgotPassword)
+		api.POST("/auth/password/reset", authLimiter.Gin(), handler.ResetPassword)
+		api.POST("/auth/email/verify", authLimiter.Gin(), handler.VerifyEmail)
+		api.POST("/auth/email/resend", authLimiter.Gin(), handler.ResendVerification)
 
-		auth := api.Group("/")
-		auth.Use(apiLimiter.Gin(), handlers.AuthMiddleware(cfg.JWTSecret))
+		authed := api.Group("/")
+		authed.Use(apiLimiter.Gin(), handlers.AuthMiddleware(tokenValidator))
 		{
-			auth.GET("/user/me", handler.GetMe)
-			auth.PUT("/user/profile", handler.UpdateProfile)
-			auth.PUT("/user/password", handler.UpdatePassword)
-			auth.GET("/user/devices", handler.GetMyDevices)
-			auth.DELETE("/user/devices/:id", handler.DeleteMyDevice)
+			authed.POST("/auth/logout", handler.Logout)
+			authed.GET("/user/me", handler.GetMe)
+			authed.PUT("/user/profile", handler.UpdateProfile)
+			authed.PUT("/user/password", handler.UpdatePassword)
+			authed.GET("/user/devices", handler.GetMyDevices)
+			authed.DELETE("/user/devices/:id", handler.DeleteMyDevice)
 
-			auth.POST("/rooms", handler.CreateRoom)
-			auth.GET("/rooms", handler.GetMyRooms)
-			auth.GET("/rooms/:id", handler.GetRoom)
-			auth.GET("/rooms/number/:number", handler.GetRoomByNumber)
-			auth.POST("/rooms/:id/join", handler.JoinRoom)
-			auth.POST("/rooms/:id/sfu-token", handler.GetSFUToken)
-			auth.DELETE("/rooms/:id", handler.DeleteRoom)
-			auth.POST("/rooms/:id/lock", handler.LockRoom)
-			auth.POST("/rooms/:id/unlock", handler.UnlockRoom)
+			authed.POST("/rooms", handler.CreateRoom)
+			authed.GET("/rooms", handler.GetMyRooms)
+			authed.GET("/rooms/:id", handler.GetRoom)
+			authed.GET("/rooms/number/:number", handler.GetRoomByNumber)
+			authed.POST("/rooms/:id/join", handler.JoinRoom)
+			authed.POST("/rooms/:id/sfu-token", handler.GetSFUToken)
+			authed.DELETE("/rooms/:id", handler.DeleteRoom)
+			authed.POST("/rooms/:id/lock", handler.LockRoom)
+			authed.POST("/rooms/:id/unlock", handler.UnlockRoom)
 
-			auth.POST("/rooms/:id/members/:userId/kick", handler.KickMember)
-			auth.POST("/rooms/:id/members/:userId/mute", handler.MuteMember)
-			auth.POST("/rooms/:id/members/:userId/unmute", handler.UnmuteMember)
-			auth.POST("/rooms/:id/members/:userId/admin", handler.SetAdmin)
-			auth.DELETE("/rooms/:id/members/:userId/admin", handler.RemoveAdmin)
-			auth.POST("/rooms/:id/members/:userId/transfer", handler.TransferOwner)
+			authed.POST("/rooms/:id/members/:userId/kick", handler.KickMember)
+			authed.POST("/rooms/:id/members/:userId/mute", handler.MuteMember)
+			authed.POST("/rooms/:id/members/:userId/unmute", handler.UnmuteMember)
+			authed.POST("/rooms/:id/members/:userId/admin", handler.SetAdmin)
+			authed.DELETE("/rooms/:id/members/:userId/admin", handler.RemoveAdmin)
+			authed.POST("/rooms/:id/members/:userId/transfer", handler.TransferOwner)
 
-			auth.GET("/rooms/:id/messages", handler.GetMessages)
-			auth.POST("/rooms/:id/messages", handler.SendMessage)
-			auth.GET("/rooms/:id/messages/private/:userId", handler.GetPrivateMessages)
-			auth.POST("/rooms/:id/upload", handler.UploadFile)
-			auth.GET("/rooms/:id/uploads/:name", handler.GetUploadedFile)
+			authed.GET("/rooms/:id/messages", handler.GetMessages)
+			authed.POST("/rooms/:id/messages", handler.SendMessage)
+			authed.GET("/rooms/:id/messages/private/:userId", handler.GetPrivateMessages)
+			authed.POST("/rooms/:id/upload", handler.UploadFile)
+			authed.GET("/rooms/:id/uploads/:name", handler.GetUploadedFile)
 
-			auth.GET("/rooms/:id/audit-logs", handler.GetAuditLogs)
+			authed.GET("/rooms/:id/audit-logs", handler.GetAuditLogs)
 
-			auth.PUT("/rooms/:id/media-state", handler.UpdateMediaState)
+			authed.PUT("/rooms/:id/media-state", handler.UpdateMediaState)
 
 			// 离开会议与实时在线状态
-			auth.POST("/rooms/:id/leave", handler.LeaveRoom)
-			auth.GET("/rooms/:id/presence", handler.GetPresence)
+			authed.POST("/rooms/:id/leave", handler.LeaveRoom)
+			authed.GET("/rooms/:id/presence", handler.GetPresence)
 
 			// E2EE 端到端加密密钥交换
-			auth.POST("/e2ee/public-key", handler.UploadPublicKey)
-			auth.GET("/e2ee/public-key/:user_id", handler.GetPublicKey)
-			auth.DELETE("/e2ee/public-key", handler.DeletePublicKey)
+			authed.POST("/e2ee/public-key", handler.UploadPublicKey)
+			authed.GET("/e2ee/public-key/:user_id", handler.GetPublicKey)
+			authed.DELETE("/e2ee/public-key", handler.DeletePublicKey)
 		}
 		// Callback for SFU to notify peer connection failed
 		api.POST("/sfu/callback/:roomId/:userId/connection-failed", handler.NotifyConnectionFailed)
@@ -140,7 +169,7 @@ func main() {
 
 	// 兼容旧消息里的 /uploads/<name> 链接（按房间分目录之前上传的文件）：仅登录可访问。
 	// 新上传文件走 /api/v1/rooms/:id/uploads/:name，额外校验房间成员身份。
-	r.GET("/uploads/:name", handlers.AuthMiddleware(cfg.JWTSecret), func(c *gin.Context) {
+	r.GET("/uploads/:name", handlers.AuthMiddleware(tokenValidator), func(c *gin.Context) {
 		name := c.Param("name")
 		if !handlers.IsSafeUploadName(name) {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid file name"})
@@ -171,13 +200,13 @@ func main() {
 			return
 		}
 
-		userID, err := handlers.ValidateToken(token, cfg.JWTSecret)
+		claims, err := tokenValidator.Validate(token)
 		if err != nil {
 			c.Writer.WriteHeader(401)
 			return
 		}
 
-		signaling.HandleWebSocket(hub, c.Writer, c.Request, userID, log)
+		signaling.HandleWebSocket(hub, c.Writer, c.Request, claims.UserID, log)
 	})
 
 	server := &http.Server{

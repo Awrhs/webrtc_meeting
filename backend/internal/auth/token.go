@@ -18,12 +18,58 @@ type SFUClaims struct {
 	ExpiresAt time.Time
 }
 
+// UserClaims 登录 token（会话版）的声明。
+type UserClaims struct {
+	UserID    uint
+	Version   int    // 用户的 token_version：改密码后递增，旧 token 全部失效
+	JTI       string // 会话 ID：登出 / 踢设备时按它吊销
+	DeviceID  string // 登录设备指纹
+	ExpiresAt time.Time
+}
+
+// GenerateUserToken 生成不带会话信息的旧式 token（仅供兼容/测试）。
+// 生产登录请使用 GenerateSessionToken：没有 jti 的 token 会被 Validator 拒绝。
 func GenerateUserToken(userID uint, secret string, expiresIn time.Duration) (string, error) {
 	claims := jwt.MapClaims{
 		"user_id": float64(userID),
 		"exp":     time.Now().Add(expiresIn).Unix(),
 	}
 	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+}
+
+// GenerateSessionToken 生成绑定会话（jti）、token 版本与设备的登录 token。
+func GenerateSessionToken(userID uint, version int, jti, deviceID, secret string, expiresIn time.Duration) (string, error) {
+	claims := jwt.MapClaims{
+		"user_id": float64(userID),
+		"ver":     float64(version),
+		"jti":     jti,
+		"dev":     deviceID,
+		"exp":     time.Now().Add(expiresIn).Unix(),
+	}
+	return jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString([]byte(secret))
+}
+
+// ParseUserClaims 校验签名与过期时间并解析登录 token 的声明（不检查会话是否仍有效）。
+func ParseUserClaims(tokenStr, secret string) (*UserClaims, error) {
+	claims, err := parseMapClaims(tokenStr, secret)
+	if err != nil {
+		return nil, err
+	}
+	userID, ok := numberClaim(claims, "user_id")
+	if !ok {
+		return nil, errors.New("invalid token claims")
+	}
+	version, _ := numberClaim(claims, "ver")
+	jti, _ := claims["jti"].(string)
+	deviceID, _ := claims["dev"].(string)
+	exp, _ := numberClaim(claims, "exp")
+	return &UserClaims{
+		UserID:    uint(userID),
+		Version:   int(version),
+		JTI:       jti,
+		DeviceID:  deviceID,
+		ExpiresAt: time.Unix(int64(exp), 0),
+	}, nil
 }
 
 func GenerateSFUJoinToken(userID, roomID uint, secret string, expiresIn time.Duration) (string, error) {

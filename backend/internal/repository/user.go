@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	"github.com/go-redis/redis/v8"
@@ -21,9 +22,13 @@ type UserRepository interface {
 	FindByPhone(phone string) (*models.User, error)
 	FindByUsername(username string) (*models.User, error)
 	Update(user *models.User) error
+	// SetPassword 只更新密码与 token_version 两列（整行 Save 会覆盖并发的资料修改）
+	SetPassword(userID uint, hashedPassword string, tokenVersion int) error
+	SetEmailVerified(userID uint) error
 	CreateDevice(device *models.Device) error
 	UpsertDevice(device *models.Device) error
 	GetDevicesByUserID(userID uint) ([]*models.Device, error)
+	GetDeviceByID(deviceID uint, userID uint) (*models.Device, error)
 	DeleteDevice(deviceID uint, userID uint) error
 }
 
@@ -86,6 +91,26 @@ func (r *userRepository) FindByUsername(username string) (*models.User, error) {
 
 func (r *userRepository) Update(user *models.User) error {
 	return r.db.Save(user).Error
+}
+
+func (r *userRepository) SetPassword(userID uint, hashedPassword string, tokenVersion int) error {
+	return r.db.Model(&models.User{}).Where("id = ?", userID).Updates(map[string]interface{}{
+		"password":      hashedPassword,
+		"token_version": tokenVersion,
+	}).Error
+}
+
+func (r *userRepository) SetEmailVerified(userID uint) error {
+	return r.db.Model(&models.User{}).Where("id = ?", userID).Update("email_verified", true).Error
+}
+
+func (r *userRepository) GetDeviceByID(deviceID uint, userID uint) (*models.Device, error) {
+	var device models.Device
+	err := r.db.Where("id = ? AND user_id = ?", deviceID, userID).First(&device).Error
+	if err != nil {
+		return nil, err
+	}
+	return &device, nil
 }
 
 func (r *userRepository) CreateDevice(device *models.Device) error {
@@ -156,6 +181,166 @@ func (r *RedisClient) MarkTokenUsed(jti string, ttl time.Duration) (bool, error)
 	ctx := context.Background()
 	ok, err := r.client.SetNX(ctx, "sfu_jti:"+jti, "1", ttl).Result()
 	return ok, err
+}
+
+// ==================== 登录会话（jti）、token 版本缓存、验证码 ====================
+
+const (
+	sessionKeyPrefix      = "session:"       // session:<jti> → "<userID>|<deviceID>"
+	userSessionsKeyPrefix = "user:sessions:" // user:sessions:<userID> → set of jti
+	tokenVersionKeyPrefix = "user:tokenver:" // user:tokenver:<userID> → int（数据库值的短期缓存）
+	codeKeyPrefix         = "code:"          // code:<kind>:<userID> → sha256(code)
+	codeAttemptsKeyPrefix = "code_attempts:" // code_attempts:<kind>:<userID> → 尝试次数
+)
+
+func userSessionsKey(userID uint) string { return userSessionsKeyPrefix + strconv.Itoa(int(userID)) }
+
+// CreateSession 记录一个登录会话；会话随 token 一起过期。
+func (r *RedisClient) CreateSession(jti string, userID uint, deviceID string, ttl time.Duration) error {
+	ctx := context.Background()
+	pipe := r.client.TxPipeline()
+	pipe.Set(ctx, sessionKeyPrefix+jti, fmt.Sprintf("%d|%s", userID, deviceID), ttl)
+	pipe.SAdd(ctx, userSessionsKey(userID), jti)
+	// 集合的过期时间随最新会话刷新：集合里可能残留已过期的 jti，读取时会被过滤
+	pipe.Expire(ctx, userSessionsKey(userID), ttl)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// SessionUserID 实现 auth.SessionStore：会话存在则返回所属用户。
+func (r *RedisClient) SessionUserID(jti string) (uint, bool, error) {
+	ctx := context.Background()
+	val, err := r.client.Get(ctx, sessionKeyPrefix+jti).Result()
+	if err == redis.Nil {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	userID, _ := parseSessionValue(val)
+	return userID, true, nil
+}
+
+// RevokeSession 吊销单个会话（登出）。
+func (r *RedisClient) RevokeSession(userID uint, jti string) error {
+	ctx := context.Background()
+	pipe := r.client.TxPipeline()
+	pipe.Del(ctx, sessionKeyPrefix+jti)
+	pipe.SRem(ctx, userSessionsKey(userID), jti)
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// RevokeAllSessions 吊销用户的全部会话（改密码/重置密码）。
+func (r *RedisClient) RevokeAllSessions(userID uint) error {
+	ctx := context.Background()
+	jtis, err := r.client.SMembers(ctx, userSessionsKey(userID)).Result()
+	if err != nil {
+		return err
+	}
+	pipe := r.client.TxPipeline()
+	for _, jti := range jtis {
+		pipe.Del(ctx, sessionKeyPrefix+jti)
+	}
+	pipe.Del(ctx, userSessionsKey(userID))
+	_, err = pipe.Exec(ctx)
+	return err
+}
+
+// RevokeDeviceSessions 吊销某设备上的全部会话（用户删除登录设备），返回吊销数量。
+func (r *RedisClient) RevokeDeviceSessions(userID uint, deviceID string) (int, error) {
+	ctx := context.Background()
+	jtis, err := r.client.SMembers(ctx, userSessionsKey(userID)).Result()
+	if err != nil {
+		return 0, err
+	}
+	revoked := 0
+	for _, jti := range jtis {
+		val, err := r.client.Get(ctx, sessionKeyPrefix+jti).Result()
+		if err != nil {
+			continue
+		}
+		if _, dev := parseSessionValue(val); dev == deviceID {
+			if err := r.RevokeSession(userID, jti); err == nil {
+				revoked++
+			}
+		}
+	}
+	return revoked, nil
+}
+
+func parseSessionValue(val string) (uint, string) {
+	idStr, device, _ := strings.Cut(val, "|")
+	id, _ := strconv.Atoi(idStr)
+	return uint(id), device
+}
+
+// GetTokenVersion 读取 token_version 缓存。
+func (r *RedisClient) GetTokenVersion(userID uint) (int, bool, error) {
+	ctx := context.Background()
+	val, err := r.client.Get(ctx, tokenVersionKeyPrefix+strconv.Itoa(int(userID))).Result()
+	if err == redis.Nil {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	v, err := strconv.Atoi(val)
+	if err != nil {
+		return 0, false, nil
+	}
+	return v, true, nil
+}
+
+// SetTokenVersion 写入 token_version 缓存。
+func (r *RedisClient) SetTokenVersion(userID uint, version int, ttl time.Duration) error {
+	ctx := context.Background()
+	return r.client.Set(ctx, tokenVersionKeyPrefix+strconv.Itoa(int(userID)), strconv.Itoa(version), ttl).Err()
+}
+
+func codeKey(kind string, userID uint) string {
+	return codeKeyPrefix + kind + ":" + strconv.Itoa(int(userID))
+}
+
+// StoreCode 保存验证码哈希（覆盖旧码并清零尝试次数）。
+func (r *RedisClient) StoreCode(kind string, userID uint, codeHash string, ttl time.Duration) error {
+	ctx := context.Background()
+	pipe := r.client.TxPipeline()
+	pipe.Set(ctx, codeKey(kind, userID), codeHash, ttl)
+	pipe.Del(ctx, codeAttemptsKeyPrefix+kind+":"+strconv.Itoa(int(userID)))
+	_, err := pipe.Exec(ctx)
+	return err
+}
+
+// GetCode 读取验证码哈希。
+func (r *RedisClient) GetCode(kind string, userID uint) (string, bool, error) {
+	ctx := context.Background()
+	val, err := r.client.Get(ctx, codeKey(kind, userID)).Result()
+	if err == redis.Nil {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return val, true, nil
+}
+
+// IncrCodeAttempts 记录一次校验尝试，返回累计次数。
+func (r *RedisClient) IncrCodeAttempts(kind string, userID uint, ttl time.Duration) (int64, error) {
+	ctx := context.Background()
+	key := codeAttemptsKeyPrefix + kind + ":" + strconv.Itoa(int(userID))
+	n, err := r.client.Incr(ctx, key).Result()
+	if err != nil {
+		return 0, err
+	}
+	r.client.Expire(ctx, key, ttl)
+	return n, nil
+}
+
+// DeleteCode 作废验证码。
+func (r *RedisClient) DeleteCode(kind string, userID uint) error {
+	ctx := context.Background()
+	return r.client.Del(ctx, codeKey(kind, userID), codeAttemptsKeyPrefix+kind+":"+strconv.Itoa(int(userID))).Err()
 }
 
 func (r *RedisClient) GetOnline(userID uint) (string, error) {

@@ -50,6 +50,17 @@ type Config struct {
 	UploadDir                  string
 	UploadMaxBytes             int
 	PresenceGraceSeconds       int
+	// 邮件发送：MailProvider 取 log（打到日志，开发/局域网默认）或 smtp；
+	// SMTPTLSMode 取 starttls（587）、implicit（465）或 none（仅本机调试）
+	MailProvider               string
+	SMTPHost                   string
+	SMTPPort                   int
+	SMTPUsername               string
+	SMTPPassword               string
+	SMTPFrom                   string
+	SMTPTLSMode                string
+	RequireEmailVerification   bool
+	AppName                    string
 }
 
 func loadEnvFromFile(filename string) error {
@@ -140,6 +151,15 @@ func Load() *Config {
 		UploadDir:                  getEnv("UPLOAD_DIR", "./uploads"),
 		UploadMaxBytes:             getEnvAsInt("UPLOAD_MAX_BYTES", 20<<20),
 		PresenceGraceSeconds:       getEnvAsInt("PRESENCE_GRACE_SECONDS", 90),
+		MailProvider:               strings.ToLower(getEnv("MAIL_PROVIDER", "log")),
+		SMTPHost:                   getEnv("SMTP_HOST", ""),
+		SMTPPort:                   getEnvAsInt("SMTP_PORT", 587),
+		SMTPUsername:               getEnv("SMTP_USERNAME", ""),
+		SMTPPassword:               getEnv("SMTP_PASSWORD", ""),
+		SMTPFrom:                   getEnv("SMTP_FROM", ""),
+		SMTPTLSMode:                strings.ToLower(getEnv("SMTP_TLS_MODE", "starttls")),
+		RequireEmailVerification:   getEnvAsBool("REQUIRE_EMAIL_VERIFICATION", false),
+		AppName:                    getEnv("APP_NAME", "SFU会议"),
 	}
 	if err := cfg.Validate(); err != nil {
 		panic(err)
@@ -188,8 +208,31 @@ func getEnvList(key string, defaultValue string) []string {
 }
 
 func (c *Config) Validate() error {
+	// 零值视为默认（测试里直接构造 Config{} 也应通过校验）
+	if c.MailProvider == "" {
+		c.MailProvider = "log"
+	}
+	if c.SMTPTLSMode == "" {
+		c.SMTPTLSMode = "starttls"
+	}
+	switch c.MailProvider {
+	case "log", "smtp":
+	default:
+		return fmt.Errorf("MAIL_PROVIDER must be log or smtp, got %q", c.MailProvider)
+	}
+	if c.MailProvider == "smtp" && (c.SMTPHost == "" || c.SMTPFrom == "") {
+		return fmt.Errorf("SMTP_HOST and SMTP_FROM are required when MAIL_PROVIDER=smtp")
+	}
+	switch c.SMTPTLSMode {
+	case "starttls", "implicit", "none":
+	default:
+		return fmt.Errorf("SMTP_TLS_MODE must be starttls, implicit or none, got %q", c.SMTPTLSMode)
+	}
 	if c.GOEnv != "production" {
 		return nil
+	}
+	if c.RequireEmailVerification && c.MailProvider != "smtp" {
+		return fmt.Errorf("REQUIRE_EMAIL_VERIFICATION needs MAIL_PROVIDER=smtp in production (codes would only go to the log)")
 	}
 	if c.JWTSecret == "your-secret-key-change-in-production" || len(c.JWTSecret) < 32 {
 		return fmt.Errorf("JWT_SECRET must be set to a strong value in production")

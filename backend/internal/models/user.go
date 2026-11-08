@@ -18,6 +18,12 @@ type User struct {
 	CreatedAt time.Time      `json:"created_at"`
 	UpdatedAt time.Time      `json:"updated_at"`
 	DeletedAt gorm.DeletedAt `json:"-" gorm:"index"`
+
+	// TokenVersion 登录 token 的版本号：改密码/重置密码时 +1，旧 token 全部失效。
+	// 不进 JSON：既不该暴露给前端，也不该被 Redis 用户缓存携带（版本查询总是走数据库/专用缓存）。
+	TokenVersion int `json:"-" gorm:"default:0"`
+	// EmailVerified 注册邮箱是否已通过验证码确认
+	EmailVerified bool `json:"email_verified" gorm:"default:false"`
 }
 
 type UserStatus string
@@ -61,4 +67,27 @@ type UpdateProfileRequest struct {
 type UpdatePasswordRequest struct {
 	OldPassword string `json:"old_password" binding:"required"`
 	NewPassword string `json:"new_password" binding:"required,min=8,max=20"`
+}
+
+// ForgotPasswordRequest 申请找回密码：account 可以是用户名/邮箱/手机号
+type ForgotPasswordRequest struct {
+	Account string `json:"account" binding:"required"`
+}
+
+// ResetPasswordRequest 用邮件验证码重置密码
+type ResetPasswordRequest struct {
+	Account     string `json:"account" binding:"required"`
+	Code        string `json:"code" binding:"required,len=6"`
+	NewPassword string `json:"new_password" binding:"required,min=8,max=20"`
+}
+
+// VerifyEmailRequest 用邮件验证码确认邮箱
+type VerifyEmailRequest struct {
+	Email string `json:"email" binding:"required,email"`
+	Code  string `json:"code" binding:"required,len=6"`
+}
+
+// ResendVerificationRequest 重新发送邮箱验证码
+type ResendVerificationRequest struct {
+	Email string `json:"email" binding:"required,email"`
 }
